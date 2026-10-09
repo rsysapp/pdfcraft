@@ -5,6 +5,7 @@
 //! View mode shows the document area with the page view's own navigation, zoom and find. Changes
 //! are refused in the engine (`Session::set_view_only`) and in command dispatch, not only hidden.
 
+mod host_theme;
 mod protocol;
 mod rail;
 pub mod text_match;
@@ -16,6 +17,7 @@ pub use protocol::{
 
 use std::sync::Arc;
 
+use crate::theme::{ThemeKind, ThemePreference};
 use crate::{Mode, PdfCraftApp, QuickTool};
 
 /// What `open` answers for a file that needs a password; view mode never prompts.
@@ -41,6 +43,8 @@ const VIEW_COMMANDS: &[&str] = &[
 #[derive(Default)]
 pub(crate) struct Embed {
     bridge: HostBridge,
+    /// A theme to apply once this frame's styling has run.
+    theme: Option<Theme>,
 }
 
 impl PdfCraftApp {
@@ -52,7 +56,7 @@ impl PdfCraftApp {
         // Document scripts never run in view mode: they could open addresses or change fields.
         app.session.set_javascript(false);
         app.default_mode = Mode::Read;
-        app.embed = Some(Embed { bridge });
+        app.embed = Some(Embed { bridge, ..Embed::default() });
         app.enforce_view_profile();
         app
     }
@@ -70,8 +74,12 @@ impl PdfCraftApp {
             match command {
                 HostCommand::Open { name, bytes } => self.host_open(&mut embed, &name, bytes),
                 HostCommand::JumpTo(target) => embed.bridge.emit(HostEvent::JumpNotFound { target }),
-                HostCommand::SetMarks(_) | HostCommand::SetTheme(_) => {}
+                HostCommand::SetMarks(_) => {}
+                HostCommand::SetTheme(theme) => embed.theme = Some(theme),
             }
+        }
+        if let Some(theme) = embed.theme.take() {
+            self.apply_host_theme(ctx, &theme);
         }
         // `execute` refuses full screen; should anything still set it, leave it the way the app does,
         // so the window follows.
@@ -80,6 +88,14 @@ impl PdfCraftApp {
         }
         self.enforce_view_profile();
         self.embed = Some(embed);
+    }
+
+    /// The host's theme, recorded as an explicit preference so the app's system-theme sync
+    /// (`sync_theme`) never replaces it.
+    fn apply_host_theme(&mut self, ctx: &egui::Context, theme: &Theme) {
+        self.theme = if theme.dark { ThemeKind::Dark } else { ThemeKind::Light };
+        self.theme_preference = if theme.dark { ThemePreference::Dark } else { ThemePreference::Light };
+        host_theme::apply(ctx, theme);
     }
 
     /// Open the host's file in place of the current one: `opened`, or `openFailed` for a broken
