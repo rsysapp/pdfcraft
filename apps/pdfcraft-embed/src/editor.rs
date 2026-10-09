@@ -28,8 +28,9 @@ impl EmbeddedEditor {
     }
 
     /// Opens a document, replacing any open one. Answers with an `opened` or `openFailed` event.
-    pub fn open(&self, bytes: &[u8], #[wasm_bindgen(js_name = "fileName")] file_name: &str) {
-        self.send(HostCommand::Open { name: file_name.to_owned(), bytes: bytes.to_vec() });
+    pub fn open(&self, bytes: Vec<u8>, #[wasm_bindgen(js_name = "fileName")] file_name: String) {
+        // Owned arguments: the bytes are copied into wasm memory once, then moved into the queue.
+        self.send(HostCommand::Open { name: file_name, bytes });
     }
 
     #[wasm_bindgen(js_name = jumpTo)]
@@ -63,10 +64,16 @@ impl EmbeddedEditor {
     /// One listener; a second call replaces the first. Events are delivered after the frame that
     /// produced them.
     #[wasm_bindgen(js_name = setListener)]
-    pub fn set_listener(&self, #[wasm_bindgen(unchecked_param_type = "(event: EditorEvent) => void")] listener: js_sys::Function) {
-        if !self.destroyed.get() {
-            self.listener.replace(Some(listener));
+    pub fn set_listener(&self, #[wasm_bindgen(unchecked_param_type = "(event: EditorEvent) => void")] listener: JsValue) -> Result<(), JsError> {
+        // Taken as a plain value and checked: wasm-bindgen does not check a `Function` argument, and
+        // a non-function would only fail later, inside event delivery.
+        let listener = listener.dyn_into::<js_sys::Function>().map_err(|_| JsError::new("setListener: expected a function"))?;
+        if !self.destroyed.get()
+            && let Ok(mut slot) = self.listener.try_borrow_mut()
+        {
+            *slot = Some(listener);
         }
+        Ok(())
     }
 
     /// Stops the runner and frees the canvas. The object is unusable afterwards: later calls queue
@@ -80,7 +87,22 @@ impl EmbeddedEditor {
         // The runner has dropped the app; this drops the bridge's copy of its egui context and
         // anything still queued, so nothing of the editor outlives it through this object.
         self.bridge.detach();
-        self.listener.replace(None);
+        // `try_borrow_mut`, not `replace`: this also runs from `Drop`, which must not panic. Event
+        // delivery clones the listener out before calling it, so the cell is free here anyway.
+        if let Ok(mut slot) = self.listener.try_borrow_mut() {
+            *slot = None;
+        }
+    }
+}
+
+/// wasm-bindgen's `free()`, `[Symbol.dispose]()` and garbage collection drop the object without
+/// calling `destroy`. The runner's event listeners hold their own copies of it, so without this
+/// the editor would keep rendering on the canvas, unreachable. `destroy` is idempotent, so
+/// `destroy()` then `free()` is fine. Its runner calls cannot meet a borrowed runner: host code
+/// never runs inside a frame (events reach the listener in a later task).
+impl Drop for EmbeddedEditor {
+    fn drop(&mut self) {
+        self.destroy();
     }
 }
 
@@ -103,7 +125,7 @@ async fn start(canvas: web_sys::HtmlCanvasElement, options: JsValue) -> Result<E
     let runner = eframe::WebRunner::new();
     let (app_bridge, app_listener) = (bridge.clone(), listener.clone());
     let web_options = eframe::WebOptions { renderer: eframe::Renderer::Glow, ..Default::default() };
-    runner
+    let started = runner
         .start(
             canvas,
             web_options,
@@ -116,7 +138,13 @@ async fn start(canvas: web_sys::HtmlCanvasElement, options: JsValue) -> Result<E
                 }))
             }),
         )
-        .await?;
+        .await;
+    if let Err(error) = started {
+        // No `EmbeddedEditor` exists to drop, so unsubscribe whatever the runner installed here.
+        runner.destroy();
+        bridge.detach();
+        return Err(error);
+    }
     wasm_bindgen_futures::JsFuture::from(first_frame).await?;
     Ok(EmbeddedEditor { runner, bridge, listener, destroyed: Cell::new(false) })
 }
