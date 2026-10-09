@@ -19,7 +19,7 @@ use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 
-use pdfcraft_render::DocInfo;
+use pdfcraft_render::{DocInfo, PageText};
 
 use crate::canvas::PageXform;
 use crate::theme::{ThemeKind, ThemePreference};
@@ -59,7 +59,10 @@ pub(crate) struct Embed {
     /// The host's marks as it sent them, and their texts folded for matching.
     marks: Vec<Mark>,
     needles: Vec<Vec<char>>,
-    /// Where they were found, shared with the page view's painter.
+    /// Each mark's first match, parallel to `marks`: its page and line rectangles. Text layers
+    /// arrive in any order, so a hit on a later page is replaced when an earlier page turns one up.
+    hits: Vec<Option<(usize, Vec<[f32; 4]>)>>,
+    /// The hits as the page view paints them, in the host's mark order (the last one is on top).
     page_marks: Arc<Vec<PageMark>>,
     /// Pages already searched for the current marks.
     searched: HashSet<usize>,
@@ -86,14 +89,19 @@ impl Embed {
     /// Replace every host mark; they are searched for again as text layers arrive.
     fn set_marks(&mut self, marks: Vec<Mark>) {
         self.needles = marks.iter().map(|m| text_match::fold(&m.text)).collect();
+        self.hits = vec![None; marks.len()];
         self.marks = marks;
         self.page_marks = Arc::default();
         self.searched.clear();
     }
 
-    /// Pages some mark may lie on whose text has not been searched yet.
+    /// Pages whose text some mark still needs: unsearched pages it may lie on, and for a mark
+    /// already found, only those before its hit (a later page cannot change its first match).
     fn pages_pending(&self, pages: usize) -> impl Iterator<Item = usize> + '_ {
-        (0..pages).filter(|p| !self.searched.contains(p) && self.marks.iter().any(|m| mark_may_lie_on(m, *p)))
+        (0..pages).filter(|p| {
+            !self.searched.contains(p)
+                && self.marks.iter().zip(&self.hits).any(|(m, hit)| mark_may_lie_on(m, *p) && hit.as_ref().is_none_or(|(found, _)| p < found))
+        })
     }
 
     /// Some page a mark may lie on has not been searched yet.
@@ -107,7 +115,8 @@ impl Embed {
         if !self.marks_pending(pages) {
             return (false, None);
         }
-        if self.marks.iter().any(|m| m.page.is_none()) { (true, None) } else { (false, self.pages_pending(pages).next()) }
+        let any_page = self.marks.iter().zip(&self.hits).any(|(m, hit)| m.page.is_none() && hit.is_none());
+        if any_page { (true, None) } else { (false, self.pages_pending(pages).next()) }
     }
 
     /// Search the pages whose text layer arrived since the last call, for every mark that may lie
@@ -116,26 +125,42 @@ impl Embed {
         if self.marks.is_empty() {
             return;
         }
-        let ready: Vec<usize> = view.texts.keys().chain(view.text_failed.iter()).copied().filter(|p| !self.searched.contains(p)).collect();
-        if ready.is_empty() {
-            return;
-        }
-        let mut found = (*self.page_marks).clone();
+        let mut ready: Vec<usize> = view.texts.keys().chain(view.text_failed.iter()).copied().filter(|p| !self.searched.contains(p)).collect();
+        ready.sort_unstable();
+        ready.dedup();
         for page in ready {
-            self.searched.insert(page);
-            let Some(text) = view.texts.get(&page) else { continue };
-            let here: Vec<usize> = (0..self.marks.len()).filter(|&k| self.marks.get(k).is_some_and(|m| mark_may_lie_on(m, page))).collect();
-            let needles: Vec<Vec<char>> = here.iter().filter_map(|&k| self.needles.get(k).cloned()).collect();
-            for (k, ranges) in here.iter().zip(text_match::find_all(text, &needles)) {
-                let Some(mark) = self.marks.get(*k) else { continue };
-                for range in ranges {
-                    for rect in text.line_rects(range) {
-                        found.push(PageMark { id: mark.id.clone(), page, rect, color: mark.color });
-                    }
-                }
-            }
+            self.search_page(page, view.texts.get(&page).map(|t| &**t));
         }
-        self.page_marks = Arc::new(found);
+    }
+
+    /// Search one page's text (`None` when it has none) for the marks that may lie there, and keep
+    /// each mark's first match: on its own page when it has one, else on the lowest page.
+    fn search_page(&mut self, page: usize, text: Option<&PageText>) {
+        self.searched.insert(page);
+        let Some(text) = text else { return };
+        let here: Vec<usize> = (0..self.marks.len()).filter(|&k| self.marks.get(k).is_some_and(|m| mark_may_lie_on(m, page))).collect();
+        let needles: Vec<Vec<char>> = here.iter().filter_map(|&k| self.needles.get(k).cloned()).collect();
+        let mut changed = false;
+        for (k, ranges) in here.iter().zip(text_match::find_all(text, &needles)) {
+            let Some(range) = ranges.into_iter().next() else { continue };
+            let Some(hit) = self.hits.get_mut(*k) else { continue };
+            if hit.as_ref().is_some_and(|(found, _)| *found <= page) {
+                continue;
+            }
+            *hit = Some((page, text.line_rects(range)));
+            changed = true;
+        }
+        if changed {
+            let color_of = |k: usize| self.marks.get(k).map(|m| m.color);
+            let found: Vec<PageMark> = (0..self.hits.len())
+                .filter_map(|k| Some((k, self.hits.get(k)?.as_ref()?, color_of(k)?)))
+                .flat_map(|(k, (page, rects), color)| {
+                    let id = self.marks.get(k).map(|m| m.id.clone()).unwrap_or_default();
+                    rects.iter().map(move |rect| PageMark { id: id.clone(), page: *page, rect: *rect, color })
+                })
+                .collect();
+            self.page_marks = Arc::new(found);
+        }
     }
 }
 
@@ -439,6 +464,40 @@ pub(crate) fn show(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
 
 #[cfg(test)]
 mod tests {
+    /// A page with one line of text, one glyph per character.
+    fn page_with(line: &str) -> pdfcraft_render::PageText {
+        let mut text = pdfcraft_render::PageText::default();
+        for (k, ch) in line.chars().enumerate() {
+            let x = k as f32 * 7.0;
+            text.glyphs.push(pdfcraft_render::TextGlyph { text: ch.to_string(), rect: [x, 0.0, x + 6.0, 12.0] });
+            text.line_of.push(0);
+            text.space_before.push(ch != ' ' && k > 0 && line.chars().nth(k - 1) == Some(' '));
+        }
+        text
+    }
+
+    fn mark(id: &str, text: &str, page: Option<u32>) -> super::Mark {
+        super::Mark { id: id.into(), text: text.into(), page, color: egui::Color32::RED }
+    }
+
+    #[test]
+    fn a_mark_keeps_its_first_match_whatever_order_the_text_arrives_in() {
+        let mut embed = super::Embed::default();
+        embed.set_marks(vec![mark("goods", "the goods", None), mark("late", "the goods", Some(3))]);
+        // Page 3's text arrives before page 2's; page 1 has no match.
+        embed.search_page(2, Some(&page_with("pay for the goods the goods")));
+        let found = |embed: &super::Embed| embed.page_marks.iter().map(|m| (m.id.clone(), m.page)).collect::<Vec<_>>();
+        assert_eq!(found(&embed), vec![("goods".to_string(), 2), ("late".to_string(), 2)]);
+        embed.search_page(1, Some(&page_with("deliver the goods now the goods")));
+        embed.search_page(0, Some(&page_with("nothing here")));
+        // A later page arriving afterwards never takes the match over.
+        embed.search_page(3, Some(&page_with("the goods")));
+        assert_eq!(found(&embed), vec![("goods".to_string(), 1), ("late".to_string(), 2)], "one match per mark: the lowest page, host order");
+        let first_line_matches = embed.page_marks.iter().filter(|m| m.id == "goods").count();
+        assert_eq!(first_line_matches, 1, "only the first of two matches on the page");
+        assert_eq!(embed.pages_pending(4).count(), 0, "a found mark asks for no more text");
+    }
+
     #[test]
     fn view_commands_are_registered_commands() {
         for id in super::VIEW_COMMANDS {

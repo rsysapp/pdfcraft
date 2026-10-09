@@ -27,7 +27,7 @@ fn marks_are_found_where_they_may_lie_and_skipped_otherwise() {
     settle(&mut h);
     let red = Color32::from_rgba_unmultiplied(255, 0, 0, 128);
     let green = Color32::from_rgba_unmultiplied(0, 255, 0, 128);
-    assert_eq!(h.state().found_host_marks(), [("goods".to_string(), 2, red), ("goods".to_string(), 3, red), ("thirty".to_string(), 3, green)]);
+    assert_eq!(h.state().found_host_marks(), [("goods".to_string(), 2, red), ("thirty".to_string(), 3, green)]);
     assert!(bridge.take_events().iter().all(|e| !matches!(e, HostEvent::JumpNotFound { .. })), "marks that aren't found stay silent");
     bridge.send(HostCommand::SetMarks(Vec::new()));
     settle(&mut h);
