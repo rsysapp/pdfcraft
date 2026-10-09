@@ -52,6 +52,8 @@ pub(crate) struct Embed {
     jump: Option<JumpTarget>,
     /// The page last reported (`pageChanged`), 0-based.
     last_page: Option<usize>,
+    /// The selection last reported, as (page, glyph range).
+    last_selection: Option<(usize, Range<usize>)>,
 }
 
 impl Embed {
@@ -59,6 +61,7 @@ impl Embed {
     fn document_closed(&mut self) {
         self.jump = None;
         self.last_page = None;
+        self.last_selection = None;
     }
 }
 
@@ -247,13 +250,42 @@ fn jump_to_match(view: &mut DocView, info: &DocInfo, page: usize, range: Range<u
 }
 
 /// What the host hears about the frame just drawn.
-fn collect_events(app: &mut PdfCraftApp, _ctx: &egui::Context) {
+fn collect_events(app: &mut PdfCraftApp, ctx: &egui::Context) {
     let Some(embed) = app.embed.as_mut() else { return };
     let Some(view) = app.active.and_then(|i| app.views.get(i)) else { return };
     if embed.last_page != Some(view.current) {
         embed.last_page = Some(view.current);
         embed.bridge.emit(HostEvent::PageChanged { page: view.current + 1 });
     }
+    // A selection settles when no button is down: drags report on release, keys at once.
+    let now = view.selection_span();
+    if now == embed.last_selection || ctx.input(|i| i.pointer.any_down()) {
+        return;
+    }
+    match &now {
+        None => embed.bridge.emit(HostEvent::SelectionCleared),
+        Some((page, range)) => {
+            // Off screen (no position yet): try again next frame.
+            let Some(event) = selection_event(view, *page, range.clone(), ctx.zoom_factor()) else { return };
+            embed.bridge.emit(event);
+        }
+    }
+    embed.last_selection = now;
+}
+
+/// The selection as the host hears it, placed at the end of its last line: egui points times the
+/// zoom factor are CSS pixels from the canvas's top-left.
+fn selection_event(view: &DocView, page: usize, range: Range<usize>, zoom: f32) -> Option<HostEvent> {
+    let text = view.texts.get(&page)?;
+    let copy_text = text.text_of(range.clone());
+    if copy_text.trim().is_empty() {
+        return None;
+    }
+    let last = text.line_rects(range).last().copied()?;
+    let end = view.page_xform(page)?.view_rect(last).right_bottom();
+    let (x, y) = (end.x * zoom, end.y * zoom);
+    let text = copy_text.split_whitespace().collect::<Vec<_>>().join(" ");
+    (x.is_finite() && y.is_finite()).then_some(HostEvent::Selection { text, copy_text, page: Some(page + 1), x, y })
 }
 
 /// The embed build's frame: the navigation rail and the page view. Dialogs, panels, the palette

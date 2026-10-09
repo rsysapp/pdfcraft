@@ -15,6 +15,9 @@ use pdfcraft_render::{DocInfo, LayerOp, LinkTarget, PageText, RenderPool, Render
 use crate::theme::{self, Tokens};
 use crate::{PdfCraftApp, QuickTool, RightPanel, comments, icons, widgets};
 
+// Embed build: read access to the selection for the host bridge (crate::embed).
+mod embed_access;
+
 /// Logical pixels per PDF point at 100% (96 dpi, like browsers).
 pub const PT: f32 = 96.0 / 72.0;
 const GAP: f32 = 14.0;
