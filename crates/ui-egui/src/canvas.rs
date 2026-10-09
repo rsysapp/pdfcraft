@@ -1388,6 +1388,9 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
         view.content.selected = None;
     }
 
+    // Embed build: the host page's marks (crate::embed).
+    let host_marks = crate::embed::page_marks(app.embed.as_ref());
+    let mut mark_clicked: Option<String> = None;
     let out = scroll.show_viewport(ui, |ui, viewport| {
         // egui's drag responses accept every pointer button. Keep a wheel gesture from also
         // selecting text, drawing a mark, or panning with the Hand tool.
@@ -1675,6 +1678,9 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
             let preview_target = (tool == QuickTool::Select && !comments_hidden).then_some(view.comments.selected).flatten();
             view.signature_drag.prepare(ui.ctx(), doc, preview_target, scale);
             view.signature_drag.paint(painter, &pcx, &view.comments, view.pending_edit.as_ref());
+
+            // Embed build: host marks, above the page and below the selection (crate::embed).
+            crate::embed::paint_marks(painter, &xf, i, &host_marks, &resp, &mut mark_clicked);
 
             // Text layer: find matches, selection, I-beam and drag-to-select.
             let to_screen = |g: [f32; 4]| xf.view_rect(g);
@@ -2127,9 +2133,11 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
     if let Some((name, action)) = app.views[index].forms.button.take() {
         run_button(app, index, &name, action);
     }
-    // Embed build: no quick-action bar (crate::embed).
+    // Embed build: no quick-action bar; a click on a host mark goes to the host (crate::embed).
     if !embedded {
         quick_bar(app, avail, ui);
+    } else if let Some(id) = mark_clicked {
+        crate::embed::mark_activated(app, id);
     }
 }
 

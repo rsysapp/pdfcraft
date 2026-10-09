@@ -15,11 +15,13 @@ pub use protocol::{
     parse_theme,
 };
 
+use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 
 use pdfcraft_render::DocInfo;
 
+use crate::canvas::PageXform;
 use crate::theme::{ThemeKind, ThemePreference};
 use crate::{DocView, Mode, PdfCraftApp, QuickTool};
 
@@ -54,14 +56,86 @@ pub(crate) struct Embed {
     last_page: Option<usize>,
     /// The selection last reported, as (page, glyph range).
     last_selection: Option<(usize, Range<usize>)>,
+    /// The host's marks as it sent them, and their texts folded for matching.
+    marks: Vec<Mark>,
+    needles: Vec<Vec<char>>,
+    /// Where they were found, shared with the page view's painter.
+    page_marks: Arc<Vec<PageMark>>,
+    /// Pages already searched for the current marks.
+    searched: HashSet<usize>,
+}
+
+/// A host mark's rectangle on one page, in page view space (points, y down).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PageMark {
+    id: String,
+    page: usize,
+    rect: [f32; 4],
+    color: egui::Color32,
 }
 
 impl Embed {
-    /// Forget what belonged to the document that was open.
+    /// Forget what belonged to the document that was open, marks included.
     fn document_closed(&mut self) {
         self.jump = None;
         self.last_page = None;
         self.last_selection = None;
+        self.set_marks(Vec::new());
+    }
+
+    /// Replace every host mark; they are searched for again as text layers arrive.
+    fn set_marks(&mut self, marks: Vec<Mark>) {
+        self.needles = marks.iter().map(|m| text_match::fold(&m.text)).collect();
+        self.marks = marks;
+        self.page_marks = Arc::default();
+        self.searched.clear();
+    }
+
+    /// Pages some mark may lie on whose text has not been searched yet.
+    fn pages_pending(&self, pages: usize) -> impl Iterator<Item = usize> + '_ {
+        (0..pages).filter(|p| !self.searched.contains(p) && self.marks.iter().any(|m| mark_may_lie_on(m, *p)))
+    }
+
+    /// Some page a mark may lie on has not been searched yet.
+    fn marks_pending(&self, pages: usize) -> bool {
+        self.pages_pending(pages).next().is_some()
+    }
+
+    /// The text layers the marks need: every page when a mark may lie on any (it has no page),
+    /// otherwise the next pending page alone (one at a time, as `want_text_page` takes one).
+    fn marks_text_need(&self, pages: usize) -> (bool, Option<usize>) {
+        if !self.marks_pending(pages) {
+            return (false, None);
+        }
+        if self.marks.iter().any(|m| m.page.is_none()) { (true, None) } else { (false, self.pages_pending(pages).next()) }
+    }
+
+    /// Search the pages whose text layer arrived since the last call, for every mark that may lie
+    /// there. Marks that are not found are skipped.
+    fn resolve_marks(&mut self, view: &DocView) {
+        if self.marks.is_empty() {
+            return;
+        }
+        let ready: Vec<usize> = view.texts.keys().chain(view.text_failed.iter()).copied().filter(|p| !self.searched.contains(p)).collect();
+        if ready.is_empty() {
+            return;
+        }
+        let mut found = (*self.page_marks).clone();
+        for page in ready {
+            self.searched.insert(page);
+            let Some(text) = view.texts.get(&page) else { continue };
+            let here: Vec<usize> = (0..self.marks.len()).filter(|&k| self.marks.get(k).is_some_and(|m| mark_may_lie_on(m, page))).collect();
+            let needles: Vec<Vec<char>> = here.iter().filter_map(|&k| self.needles.get(k).cloned()).collect();
+            for (k, ranges) in here.iter().zip(text_match::find_all(text, &needles)) {
+                let Some(mark) = self.marks.get(*k) else { continue };
+                for range in ranges {
+                    for rect in text.line_rects(range) {
+                        found.push(PageMark { id: mark.id.clone(), page, rect, color: mark.color });
+                    }
+                }
+            }
+        }
+        self.page_marks = Arc::new(found);
     }
 }
 
@@ -92,7 +166,7 @@ impl PdfCraftApp {
             match command {
                 HostCommand::Open { name, bytes } => self.host_open(&mut embed, &name, bytes),
                 HostCommand::JumpTo(target) => self.host_jump(&mut embed, target),
-                HostCommand::SetMarks(_) => {}
+                HostCommand::SetMarks(marks) => embed.set_marks(marks),
                 HostCommand::SetTheme(theme) => embed.theme = Some(theme),
             }
         }
@@ -101,6 +175,9 @@ impl PdfCraftApp {
         }
         // Text layers that arrived this frame (`receive`, earlier in `logic`).
         self.resolve_jump(&mut embed);
+        if let Some(view) = self.active.and_then(|i| self.views.get(i)) {
+            embed.resolve_marks(view);
+        }
         // A page-scoped jump needs only that page's text; an unscoped one searches every page.
         let pages = self.active_page_count();
         let (all_text, text_page) = match &embed.jump {
@@ -108,9 +185,11 @@ impl PdfCraftApp {
             Some(_) => (true, None),
             None => (false, None),
         };
+        // Marks without a page need every page's text; scoped ones only their own pages.
+        let (marks_all_text, marks_text_page) = embed.marks_text_need(pages);
         if let Some(view) = self.active.and_then(|i| self.views.get_mut(i)) {
-            view.want_all_text = all_text;
-            view.want_text_page = text_page;
+            view.want_all_text = all_text || marks_all_text;
+            view.want_text_page = text_page.or(marks_text_page);
         }
         // `execute` refuses full screen; should anything still set it, leave it the way the app does,
         // so the window follows.
@@ -121,9 +200,24 @@ impl PdfCraftApp {
         self.embed = Some(embed);
     }
 
-    /// Whether host work (a text jump) still waits for text layers (tests).
+    /// Whether host work (a text jump, marks) still waits for text layers (tests).
     pub fn host_work_pending(&self) -> bool {
-        self.embed.as_ref().is_some_and(|e| e.jump.is_some())
+        let pages = self.active_page_count();
+        self.embed.as_ref().is_some_and(|e| e.jump.is_some() || e.marks_pending(pages))
+    }
+
+    /// The host marks found: (id, 1-based page, colour), one per line, by page then id (tests).
+    pub fn found_host_marks(&self) -> Vec<(String, usize, egui::Color32)> {
+        let mut out: Vec<(String, usize, egui::Color32)> =
+            self.embed.iter().flat_map(|e| e.page_marks.iter().map(|m| (m.id.clone(), m.page + 1, m.color))).collect();
+        out.sort_by(|a, b| (a.1, &a.0).cmp(&(b.1, &b.0)));
+        out
+    }
+
+    /// Where the host marks are on screen this frame: (id, rectangle) (tests and automation).
+    pub fn host_mark_rects(&self) -> Vec<(String, egui::Rect)> {
+        let (Some(embed), Some(view)) = (self.embed.as_ref(), self.active.and_then(|i| self.views.get(i))) else { return Vec::new() };
+        embed.page_marks.iter().filter_map(|m| view.page_xform(m.page).map(|xf| (m.id.clone(), xf.view_rect(m.rect)))).collect()
     }
 
     fn active_page_count(&self) -> usize {
@@ -224,6 +318,45 @@ impl PdfCraftApp {
         for view in &mut self.views {
             view.organize = false;
         }
+    }
+}
+
+/// Whether `mark` may lie on page index `page`.
+fn mark_may_lie_on(mark: &Mark, page: usize) -> bool {
+    mark.page.is_none_or(|p| page_index(p, usize::MAX) == Some(page))
+}
+
+/// The host marks for the page view to paint (none outside the embed build).
+pub(crate) fn page_marks(embed: Option<&Embed>) -> Arc<Vec<PageMark>> {
+    embed.map(|e| e.page_marks.clone()).unwrap_or_default()
+}
+
+/// Paint the host marks on `page` (above the page, below the selection) and note the one a click
+/// this frame landed in. Marks paint in the order the host sent them, so a click where marks
+/// overlap goes to the last one: the one drawn on top. A drag is never a click, so selecting text
+/// across a mark does not activate it.
+pub(crate) fn paint_marks(
+    painter: &egui::Painter,
+    xf: &PageXform,
+    page: usize,
+    marks: &[PageMark],
+    resp: &egui::Response,
+    clicked: &mut Option<String>,
+) {
+    let click = resp.clicked().then(|| resp.interact_pointer_pos()).flatten();
+    for mark in marks.iter().filter(|m| m.page == page) {
+        let rect = xf.view_rect(mark.rect);
+        painter.rect_filled(rect, egui::CornerRadius::same(2), mark.color);
+        if click.is_some_and(|p| rect.contains(p)) {
+            *clicked = Some(mark.id.clone());
+        }
+    }
+}
+
+/// A click landed in host mark `id`.
+pub(crate) fn mark_activated(app: &PdfCraftApp, id: String) {
+    if let Some(embed) = &app.embed {
+        embed.bridge.emit(HostEvent::MarkActivated { id });
     }
 }
 
