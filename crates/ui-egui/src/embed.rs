@@ -3,6 +3,7 @@
 //! the browser, so the whole bridge runs under egui_kittest.
 
 mod protocol;
+pub mod text_match;
 
 pub use protocol::{
     HostBridge, HostCommand, HostEvent, JumpTarget, MAX_MARKS, Mark, Theme, parse_color, parse_jump_target, parse_marks, parse_mount_options,
