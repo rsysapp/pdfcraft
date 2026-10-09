@@ -21,6 +21,22 @@ use crate::{Mode, PdfCraftApp, QuickTool};
 /// What `open` answers for a file that needs a password; view mode never prompts.
 const PASSWORD_MESSAGE: &str = "This file is password-protected and can't be shown here.";
 
+/// What `open_bytes` answers in view mode: only the host opens documents, never a drop or a picker.
+pub(crate) const OPEN_REFUSED: &str = "only the host page opens documents here";
+
+/// The commands view mode runs: find, page display and zoom. Everything else (editing, saving,
+/// printing, exporting, opening, panels, help and its links) is refused.
+const VIEW_COMMANDS: &[&str] = &[
+    "edit.find",
+    "view.layout.continuous",
+    "view.layout.single",
+    "view.layout.two_up",
+    "view.layout.cover",
+    "view.fit_width_scrolling",
+    "view.fit_one_page",
+    "view.fit_visible",
+];
+
 /// The app's embed state ([`PdfCraftApp::embedded`]).
 #[derive(Default)]
 pub(crate) struct Embed {
@@ -41,6 +57,11 @@ impl PdfCraftApp {
         app
     }
 
+    /// Whether command `command` may run: every command outside view mode, the viewing ones in it.
+    pub(crate) fn embed_allows(&self, command: &str) -> bool {
+        self.embed.is_none() || VIEW_COMMANDS.contains(&command)
+    }
+
     /// Run the host's commands (end of `logic`, after the app's own styling and renders).
     pub(crate) fn embed_logic(&mut self, ctx: &egui::Context) {
         let Some(mut embed) = self.embed.take() else { return };
@@ -52,7 +73,8 @@ impl PdfCraftApp {
                 HostCommand::SetMarks(_) | HostCommand::SetTheme(_) => {}
             }
         }
-        // A shortcut can still reach full screen; leave it the way the app does, so the window follows.
+        // `execute` refuses full screen; should anything still set it, leave it the way the app does,
+        // so the window follows.
         if self.full_screen {
             self.set_full_screen(ctx, false);
         }
@@ -107,4 +129,46 @@ pub(crate) fn show(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
             crate::canvas::document_area(app, i, ui);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn view_commands_are_registered_commands() {
+        for id in super::VIEW_COMMANDS {
+            assert!(pdfcraft_engine::commands::command(id).is_some(), "{id} is a registered command");
+        }
+    }
+
+    /// A folder for one test that must stay empty.
+    fn empty_folder(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("pdfcraft-embed-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("creates the folder");
+        dir
+    }
+
+    #[test]
+    fn file_pickers_never_show() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mut app = crate::PdfCraftApp::embedded(super::HostBridge::default());
+        // The picker's answer when it is allowed to ask (tests and automation).
+        app.pick_override = Some(vec![empty_folder("pick").join("chosen.pdf").to_string_lossy().into_owned()]);
+        let answered = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = answered.clone();
+        let asked = app.ask(crate::pickers::Ask::File(rfd::AsyncFileDialog::new()), None, move |_, _| flag.store(true, Ordering::SeqCst));
+        app.process_picked();
+        assert!(!asked && !answered.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn exports_and_images_are_never_written() {
+        let dir = empty_folder("write");
+        let mut app = crate::PdfCraftApp::embedded(super::HostBridge::default());
+        app.pick_override = Some(vec![dir.to_string_lossy().into_owned()]);
+        app.write_files(&[("export.txt".into(), std::sync::Arc::new(b"text".to_vec()))], "Export");
+        app.process_picked();
+        assert!(!dir.join("export.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

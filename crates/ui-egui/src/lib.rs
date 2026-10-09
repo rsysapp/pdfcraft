@@ -771,6 +771,10 @@ impl PdfCraftApp {
 
     /// Open a document and make it the active tab. Encrypted files raise the password prompt.
     pub fn open_bytes(&mut self, name: &str, path: Option<String>, bytes: Vec<u8>) -> Result<(), String> {
+        // Embed build: only the host page opens documents (`embed`).
+        if self.embed.is_some() {
+            return Err(embed::OPEN_REFUSED.into());
+        }
         // Images and text files become new, unsaved PDFs (Create a PDF).
         if let Some(r) = self.open_converted(name, &bytes) {
             return r;
@@ -1057,6 +1061,10 @@ impl PdfCraftApp {
     /// Open a web link in the system browser (a new tab on the web). Only for PdfCraft's own
     /// links; an address that came from a document goes through [`Self::request_document_url`].
     pub fn open_url(&mut self, url: &str) {
+        // Embed build: the host page owns navigation; no help, update or document link opens (`embed`).
+        if self.embed.is_some() {
+            return;
+        }
         if let Some(ctx) = &self.ctx {
             ctx.open_url(egui::OpenUrl::new_tab(url));
         }

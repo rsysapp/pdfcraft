@@ -145,6 +145,10 @@ impl PrintDraft {
 
 impl PdfCraftApp {
     pub fn open_print(&mut self) {
+        // Embed build: no printing in view mode, from a key, a button's Print action or a script (`embed`).
+        if self.embed.is_some() {
+            return;
+        }
         let Some((i, _)) = self.active_ids() else { return };
         let printers = spool::printers();
         let default = printers.iter().find(|p| p.default).or(printers.first()).map(|p| p.name.clone());
@@ -166,6 +170,10 @@ impl PdfCraftApp {
     /// a preset path returns `true` once the save picker is showing; the file is written on a
     /// later frame, when the user has chosen where.
     pub fn print_now(&mut self) -> bool {
+        // Embed build: no printing in view mode (`embed`).
+        if self.embed.is_some() {
+            return false;
+        }
         // What's typed in a form field is part of what's printed (#166).
         if !self.commit_form_typing() {
             return false;

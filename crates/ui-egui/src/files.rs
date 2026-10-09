@@ -310,6 +310,10 @@ impl PdfCraftApp {
 
     /// Use picked files (also the entry point for tests and automation).
     pub fn use_files(&mut self, purpose: FilePurpose, files: Vec<(String, Vec<u8>)>) {
+        // Embed build: view mode takes no files (`embed`).
+        if self.embed.is_some() {
+            return;
+        }
         match purpose {
             FilePurpose::Combine => self.stage_combine(files),
             FilePurpose::InsertPages => self.insert_files(files),
@@ -452,6 +456,10 @@ impl PdfCraftApp {
     /// [`Self::write_files`], then `after` once every file is written: now, or on a later frame
     /// when the user chooses the folder. `after` never runs when writing fails or is cancelled.
     pub(crate) fn write_files_then(&mut self, named: Vec<(String, Arc<Vec<u8>>)>, title: &str, after: impl FnOnce(&mut Self) + Send + 'static) {
+        // Embed build: view mode writes and downloads no files (`embed`).
+        if self.embed.is_some() {
+            return;
+        }
         #[cfg(not(target_arch = "wasm32"))]
         {
             let write = move |app: &mut Self, dir: std::path::PathBuf| {
