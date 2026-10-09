@@ -65,6 +65,8 @@ mod bidi;
 mod dialogs;
 mod edit_text_ui;
 mod editing;
+// Embed build: the host bridge and view mode (apps/pdfcraft-embed).
+pub mod embed;
 mod files;
 pub mod fill_sign;
 pub mod folders_ui;
