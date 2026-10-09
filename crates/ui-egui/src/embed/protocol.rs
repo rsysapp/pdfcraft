@@ -13,9 +13,30 @@ pub const MAX_MARKS: usize = 2_000;
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum JumpTarget {
     /// A page, 1-based.
-    Page { page: u32 },
+    Page {
+        #[serde(deserialize_with = "saturating_u32")]
+        page: u32,
+    },
     /// The `occurrence`-th (0-based) match of `text` on `page` (1-based), or in the document.
-    Text { text: String, page: Option<u32>, occurrence: u32 },
+    Text {
+        text: String,
+        #[serde(default, deserialize_with = "saturating_optional_u32")]
+        page: Option<u32>,
+        #[serde(deserialize_with = "saturating_u32")]
+        occurrence: u32,
+    },
+}
+
+/// A non-negative JSON integer, saturated to `u32::MAX`: JavaScript integers reach 2^53, and one
+/// beyond `u32` is merely out of range for any document (the jump answers not found), not malformed.
+fn saturating_u32<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
+    let value = <u64 as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(u32::try_from(value).unwrap_or(u32::MAX))
+}
+
+fn saturating_optional_u32<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<u32>, D::Error> {
+    let value = <Option<u64> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(value.map(|number| u32::try_from(number).unwrap_or(u32::MAX)))
 }
 
 /// A passage the host wants painted, validated.
@@ -97,7 +118,10 @@ impl HostBridge {
     /// Host side: queue a command; the app runs it on its next frame, which this requests.
     pub fn send(&self, command: HostCommand) {
         self.commands.lock().unwrap_or_else(PoisonError::into_inner).push_back(command);
-        if let Some(ctx) = self.ctx.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
+        // Clone out and release the lock first: `request_repaint` takes egui's own lock, and a host
+        // thread must not hold ours while it waits for that.
+        let ctx = self.ctx.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        if let Some(ctx) = ctx {
             ctx.request_repaint();
         }
     }
@@ -230,8 +254,15 @@ mod tests {
             parse_jump_target(r#"{"kind":"text","text":"x","page":2,"occurrence":0}"#),
             Ok(JumpTarget::Text { text: "x".into(), page: Some(2), occurrence: 0 })
         );
+        assert_eq!(parse_jump_target(r#"{"kind":"page","page":5000000000}"#), Ok(JumpTarget::Page { page: u32::MAX }));
+        assert_eq!(
+            parse_jump_target(r#"{"kind":"text","text":"x","page":5000000000,"occurrence":9007199254740991}"#),
+            Ok(JumpTarget::Text { text: "x".into(), page: Some(u32::MAX), occurrence: u32::MAX })
+        );
         for bad in [
             r#"{"kind":"page","page":1.5}"#,
+            r#"{"kind":"text","text":"x","page":null,"occurrence":-1}"#,
+            r#"{"kind":"text","text":"x","page":1.5,"occurrence":0}"#,
             r#"{"kind":"page","page":-1}"#,
             r#"{"kind":"text","text":"x","page":null}"#,
             r#"{"kind":"chapter","page":1}"#,
@@ -252,10 +283,13 @@ mod tests {
         assert_eq!(parse_marks("[]"), Ok(Vec::new()));
         let err = parse_marks(r#"[{"id":"t1","text":"x","page":null,"color":"red"}]"#).expect_err("not a colour");
         assert!(err.contains("t1"), "{err}");
-        let one = r##"{"id":"m","text":"x","page":null,"color":"#000000ff"}"##;
-        let many = format!("[{}]", vec![one; MAX_MARKS + 1].join(","));
+        let many_marks: Vec<String> =
+            (0..=MAX_MARKS).map(|index| format!(r##"{{"id":"m{index}","text":"x","page":null,"color":"#000000ff"}}"##)).collect();
+        let many = format!("[{}]", many_marks.join(","));
         let kept = parse_marks(&many).expect("marks beyond the cap are ignored, not refused");
         assert_eq!(kept.len(), MAX_MARKS);
+        assert_eq!(kept[0].id, "m0");
+        assert_eq!(kept[MAX_MARKS - 1].id, format!("m{}", MAX_MARKS - 1));
     }
 
     #[test]
