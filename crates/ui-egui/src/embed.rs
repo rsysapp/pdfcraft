@@ -98,8 +98,16 @@ impl PdfCraftApp {
         }
         // Text layers that arrived this frame (`receive`, earlier in `logic`).
         self.resolve_jump(&mut embed);
+        // A page-scoped jump needs only that page's text; an unscoped one searches every page.
+        let pages = self.active_page_count();
+        let (all_text, text_page) = match &embed.jump {
+            Some(JumpTarget::Text { page: Some(page), .. }) => (false, page_index(*page, pages)),
+            Some(_) => (true, None),
+            None => (false, None),
+        };
         if let Some(view) = self.active.and_then(|i| self.views.get_mut(i)) {
-            view.want_all_text = embed.jump.is_some();
+            view.want_all_text = all_text;
+            view.want_text_page = text_page;
         }
         // `execute` refuses full screen; should anything still set it, leave it the way the app does,
         // so the window follows.
@@ -165,10 +173,10 @@ impl PdfCraftApp {
                 found.into_iter().flatten().map(move |r| (p, r))
             })
             .nth(wanted);
-        match (hit, embed.jump.take()) {
-            (Some((p, range)), _) => jump_to_match(view, &doc.info, p, range),
-            (None, Some(target)) => embed.bridge.emit(HostEvent::JumpNotFound { target }),
-            (None, None) => {}
+        let found = hit.is_some_and(|(p, range)| jump_to_match(view, &doc.info, p, range));
+        match embed.jump.take() {
+            Some(target) if !found => embed.bridge.emit(HostEvent::JumpNotFound { target }),
+            _ => {}
         }
     }
 
@@ -221,11 +229,12 @@ fn page_index(page: u32, pages: usize) -> Option<usize> {
     usize::try_from(page).ok()?.checked_sub(1).filter(|p| *p < pages)
 }
 
-/// Bring a match into view as the find bar does, and outline it briefly.
-fn jump_to_match(view: &mut DocView, info: &DocInfo, page: usize, range: Range<usize>) {
-    let Some(text) = view.texts.get(&page).cloned() else { return };
+/// Bring a match into view as the find bar does, and outline it briefly. `false` when the page's
+/// text or the match's lines are unexpectedly missing, so the host hears `jumpNotFound`.
+fn jump_to_match(view: &mut DocView, info: &DocInfo, page: usize, range: Range<usize>) -> bool {
+    let Some(text) = view.texts.get(&page).cloned() else { return false };
     let rects = text.line_rects(range);
-    let Some(first) = rects.first().copied() else { return };
+    let Some(first) = rects.first().copied() else { return false };
     let bounds = rects.iter().fold(first, |a, r| [a[0].min(r[0]), a[1].min(r[1]), a[2].max(r[2]), a[3].max(r[3])]);
     let height = info.pages.get(page).map_or(1.0, |p| p.height.max(1.0));
     view.go_to_page(page);
@@ -234,6 +243,7 @@ fn jump_to_match(view: &mut DocView, info: &DocInfo, page: usize, range: Range<u
         let (a, b) = (p.view_to_user(bounds[0], bounds[1]), p.view_to_user(bounds[2], bounds[3]));
         view.flash = Some((page, [a[0].min(b[0]), a[1].min(b[1]), a[0].max(b[0]), a[1].max(b[1])], 0.0));
     }
+    true
 }
 
 /// What the host hears about the frame just drawn.

@@ -89,9 +89,30 @@ fn jumps_without_a_document_or_overtaken_by_an_open() {
     bridge.send(HostCommand::Open { name: "other.pdf".into(), bytes: three_pages() });
     h.run_steps(3);
     settle(&mut h);
-    let events = bridge.take_events();
+    // Exactly the new document's events: the waiting jump was dropped, not run against it.
+    assert_eq!(bridge.take_events(), [HostEvent::Opened { pages: 3 }, HostEvent::PageChanged { page: 1 }]);
+    assert_eq!(h.state().views[0].current, 0, "the dropped jump did not move the new document");
+    assert!(h.state().views[0].flash.is_none(), "the dropped jump outlined nothing");
+}
+
+#[test]
+fn a_page_scoped_text_jump_loads_only_its_own_pages_text() {
+    let (mut h, bridge) = embedded();
+    let filler: &[&str] = &["Clause", "Plain filler text"];
+    let target: &[&str] = &["Clause", "The needle is here"];
+    let mut all = vec![filler; 30];
+    all[24] = target;
+    open(&mut h, &bridge, "thirty.pdf", embed_support::pages(&all));
+    assert!(!h.state().views[0].has_text(12), "a page far from the view starts without its text");
+    let events = jump(&mut h, &bridge, text("needle", Some(25), 0));
     assert!(not_found(&events).is_empty(), "{events:?}");
-    assert_eq!(events.first(), Some(&HostEvent::Opened { pages: 3 }));
+    assert_eq!(h.state().views[0].current, 24);
+    assert!(h.state().views[0].has_text(24));
+    assert!(!h.state().views[0].has_text(12), "pages outside the scope and the view stay unread");
+    // An unscoped jump still searches the whole document.
+    let events = jump(&mut h, &bridge, text("needle", None, 0));
+    assert!(not_found(&events).is_empty(), "{events:?}");
+    assert!(h.state().views[0].has_text(12));
 }
 
 #[test]

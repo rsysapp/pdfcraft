@@ -209,6 +209,8 @@ pub struct DocView {
     pub compare_marks: Vec<(usize, [f32; 4], Color32)>,
     /// Embed build: request every page's text layer (host jumps and marks, `crate::embed`).
     pub want_all_text: bool,
+    /// Embed build: request just this page's text layer (a page-scoped host jump).
+    pub want_text_page: Option<usize>,
     pages: HashMap<usize, PageTex>,
     /// Pages the renderer could not draw, with the reason (never re-requested).
     errors: HashMap<usize, String>,
@@ -358,6 +360,7 @@ impl DocView {
             flash: None,
             compare_marks: Vec::new(),
             want_all_text: false,
+            want_text_page: None,
             pages: HashMap::new(),
             errors: HashMap::new(),
             waiting_since: HashMap::new(),
@@ -542,6 +545,11 @@ impl DocView {
     /// A page's thumbnail texture, when rendered (the print preview uses them).
     pub(crate) fn thumb_id(&self, page: usize) -> Option<egui::TextureId> {
         self.thumbs.get(&page).map(|t| t.id())
+    }
+
+    /// Whether `page`'s text layer is loaded (embed build tests).
+    pub fn has_text(&self, page: usize) -> bool {
+        self.texts.contains_key(&page)
     }
 
     pub(crate) fn page_text(&self, page: usize) -> Option<Arc<PageText>> {
@@ -1936,6 +1944,10 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
         let n = info.pages.len();
         let rest: Vec<usize> = (0..n).map(|k| (cur + k) % n).filter(need_text).filter(|p| !text_pages.contains(p)).collect();
         text_pages.extend(rest);
+    }
+    // Embed build: a page-scoped host jump needs only its own page's text.
+    if let Some(page) = view.want_text_page.filter(|p| need_text(p) && !text_pages.contains(p)) {
+        text_pages.push(page);
     }
     queue.extend(text_pages.into_iter().map(|page| RenderRequest { page, kind: RequestKind::Text, tile: None, scale: 1.0, tag: TEXT_TAG }));
     if want_thumbs {
