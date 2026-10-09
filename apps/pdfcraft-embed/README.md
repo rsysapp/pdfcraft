@@ -16,6 +16,8 @@ The zip holds `pdfcraft_embed.js` (generated glue, ES module), `pdfcraft_embed_b
 `pdfcraft_embed.d.ts` (generated declarations), `LICENSE-MIT`, `LICENSE-APACHE`, `NOTICE`,
 `ATTRIBUTION.md` and `SHA256SUMS`. A tag `embed-v<version>` releases it
 (`.github/workflows/embed-release.yml`); the version is this crate's own, not the app's.
+The zip's hash is reproducible on the same toolchain and checkout path (the module records
+source paths).
 
 ## Behaviour a host page relies on
 

@@ -8,8 +8,8 @@ on:
     tags: ["embed-v*"]
   workflow_dispatch:
 
-permissions:
-  contents: read
+# No token rights by default; each job asks for its own.
+permissions: {}
 
 concurrency:
   group: embed-release-${{ github.ref }}
@@ -19,31 +19,20 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   BINARYEN_VERSION: "123"
+  # From the release's own .sha256 asset, cross-checked by hashing the tarball.
+  BINARYEN_SHA256: e959f2170af4c20c552e9de3a0253704d6a9d2766e8fdb88e4d6ac4bae9388fe
 
 jobs:
-  embed:
+  # Builds with a read-only token. Nothing here can write to the repository.
+  build:
     name: Embed build (wasm)
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          toolchain: 1.95.0
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: embed
-      - name: Install wasm-bindgen (the version in Cargo.lock)
-        run: |
-          v="$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/version = |"/, ""); print; exit }' Cargo.lock)"
-          cargo install wasm-bindgen-cli --version "$v" --locked
-      - name: Install wasm-opt (binaryen)
-        run: |
-          curl -fsSL "https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/binaryen-version_${BINARYEN_VERSION}-x86_64-linux.tar.gz" \
-            | tar -xz -C "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/binaryen-version_${BINARYEN_VERSION}/bin" >> "$GITHUB_PATH"
+          persist-credentials: false
       - name: The tag names the crate's version
         if: github.ref_type == 'tag'
         run: |
@@ -52,20 +41,56 @@ jobs:
             echo "::error::tag $GITHUB_REF_NAME, but apps/pdfcraft-embed is version $have"
             exit 1
           fi
+      # dtolnay/rust-toolchain publishes each Rust release as a branch, not a tag; this is the
+      # 1.95.0 branch's commit.
+      - uses: dtolnay/rust-toolchain@1d64bbcee8ef0c191a54710c227fd268a0d5014b # 1.95.0
+        with:
+          toolchain: 1.95.0
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: embed
+      - name: Install wasm-bindgen (the version in Cargo.lock)
+        run: |
+          v="$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/version = |"/, ""); print; exit }' Cargo.lock)"
+          cargo install wasm-bindgen-cli --version "$v" --locked
+      - name: Install wasm-opt (binaryen)
+        run: |
+          tarball="binaryen-version_${BINARYEN_VERSION}-x86_64-linux.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$tarball" "https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/$tarball"
+          echo "$BINARYEN_SHA256  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/binaryen-version_${BINARYEN_VERSION}/bin" >> "$GITHUB_PATH"
       - name: Build and zip
         run: packaging/embed/package.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: pdfcraft-embed
           path: dist/release/pdfcraft-embed-*
           if-no-files-found: error
+
+  # Holds the write token and runs only `gh`: no toolchain, cargo or build action.
+  release:
+    name: Release
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: pdfcraft-embed
+          path: release
       - name: Attach to the release
-        if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           version="${GITHUB_REF_NAME#embed-v}"
-          gh release create "$GITHUB_REF_NAME" "dist/release/pdfcraft-embed-$version.zip" "dist/release/pdfcraft-embed-$version.zip.sha256" \
+          cd release
+          sha256sum -c "pdfcraft-embed-$version.zip.sha256"
+          gh release create "$GITHUB_REF_NAME" "pdfcraft-embed-$version.zip" "pdfcraft-embed-$version.zip.sha256" \
+            --repo "$GITHUB_REPOSITORY" \
             --title "Embed build $version" \
             --notes "pdfcraft-embed-$version.zip: the embed build's WebAssembly module, generated JavaScript glue and TypeScript declarations, licences and SHA256SUMS. See apps/pdfcraft-embed/README.md." \
             --latest=false \

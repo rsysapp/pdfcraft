@@ -88,8 +88,9 @@ FILES=(pdfcraft_embed.js pdfcraft_embed_bg.wasm pdfcraft_embed.d.ts LICENSE-MIT 
 ) >"$OUT/SHA256SUMS"
 
 # Same bytes in, same zip out: fixed timestamps, no extra attributes, a fixed file order.
-# TZ=UTC: zip stores local time and touch reads it, so the zone must not matter.
-(cd "$OUT" && TZ=UTC touch -t 198001010000 "${FILES[@]}" SHA256SUMS)
+# TZ=UTC: zip stores local time and touch reads it, so the zone must not matter. chmod: zip stores
+# the mode, so the umask must not matter either.
+(cd "$OUT" && chmod 644 "${FILES[@]}" SHA256SUMS && TZ=UTC touch -t 198001010000 "${FILES[@]}" SHA256SUMS)
 rm -f "$DIST/$NAME.zip" "$DIST/$NAME.zip.sha256"
 # shellcheck disable=SC2046  # the names have no spaces; sorted in byte order for a fixed entry order
 (cd "$OUT" && TZ=UTC zip -qX9 "$DIST/$NAME.zip" $(printf '%s\n' "${FILES[@]}" SHA256SUMS | LC_ALL=C sort))
