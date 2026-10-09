@@ -23,10 +23,12 @@ env:
   BINARYEN_SHA256: e959f2170af4c20c552e9de3a0253704d6a9d2766e8fdb88e4d6ac4bae9388fe
 
 jobs:
-  # Builds with a read-only token. Nothing here can write to the repository.
+  # Builds with a read-only token. Nothing here can write to the repository. No build cache: a
+  # restored cache could carry another run's outputs into the release. A named runner image, not
+  # -latest, keeps the operating system from changing between releases.
   build:
     name: Embed build (wasm)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -47,9 +49,6 @@ jobs:
         with:
           toolchain: 1.95.0
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: embed
       - name: Install wasm-bindgen (the version in Cargo.lock)
         run: |
           v="$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/version = |"/, ""); print; exit }' Cargo.lock)"
@@ -74,7 +73,7 @@ jobs:
     name: Release
     needs: build
     if: github.ref_type == 'tag'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
