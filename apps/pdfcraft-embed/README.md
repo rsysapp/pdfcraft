@@ -12,9 +12,18 @@ dispatch refuses everything but find, page display and zoom. Ctrl/Cmd+C copies t
 packaging/embed/package.sh   # dist/release/pdfcraft-embed-<version>.zip and .zip.sha256
 ```
 
-The zip holds `pdfcraft_embed.js` (generated glue, ES module), `pdfcraft_embed_bg.wasm`,
-`pdfcraft_embed.d.ts` (generated declarations), `LICENSE-MIT`, `LICENSE-APACHE`, `NOTICE`,
-`ATTRIBUTION.md` and `SHA256SUMS`. A tag `embed-v<version>` releases it
+The zip holds:
+
+| File | What |
+|---|---|
+| `pdfcraft_embed.js` | generated glue (ES module) |
+| `pdfcraft_embed_bg.wasm` | the editor |
+| `pdfcraft_embed.d.ts` | generated TypeScript declarations |
+| `LICENSE-MIT`, `LICENSE-APACHE`, `NOTICE`, `ATTRIBUTION.md` | PdfCraft's licences and attribution |
+| `licenses/` | the licence texts of the third-party assets compiled into the module: Lucide icons (ISC), Inter, JetBrains Mono and Dancing Script (OFL 1.1), egui's default fonts (Ubuntu Font Licence, Hack, OFL 1.1 for Noto Emoji, MIT for emoji-icon-font), the Foxit standard-14 fonts and Adobe CMaps (BSD-3-Clause), and hayro's colour profiles (MIT, CC0); plus `OFL-<family>.txt` for each craft-fonts family when built with `CRAFT_FONTS_DIR` |
+| `SHA256SUMS` | the SHA-256 of every file above |
+
+A tag `embed-v<version>` releases it
 (`.github/workflows/embed-release.yml`); the version is this crate's own, not the app's.
 The zip's hash is reproducible on the same toolchain and checkout path (the module records
 source paths).
@@ -43,6 +52,33 @@ source paths).
 - Keyboard: eframe keeps Tab on the canvas. Wrap the canvas in an element with a capture-phase
   `keydown` listener that moves focus on Tab and Shift+Tab.
 - Nothing is stored in the host page's storage.
+- Hide the host's selection toolbar on `opened` and `openFailed`, and on any pointer, wheel or key
+  input in the canvas's wrapper: a reported selection's `x`, `y` go stale once the page scrolls.
+
+## Limits
+
+- `setMarks` keeps the first 2,000 marks (`MAX_MARKS`) and ignores the rest.
+- Passages are at most 10,000 characters once folded (`MAX_NEEDLE_CHARS`): a longer mark is
+  skipped, a longer text jump answers `jumpNotFound`. A mark that is empty once folded is skipped.
+- Page numbers and occurrences above 2^32-1 saturate to 2^32-1, so they are out of range for any
+  document: the jump answers `jumpNotFound`, the mark is skipped. Negative or fractional numbers
+  throw.
+- `open` has no size cap of its own: the host caps the file size it passes.
+- A text jump or mark without a page loads every page's text layer, so its cost grows with the
+  page count; a page-scoped one loads that page alone. Matching costs O(page text × passage) per
+  page searched, on the frame.
+- What a malformed call throws echoes the strings the host sent (a mark's id or colour, a value
+  that failed to parse), and `openFailed` carries the parser's message: show them as text, never
+  as markup.
+- The command and event queues are unbounded: the host page is trusted not to flood them.
+
+## Crashes
+
+A Rust panic aborts the WebAssembly module: there is no unwinding on wasm32. After one the editor
+sends nothing more and later calls may throw. The host therefore puts a timeout on `open`: no
+`opened` or `openFailed` within it (or a call that throws) is a failure, after which the host shows
+its own failure panel, calls `destroy` and mounts a fresh editor for the next document. On a
+`mount` timeout, keep the promise and `destroy` the editor if it resolves late.
 
 ## Branding
 
