@@ -52,6 +52,8 @@ pub(crate) enum Check {
     Idle,
     #[cfg(not(target_arch = "wasm32"))]
     Running(std::sync::mpsc::Receiver<Result<Release, String>>),
+    // Embed build: wasm32 runs no update check, so nothing finishes one (the wasm32 clippy gate).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     Done(Result<Release, String>),
 }
 

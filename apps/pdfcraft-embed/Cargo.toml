@@ -1,0 +1,25 @@
+[package]
+name = "pdfcraft-embed"
+description = "The embed build: PdfCraft's page view as a WebAssembly module a host page mounts on its own canvas"
+# Released on its own (tags embed-v<version>), so not the workspace version.
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Without `brand`: a modified build may not carry the ArtCraft marks (docs/brand/LICENSE-brand.txt).
+# A path dependency, because a workspace dependency would ignore `default-features = false`.
+pdfcraft-ui-egui = { path = "../../crates/ui-egui", default-features = false }
+eframe = { workspace = true, features = ["default_fonts", "glow"] }
+egui = { workspace = true }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["HtmlCanvasElement", "console"] }

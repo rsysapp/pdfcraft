@@ -88,11 +88,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
+          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           key: wasm32
       - name: Check library crates for wasm32
         run: cargo xtask wasm
+      - name: Clippy for the embed build (wasm32)
+        run: cargo clippy -p pdfcraft-embed --target wasm32-unknown-unknown -- -D warnings
 
   deny:
     name: dependency licences and advisories

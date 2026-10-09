@@ -87,11 +87,16 @@ pub const TABLE: &[(&str, Class)] = &[
     ("pdfcraft", Class::Exempt),
     ("cli", Class::Exempt),
     ("web", Class::Exempt),
+    ("embed", Class::Exempt),
     ("xtask", Class::Exempt),
 ];
 
 /// Workspace crates a standalone crate may use (architecture §3 rule 3: `cos → filters, crypt, geom`).
 pub const STANDALONE_DEPS: &[(&str, &[&str])] = &[("cos", &["filters", "crypt", "geom"])];
+
+/// Apps that ship as WebAssembly modules. Exempt from layering like every app, but
+/// `cargo xtask wasm` checks them, so a browser-only crate can't stop compiling unnoticed.
+pub const WASM_APPS: &[&str] = &["embed"];
 
 /// Allowed same-layer edges (architecture §3 rule 1). `forms → js` is deliberately absent.
 pub const SIDEWAYS: &[(&str, &str)] = &[
@@ -116,6 +121,11 @@ pub fn short_name(pkg: &str) -> &str {
 pub fn classify(pkg: &str) -> Option<Class> {
     let s = short_name(pkg);
     TABLE.iter().find(|(n, _)| *n == s).map(|(_, c)| *c)
+}
+
+/// Whether `cargo xtask wasm` checks `pkg` although it is an app (see [`WASM_APPS`]).
+pub fn builds_for_wasm(pkg: &str) -> bool {
+    WASM_APPS.contains(&short_name(pkg))
 }
 
 fn is_ui_crate(name: &str) -> bool {
@@ -332,5 +342,15 @@ mod tests {
         for app in ["pdfcraft", "pdfcraft-cli", "pdfcraft-web", "xtask"] {
             assert!(check(&[c(app, &[("egui", Normal, false), ("pdfcraft-ui-egui", Normal, true)])]).is_empty());
         }
+    }
+
+    #[test]
+    fn wasm_apps_are_registered_and_checked() {
+        for app in WASM_APPS {
+            assert_eq!(classify(&format!("pdfcraft-{app}")), Some(Class::Exempt), "{app} is an app");
+        }
+        assert!(builds_for_wasm("pdfcraft-embed"), "the embed build is never silently exempt from the wasm32 check");
+        assert!(!builds_for_wasm("pdfcraft-web"));
+        assert!(check(&[c("pdfcraft-embed", &[("eframe", Normal, false), ("pdfcraft-ui-egui", Normal, true)])]).is_empty());
     }
 }

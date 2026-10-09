@@ -286,6 +286,8 @@ struct Shared {
     busy: Mutex<Vec<Option<(RenderRequest, std::time::Instant)>>>,
     /// Pages (and request kinds) the watchdog gave up on: answered with an error at once, so a
     /// pathological page cannot trap every worker in turn.
+    // Embed build: wasm32 has no worker threads, so no watchdog reads this (the wasm32 clippy gate).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     stuck: Mutex<std::collections::HashSet<(usize, RequestKind)>>,
     /// Test hook: make one page slow.
     #[cfg(test)]
@@ -303,6 +305,8 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// the stuck one's place (threads cannot be killed; the stuck one exits when its render
 /// finally returns, and its late result is dropped). At most `threads` replacements are started
 /// per pool, so a document full of pathological pages cannot spawn threads without bound.
+// Embed build: on wasm32 the worker and watchdog fields go unread (the wasm32 clippy gate).
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub struct RenderPool {
     shared: Arc<Shared>,
     wake: Mutex<Vec<Sender<()>>>,

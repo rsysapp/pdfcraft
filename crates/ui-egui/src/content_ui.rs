@@ -477,7 +477,8 @@ impl crate::PdfCraftApp {
             });
         }
         #[cfg(target_arch = "wasm32")]
-        self.notify_fmt("{name}: choosing images arrives on the web with file pickers for images", &[("name", &name)]);
+        // Embed build: `name`, not `&name` (clippy's needless_borrow, seen by the wasm32 clippy gate).
+        self.notify_fmt("{name}: choosing images arrives on the web with file pickers for images", &[("name", name)]);
     }
 
     /// Edit image ▸ Replace: pick a file for the selected image.
