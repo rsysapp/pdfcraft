@@ -89,9 +89,19 @@ impl Embed {
         self.set_marks(Vec::new());
     }
 
-    /// Replace every host mark; they are searched for again as text layers arrive.
+    /// Replace every host mark; they are searched for again as text layers arrive. A mark that can
+    /// never match (blank once folded, or longer than matching takes) is skipped here, so it never
+    /// asks for any page's text.
     fn set_marks(&mut self, marks: Vec<Mark>) {
-        self.needles = marks.iter().map(|m| text_match::fold(&m.text)).collect();
+        let (marks, needles): (Vec<Mark>, Vec<Vec<char>>) = marks
+            .into_iter()
+            .map(|m| {
+                let needle = text_match::fold(&m.text);
+                (m, needle)
+            })
+            .filter(|(_, needle)| !needle.is_empty() && needle.len() <= text_match::MAX_NEEDLE_CHARS)
+            .unzip();
+        self.needles = needles;
         self.hits = vec![None; marks.len()];
         self.marks = marks;
         self.page_marks = Arc::default();

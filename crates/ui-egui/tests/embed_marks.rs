@@ -114,8 +114,26 @@ fn page_scoped_marks_load_their_own_pages_and_out_of_range_ones_are_skipped() {
         mark("early", "Definitions", Some(1), "#0000ff80"),
         mark("beyond", "Delivery", Some(9), "#ff00ff80"),
         mark("zero", "Delivery", Some(0), "#ff00ff80"),
+        mark("saturated", "Delivery", Some(u32::MAX), "#ff00ff80"),
     ]));
     settle(&mut h);
     let found: Vec<(String, usize)> = h.state().found_host_marks().into_iter().map(|(id, page, _)| (id, page)).collect();
     assert_eq!(found, [("early".to_string(), 1), ("late".to_string(), 3)]);
+}
+
+#[test]
+fn marks_that_can_never_match_load_no_text() {
+    let (mut h, bridge) = embedded();
+    let filler: &[&str] = &["Clause", "Plain filler text"];
+    open(&mut h, &bridge, "thirty.pdf", pages(&[filler; 30]));
+    assert!(!h.state().views[0].has_text(12), "a page far from the view starts without its text");
+    let oversized = "x".repeat(pdfcraft_ui_egui::embed::text_match::MAX_NEEDLE_CHARS + 1);
+    bridge.send(HostCommand::SetMarks(vec![
+        mark("empty", "", None, "#ff000080"),
+        mark("blank", " \t ", None, "#ff000080"),
+        mark("long", &oversized, None, "#ff000080"),
+    ]));
+    settle(&mut h);
+    assert!(h.state().found_host_marks().is_empty());
+    assert!(!h.state().views[0].has_text(12), "skipped marks ask for no page's text");
 }

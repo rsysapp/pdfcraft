@@ -179,6 +179,8 @@ impl HostBridge {
 struct WireMark {
     id: String,
     text: String,
+    // Saturated like a jump's page: one beyond u32 is a page no document has, so the mark is skipped.
+    #[serde(default, deserialize_with = "saturating_optional_u32")]
     page: Option<u32>,
     color: String,
 }
@@ -306,6 +308,13 @@ mod tests {
         assert_eq!(marks[1].page, Some(2));
         assert_eq!(marks[1].color, Color32::from_rgb(0, 255, 0));
         assert_eq!(parse_marks("[]"), Ok(Vec::new()));
+        // A page beyond u32 is out of range for any document (the mark is skipped), not malformed.
+        let far = parse_marks(r##"[{"id":"far","text":"x","page":5000000000,"color":"#000000ff"}]"##).expect("saturates");
+        assert_eq!(far[0].page, Some(u32::MAX));
+        for bad_page in ["-1", "1.5", "\"2\""] {
+            let json = format!(r##"[{{"id":"t","text":"x","page":{bad_page},"color":"#000000ff"}}]"##);
+            assert!(parse_marks(&json).is_err(), "{bad_page}");
+        }
         let err = parse_marks(r#"[{"id":"t1","text":"x","page":null,"color":"red"}]"#).expect_err("not a colour");
         assert!(err.contains("t1"), "{err}");
         let many_marks: Vec<String> =
