@@ -94,3 +94,25 @@ fn coordinates_are_css_pixels_so_they_scale_with_the_zoom_factor() {
         "same place on the page at both factors"
     );
 }
+
+#[test]
+fn a_whitespace_only_selection_clears_the_one_reported() {
+    let (mut h, bridge) = embedded();
+    open(&mut h, &bridge, "lines.pdf", two_lines());
+    // Glyphs: "The" 0–2, a space 3, "quick" 4–8.
+    h.state_mut().views[0].select_text(0, 4, 8);
+    h.run_steps(2);
+    let events = selections(&bridge.take_events());
+    assert!(matches!(events.as_slice(), [HostEvent::Selection { text, .. }] if text == "quick"), "{events:?}");
+    h.state_mut().views[0].select_text(0, 3, 3);
+    h.run_steps(2);
+    assert_eq!(selections(&bridge.take_events()), [HostEvent::SelectionCleared], "the host's toolbar must not stay on stale text");
+    h.run_steps(3);
+    assert!(selections(&bridge.take_events()).is_empty(), "cleared once");
+    // Clearing the blank selection, or selecting blank again, says nothing more.
+    h.key_press(Key::Escape);
+    h.run_steps(2);
+    h.state_mut().views[0].select_text(0, 3, 3);
+    h.run_steps(2);
+    assert!(selections(&bridge.take_events()).is_empty(), "nothing was reported since the clear");
+}

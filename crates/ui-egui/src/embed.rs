@@ -54,8 +54,10 @@ pub(crate) struct Embed {
     jump: Option<JumpTarget>,
     /// The page last reported (`pageChanged`), 0-based.
     last_page: Option<usize>,
-    /// The selection last reported, as (page, glyph range).
+    /// The selection last settled, as (page, glyph range), blank ones included.
     last_selection: Option<(usize, Range<usize>)>,
+    /// Whether the host was last told of a selection (`selection`), not of none (`selectionCleared`).
+    selection_reported: bool,
     /// The host's marks as it sent them, and their texts folded for matching.
     marks: Vec<Mark>,
     needles: Vec<Vec<char>>,
@@ -83,6 +85,7 @@ impl Embed {
         self.jump = None;
         self.last_page = None;
         self.last_selection = None;
+        self.selection_reported = false;
         self.set_marks(Vec::new());
     }
 
@@ -420,30 +423,56 @@ fn collect_events(app: &mut PdfCraftApp, ctx: &egui::Context) {
     if now == embed.last_selection || ctx.input(|i| i.pointer.any_down()) {
         return;
     }
-    match &now {
-        None => embed.bridge.emit(HostEvent::SelectionCleared),
-        Some((page, range)) => {
-            // Off screen (no position yet): try again next frame.
-            let Some(event) = selection_event(view, *page, range.clone(), ctx.zoom_factor()) else { return };
+    let reading = match &now {
+        None => Reading::Blank,
+        Some((page, range)) => selection_event(view, *page, range.clone(), ctx.zoom_factor()),
+    };
+    match reading {
+        // Off screen or its text layer not in yet: try again next frame.
+        Reading::NotReady => return,
+        // No selection, or only whitespace: nothing for the host to act on, so a selection it was
+        // told of is cleared (once), or its toolbar would stay on stale text.
+        Reading::Blank => {
+            if embed.selection_reported {
+                embed.bridge.emit(HostEvent::SelectionCleared);
+            }
+            embed.selection_reported = false;
+        }
+        Reading::Text(event) => {
             embed.bridge.emit(event);
+            embed.selection_reported = true;
         }
     }
     embed.last_selection = now;
 }
 
+/// A settled selection as the host would hear of it.
+enum Reading {
+    Text(HostEvent),
+    /// Only whitespace (or nothing) is selected.
+    Blank,
+    /// The page is off screen or its text layer is not loaded.
+    NotReady,
+}
+
 /// The selection as the host hears it, placed at the end of its last line: egui points times the
 /// zoom factor are CSS pixels from the canvas's top-left.
-fn selection_event(view: &DocView, page: usize, range: Range<usize>, zoom: f32) -> Option<HostEvent> {
-    let text = view.texts.get(&page)?;
+fn selection_event(view: &DocView, page: usize, range: Range<usize>, zoom: f32) -> Reading {
+    let Some(text) = view.texts.get(&page) else { return Reading::NotReady };
     let copy_text = text.text_of(range.clone());
     if copy_text.trim().is_empty() {
-        return None;
+        return Reading::Blank;
     }
-    let last = text.line_rects(range).last().copied()?;
-    let end = view.page_xform(page)?.view_rect(last).right_bottom();
+    let Some(last) = text.line_rects(range).last().copied() else { return Reading::NotReady };
+    let Some(xf) = view.page_xform(page) else { return Reading::NotReady };
+    let end = xf.view_rect(last).right_bottom();
     let (x, y) = (end.x * zoom, end.y * zoom);
     let text = copy_text.split_whitespace().collect::<Vec<_>>().join(" ");
-    (x.is_finite() && y.is_finite()).then_some(HostEvent::Selection { text, copy_text, page: Some(page + 1), x, y })
+    if x.is_finite() && y.is_finite() {
+        Reading::Text(HostEvent::Selection { text, copy_text, page: Some(page + 1), x, y })
+    } else {
+        Reading::NotReady
+    }
 }
 
 /// The embed build's frame: the navigation rail and the page view. Dialogs, panels, the palette
