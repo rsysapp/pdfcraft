@@ -8,6 +8,11 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["brand"]
+# The ArtCraft marks (docs/brand/). Builds that may not carry them (the embed build) turn it off.
+brand = []
+
 [dependencies]
 pdfcraft-fonts = { workspace = true }
 pdfcraft-engine = { workspace = true }

@@ -201,24 +201,29 @@ pub fn progress_notice(app: &PdfCraftApp, ctx: &egui::Context) -> bool {
     cancel
 }
 
+/// The ArtCraft marks (docs/brand/; trademarks, not open source): the wordmark for light and dark
+/// backgrounds, then the mark. Embed build: without the `brand` feature there are none and the
+/// plain name shows instead.
+#[cfg(feature = "brand")]
+const BRAND: Option<[(&str, &[u8]); 3]> = Some([
+    ("bytes://artcraft-logo.svg", include_bytes!("../../../docs/brand/artcraft-logo.svg")),
+    ("bytes://artcraft-logo-white.svg", include_bytes!("../../../docs/brand/artcraft-logo-white.svg")),
+    ("bytes://artcraft-mark.svg", include_bytes!("../../../docs/brand/artcraft-mark.svg")),
+]);
+#[cfg(not(feature = "brand"))]
+const BRAND: Option<[(&str, &[u8]); 3]> = None;
+
 /// The ArtCraft wordmark (Storyteller's brand, docs/brand/; not open source), sized to `height`.
 pub fn artcraft_logo(ui: &mut egui::Ui, height: f32) -> Response {
-    let dark = ui.visuals().dark_mode;
-    let (uri, bytes): (&str, &'static [u8]) = if dark {
-        ("bytes://artcraft-logo-white.svg", include_bytes!("../../../docs/brand/artcraft-logo-white.svg"))
-    } else {
-        ("bytes://artcraft-logo.svg", include_bytes!("../../../docs/brand/artcraft-logo.svg"))
-    };
+    let Some([light, white, _]) = BRAND else { return ui.label("PdfCraft") };
+    let (uri, bytes) = if ui.visuals().dark_mode { white } else { light };
     ui.add(egui::Image::from_bytes(uri, bytes).max_height(height).alt_text("ArtCraft"))
 }
 
 /// The ArtCraft mark (brand blue, works on light and dark), `size` points square.
 pub fn artcraft_mark(ui: &mut egui::Ui, size: f32) -> Response {
-    ui.add(
-        egui::Image::from_bytes("bytes://artcraft-mark.svg", include_bytes!("../../../docs/brand/artcraft-mark.svg"))
-            .fit_to_exact_size(vec2(size, size))
-            .alt_text("ArtCraft"),
-    )
+    let Some([_, _, (uri, bytes)]) = BRAND else { return ui.label("PdfCraft") };
+    ui.add(egui::Image::from_bytes(uri, bytes).fit_to_exact_size(vec2(size, size)).alt_text("ArtCraft"))
 }
 
 /// Buttons for every community link (`pdfcraft_engine::links`), Discord first and prominent.
@@ -322,5 +327,12 @@ mod tests {
         app.notify("Saved");
         let again = toast_rect(&mut app, &ctx, 1280.0, &mut now);
         assert!((again.width() - short.width()).abs() < 1.0, "long notices must not impose a permanent minimum width");
+    }
+
+    /// docs/brand/LICENSE-brand.txt: a modified build (the embed build turns `brand` off) carries
+    /// none of the ArtCraft marks, so they are compiled in only with the feature.
+    #[test]
+    fn the_artcraft_marks_are_compiled_only_with_the_brand_feature() {
+        assert_eq!(BRAND.is_some(), cfg!(feature = "brand"));
     }
 }
