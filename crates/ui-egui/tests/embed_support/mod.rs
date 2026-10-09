@@ -62,11 +62,11 @@ pub fn embedded() -> (Harness<'static, PdfCraftApp>, HostBridge) {
     (h, bridge)
 }
 
-/// Run frames until page renders and text layers are in.
+/// Run frames until page renders, text layers and host work (jumps, marks) are done.
 pub fn settle(h: &mut Harness<'static, PdfCraftApp>) {
     for _ in 0..500 {
         h.run_steps(2);
-        if !h.state().render_pending() {
+        if !h.state().render_pending() && !h.state().host_work_pending() {
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -81,4 +81,13 @@ pub fn open(h: &mut Harness<'static, PdfCraftApp>, bridge: &HostBridge, name: &s
     h.run_steps(3);
     settle(h);
     bridge.take_events()
+}
+
+/// Three pages of an agreement-like text; page 1 quotes "Goods" with curly quotes.
+pub fn three_pages() -> Vec<u8> {
+    pages(&[
+        &["Definitions", "The \\223Goods\\224 are the packaging", "described in Schedule 1."],
+        &["Delivery", "The Supplier delivers the Goods", "within five days."],
+        &["Payment", "The Buyer pays for the Goods", "within thirty days."],
+    ])
 }

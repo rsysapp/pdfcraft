@@ -15,10 +15,13 @@ pub use protocol::{
     parse_theme,
 };
 
+use std::ops::Range;
 use std::sync::Arc;
 
+use pdfcraft_render::DocInfo;
+
 use crate::theme::{ThemeKind, ThemePreference};
-use crate::{Mode, PdfCraftApp, QuickTool};
+use crate::{DocView, Mode, PdfCraftApp, QuickTool};
 
 /// What `open` answers for a file that needs a password; view mode never prompts.
 const PASSWORD_MESSAGE: &str = "This file is password-protected and can't be shown here.";
@@ -45,6 +48,18 @@ pub(crate) struct Embed {
     bridge: HostBridge,
     /// A theme to apply once this frame's styling has run.
     theme: Option<Theme>,
+    /// A text jump waiting for the text layers it searches.
+    jump: Option<JumpTarget>,
+    /// The page last reported (`pageChanged`), 0-based.
+    last_page: Option<usize>,
+}
+
+impl Embed {
+    /// Forget what belonged to the document that was open.
+    fn document_closed(&mut self) {
+        self.jump = None;
+        self.last_page = None;
+    }
 }
 
 impl PdfCraftApp {
@@ -73,13 +88,18 @@ impl PdfCraftApp {
         for command in embed.bridge.take_commands() {
             match command {
                 HostCommand::Open { name, bytes } => self.host_open(&mut embed, &name, bytes),
-                HostCommand::JumpTo(target) => embed.bridge.emit(HostEvent::JumpNotFound { target }),
+                HostCommand::JumpTo(target) => self.host_jump(&mut embed, target),
                 HostCommand::SetMarks(_) => {}
                 HostCommand::SetTheme(theme) => embed.theme = Some(theme),
             }
         }
         if let Some(theme) = embed.theme.take() {
             self.apply_host_theme(ctx, &theme);
+        }
+        // Text layers that arrived this frame (`receive`, earlier in `logic`).
+        self.resolve_jump(&mut embed);
+        if let Some(view) = self.active.and_then(|i| self.views.get_mut(i)) {
+            view.want_all_text = embed.jump.is_some();
         }
         // `execute` refuses full screen; should anything still set it, leave it the way the app does,
         // so the window follows.
@@ -88,6 +108,68 @@ impl PdfCraftApp {
         }
         self.enforce_view_profile();
         self.embed = Some(embed);
+    }
+
+    /// Whether host work (a text jump) still waits for text layers (tests).
+    pub fn host_work_pending(&self) -> bool {
+        self.embed.as_ref().is_some_and(|e| e.jump.is_some())
+    }
+
+    fn active_page_count(&self) -> usize {
+        self.active_ids().and_then(|(_, id)| self.session.get(id)).map_or(0, |d| d.info.pages.len())
+    }
+
+    /// Start a jump: a page goes at once; text resolves now if its text layers are in, otherwise
+    /// it waits (a newer jump replaces one still waiting).
+    fn host_jump(&mut self, embed: &mut Embed, target: JumpTarget) {
+        // Any newer jump, found or not, replaces one still waiting for text layers.
+        embed.jump = None;
+        let pages = self.active_page_count();
+        let nowhere = match &target {
+            JumpTarget::Page { page } => match (page_index(*page, pages), self.active.and_then(|i| self.views.get_mut(i))) {
+                (Some(p), Some(view)) => {
+                    view.go_to_page(p);
+                    false
+                }
+                _ => true,
+            },
+            JumpTarget::Text { page, .. } => pages == 0 || page.is_some_and(|p| page_index(p, pages).is_none()),
+        };
+        if nowhere {
+            embed.bridge.emit(HostEvent::JumpNotFound { target });
+        } else if matches!(target, JumpTarget::Text { .. }) {
+            embed.jump = Some(target);
+            self.resolve_jump(embed);
+        }
+    }
+
+    /// Finish a waiting text jump once every page it searches has its text layer.
+    fn resolve_jump(&mut self, embed: &mut Embed) {
+        let Some(JumpTarget::Text { text, page, occurrence }) = &embed.jump else { return };
+        let Some((index, id)) = self.active_ids() else { return };
+        let (Some(doc), Some(view)) = (self.session.get(id), self.views.get_mut(index)) else { return };
+        let pages = doc.info.pages.len();
+        let scope: Vec<usize> = match page.and_then(|p| page_index(p, pages)) {
+            Some(p) => vec![p],
+            None => (0..pages).collect(),
+        };
+        if !scope.iter().all(|p| view.texts.contains_key(p) || view.text_failed.contains(p)) {
+            return;
+        }
+        let needle = [text_match::fold(text)];
+        let wanted = usize::try_from(*occurrence).unwrap_or(usize::MAX);
+        let hit = scope
+            .iter()
+            .flat_map(|&p| {
+                let found = view.texts.get(&p).map(|t| text_match::find_all(t, &needle)).unwrap_or_default();
+                found.into_iter().flatten().map(move |r| (p, r))
+            })
+            .nth(wanted);
+        match (hit, embed.jump.take()) {
+            (Some((p, range)), _) => jump_to_match(view, &doc.info, p, range),
+            (None, Some(target)) => embed.bridge.emit(HostEvent::JumpNotFound { target }),
+            (None, None) => {}
+        }
     }
 
     /// The host's theme, recorded as an explicit preference so the app's system-theme sync
@@ -104,6 +186,7 @@ impl PdfCraftApp {
         while !self.views.is_empty() {
             self.close_tab(0);
         }
+        embed.document_closed();
         let event = match self.try_open(name, None, Arc::new(bytes), None) {
             Err(e) => HostEvent::OpenFailed { message: format!("This file can't be shown: {e}") },
             Ok(()) if self.password_prompt.take().is_some() => HostEvent::OpenFailed { message: PASSWORD_MESSAGE.into() },
@@ -133,10 +216,41 @@ impl PdfCraftApp {
     }
 }
 
+/// A host page number (1-based) as a page index, if the document has that page.
+fn page_index(page: u32, pages: usize) -> Option<usize> {
+    usize::try_from(page).ok()?.checked_sub(1).filter(|p| *p < pages)
+}
+
+/// Bring a match into view as the find bar does, and outline it briefly.
+fn jump_to_match(view: &mut DocView, info: &DocInfo, page: usize, range: Range<usize>) {
+    let Some(text) = view.texts.get(&page).cloned() else { return };
+    let rects = text.line_rects(range);
+    let Some(first) = rects.first().copied() else { return };
+    let bounds = rects.iter().fold(first, |a, r| [a[0].min(r[0]), a[1].min(r[1]), a[2].max(r[2]), a[3].max(r[3])]);
+    let height = info.pages.get(page).map_or(1.0, |p| p.height.max(1.0));
+    view.go_to_page(page);
+    view.goto = Some((page, ((first[1] - 60.0) / height).clamp(0.0, 1.0)));
+    if let Some(p) = info.pages.get(page) {
+        let (a, b) = (p.view_to_user(bounds[0], bounds[1]), p.view_to_user(bounds[2], bounds[3]));
+        view.flash = Some((page, [a[0].min(b[0]), a[1].min(b[1]), a[0].max(b[0]), a[1].max(b[1])], 0.0));
+    }
+}
+
+/// What the host hears about the frame just drawn.
+fn collect_events(app: &mut PdfCraftApp, _ctx: &egui::Context) {
+    let Some(embed) = app.embed.as_mut() else { return };
+    let Some(view) = app.active.and_then(|i| app.views.get(i)) else { return };
+    if embed.last_page != Some(view.current) {
+        embed.last_page = Some(view.current);
+        embed.bridge.emit(HostEvent::PageChanged { page: view.current + 1 });
+    }
+}
+
 /// The embed build's frame: the navigation rail and the page view. Dialogs, panels, the palette
 /// and notices are never drawn.
 pub(crate) fn show(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
-    let t = crate::theme::Tokens::get(ui.ctx());
+    let ctx = ui.ctx().clone();
+    let t = crate::theme::Tokens::get(&ctx);
     if app.active.is_some() {
         rail::show(app, ui);
     }
@@ -145,6 +259,7 @@ pub(crate) fn show(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
             crate::canvas::document_area(app, i, ui);
         }
     });
+    collect_events(app, &ctx);
 }
 
 #[cfg(test)]
