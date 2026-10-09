@@ -23,6 +23,8 @@ pub mod ocr;
 pub mod optimizer;
 pub mod signature_image;
 pub mod xfa;
+// Embed build: view-only sessions.
+mod view_only;
 
 pub use signature_image::{ImageSignaturePreview, SignatureImage};
 
@@ -235,6 +237,8 @@ pub struct Document {
     /// XFA forms: what was approximated, rewritten or could not be written to the XFA data
     /// (also in `info.warnings`, kept there when the document is re-read).
     pub xfa_warnings: Vec<String>,
+    /// Embed build: opened in a view-only session ([`Session::set_view_only`]); nothing may change it.
+    view_only: bool,
 }
 
 impl Document {
@@ -356,7 +360,9 @@ impl Document {
     }
 
     pub fn editable(&self) -> bool {
-        self.editor.is_some()
+        // Embed build: a view-only document keeps its editor (comments without appearance
+        // streams are drawn from it, `display_bytes`) but is never edited.
+        self.editor.is_some() && !self.view_only
     }
 
     /// What the opening password allows; `None` when the document is not encrypted.
@@ -1875,6 +1881,8 @@ pub struct Session {
     trust: Arc<TrustStore>,
     /// Preferences ▸ JavaScript ▸ Enable Acrobat JavaScript, inverted (on by default).
     js_off: bool,
+    /// Embed build: every change is refused ([`Session::set_view_only`]).
+    view_only: bool,
 }
 
 /// Lay a dynamic XFA form out (pages and fields) and give its widgets appearances.
@@ -2011,6 +2019,10 @@ impl Session {
     /// Open saved revision `n` (1 = the oldest) of a document as a new, unsaved document named
     /// "<name> (revision n)".
     pub fn open_revision(&mut self, id: DocId, n: usize) -> Result<DocId, String> {
+        // Embed build: no new documents in a view-only session.
+        if self.view_only {
+            return Err(format!("this document can't be edited: {}", view_only::VIEW_ONLY));
+        }
         let doc = self.get(id).ok_or("no such document")?;
         let ends = doc.revision_ends();
         let end = *n.checked_sub(1).and_then(|i| ends.get(i)).ok_or_else(|| format!("the document has {} revision(s)", ends.len()))?;
@@ -2230,11 +2242,16 @@ impl Session {
             xfa,
             xfa_template: None,
             xfa_warnings: Vec::new(),
+            view_only: self.view_only,
         });
         Ok(id)
     }
 
     fn doc_mut(&mut self, id: DocId) -> Result<&mut Document, EditError> {
+        // Embed build: every change to a document comes through here; view-only sessions refuse it.
+        if self.view_only {
+            return Err(EditError::ReadOnly(view_only::VIEW_ONLY.into()));
+        }
         self.docs.iter_mut().find(|d| d.id == id).ok_or(EditError::NoDocument)
     }
 
@@ -2773,6 +2790,10 @@ impl Session {
 
     /// Open freshly created bytes (combine / extract) as a new, unsaved document.
     pub fn open_new(&mut self, name: impl Into<String>, bytes: Arc<Vec<u8>>) -> Result<DocId, OpenError> {
+        // Embed build: no new documents in a view-only session.
+        if self.view_only {
+            return Err(OpenError::Invalid(view_only::VIEW_ONLY.into()));
+        }
         let id = self.open(name, None, bytes, None)?;
         if let Some(d) = self.docs.iter_mut().find(|d| d.id == id) {
             d.dirty = true;
@@ -2823,6 +2844,10 @@ impl Session {
     /// Show or hide a layer (optional content group) for viewing. Returns `true` if it changed;
     /// callers must drop cached rasters and text for the document.
     pub fn set_layer_visible(&mut self, id: DocId, layer: usize, visible: bool) -> bool {
+        // Embed build: a view-only session changes nothing, not even what is shown.
+        if self.view_only {
+            return false;
+        }
         let Some(doc) = self.docs.iter_mut().find(|d| d.id == id) else { return false };
         let Some(l) = doc.info.layers.get_mut(layer) else { return false };
         if l.visible == visible {
@@ -2839,6 +2864,10 @@ impl Session {
     /// Returns `true` if any layer changed; callers must drop cached rasters and text for the
     /// document, as for [`Self::set_layer_visible`].
     pub fn set_layer_state(&mut self, id: DocId, changes: &[(LayerOp, (u32, u16))], preserve_rb: bool) -> bool {
+        // Embed build: a view-only session changes nothing, not even what is shown.
+        if self.view_only {
+            return false;
+        }
         let Some(doc) = self.docs.iter_mut().find(|d| d.id == id) else { return false };
         if !apply_layer_state(&mut doc.info.layers, &doc.info.layer_groups, changes, preserve_rb) {
             return false;
@@ -2850,6 +2879,10 @@ impl Session {
     /// Hide or show every comment on the page (Acrobat's Comments ▸ Hide all comments). Form
     /// fields and links still draw. Returns whether anything changed.
     pub fn set_hide_comments(&mut self, id: DocId, hide: bool) -> bool {
+        // Embed build: a view-only session changes nothing, not even what is shown.
+        if self.view_only {
+            return false;
+        }
         let Some(doc) = self.docs.iter_mut().find(|d| d.id == id) else { return false };
         if doc.config.hide_comments == hide {
             return false;
