@@ -293,68 +293,75 @@ pub fn right_rail(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
             }
 
             // Page navigation cluster at the bottom (as in Acrobat's rail).
-            let view = &mut app.views[index];
-            let mut page_display = None;
-            ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.y = 2.0;
-                if icons::button(ui, "zoom-out", 32.0, false, tl!("Zoom out (⌘−)")).clicked() {
-                    view.zoom_step(false);
-                }
-                if icons::button(ui, "zoom-in", 32.0, false, tl!("Zoom in (⌘+)")).clicked() {
-                    view.zoom_step(true);
-                }
-                // Between rotate and zoom, as in Acrobat. Its command runs once `view` is free.
-                let tip = crate::i18n::fmt(tl!("Page display: {layout}"), &[("layout", tl!(view.layout.label()))]);
-                let resp = icons::button(ui, view.layout.icon(), 32.0, false, &tip);
-                page_display = egui::Popup::menu(&resp)
-                    .show(|ui| {
-                        ui.set_min_width(220.0);
-                        rail_view_menu(ui, view)
-                    })
-                    .and_then(|r| r.inner);
-                if icons::button(ui, "rotate-cw", 32.0, false, tl!("Rotate view clockwise (⇧⌘+)")).clicked() {
-                    view.rotate_view(true);
-                }
-                // Not `columns-2` while fitting the page: that is the two-page view's icon.
-                let fit_icon = if view.fit == Fit::Width { "maximize" } else { "maximize-2" };
-                if icons::button(ui, fit_icon, 32.0, false, tl!("Toggle fit page / fit width")).clicked() {
-                    view.fit = if view.fit == Fit::Width { Fit::Page } else { Fit::Width };
-                    view.goto = Some((view.current, 0.0));
-                }
-                ui.label(egui::RichText::new(format!("{:.0}%", view.zoom * 100.0)).font(theme::regular(10.5)).color(t.text_faint));
-                ui.add_space(6.0);
-                if icons::button(ui, "chevron-down", 30.0, false, tl!("Next page")).clicked() {
-                    view.step_page(true);
-                }
-                if icons::button(ui, "chevron-up", 30.0, false, tl!("Previous page")).clicked() {
-                    view.step_page(false);
-                }
-                ui.label(egui::RichText::new(page_count.to_string()).font(theme::regular(11.0)).color(t.text_muted));
-                let edit = egui::TextEdit::singleline(&mut view.page_input)
-                    .id(egui::Id::new("page-input"))
-                    .desired_width(34.0)
-                    .horizontal_align(Align::Center)
-                    .font(theme::medium(12.0))
-                    .margin(vec2(2.0, 4.0));
-                let r = egui::Frame::NONE
-                    .fill(t.field)
-                    .stroke(Stroke::new(1.0, t.border))
-                    .corner_radius(CornerRadius::same(5))
-                    .show(ui, |ui| ui.add(edit))
-                    .inner
-                    .on_hover_text(tl!("Current page — type a page number or label (such as iv) and press Enter"));
-                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    // A page label first (logical page numbers, as Acrobat), then a number.
-                    let typed = view.page_input.clone();
-                    if !view.go_to_typed(&typed, &labels) {
-                        view.page_input = (view.current + 1).to_string();
-                    }
-                }
-            });
-            if let Some(id) = page_display {
-                app.execute(id);
-            }
+            page_cluster(app, ui, index, page_count, &labels);
         });
+}
+
+/// The right rail's bottom cluster: zoom, page display, rotate, fit, page count and the page box.
+// Embed build: split out of `right_rail` so the embed build's navigation rail shows the same controls.
+pub(crate) fn page_cluster(app: &mut PdfCraftApp, ui: &mut egui::Ui, index: usize, page_count: usize, labels: &[String]) {
+    let t = Tokens::get(ui.ctx());
+    let view = &mut app.views[index];
+    let mut page_display = None;
+    ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        if icons::button(ui, "zoom-out", 32.0, false, tl!("Zoom out (⌘−)")).clicked() {
+            view.zoom_step(false);
+        }
+        if icons::button(ui, "zoom-in", 32.0, false, tl!("Zoom in (⌘+)")).clicked() {
+            view.zoom_step(true);
+        }
+        // Between rotate and zoom, as in Acrobat. Its command runs once `view` is free.
+        let tip = crate::i18n::fmt(tl!("Page display: {layout}"), &[("layout", tl!(view.layout.label()))]);
+        let resp = icons::button(ui, view.layout.icon(), 32.0, false, &tip);
+        page_display = egui::Popup::menu(&resp)
+            .show(|ui| {
+                ui.set_min_width(220.0);
+                rail_view_menu(ui, view)
+            })
+            .and_then(|r| r.inner);
+        if icons::button(ui, "rotate-cw", 32.0, false, tl!("Rotate view clockwise (⇧⌘+)")).clicked() {
+            view.rotate_view(true);
+        }
+        // Not `columns-2` while fitting the page: that is the two-page view's icon.
+        let fit_icon = if view.fit == Fit::Width { "maximize" } else { "maximize-2" };
+        if icons::button(ui, fit_icon, 32.0, false, tl!("Toggle fit page / fit width")).clicked() {
+            view.fit = if view.fit == Fit::Width { Fit::Page } else { Fit::Width };
+            view.goto = Some((view.current, 0.0));
+        }
+        ui.label(egui::RichText::new(format!("{:.0}%", view.zoom * 100.0)).font(theme::regular(10.5)).color(t.text_faint));
+        ui.add_space(6.0);
+        if icons::button(ui, "chevron-down", 30.0, false, tl!("Next page")).clicked() {
+            view.step_page(true);
+        }
+        if icons::button(ui, "chevron-up", 30.0, false, tl!("Previous page")).clicked() {
+            view.step_page(false);
+        }
+        ui.label(egui::RichText::new(page_count.to_string()).font(theme::regular(11.0)).color(t.text_muted));
+        let edit = egui::TextEdit::singleline(&mut view.page_input)
+            .id(egui::Id::new("page-input"))
+            .desired_width(34.0)
+            .horizontal_align(Align::Center)
+            .font(theme::medium(12.0))
+            .margin(vec2(2.0, 4.0));
+        let r = egui::Frame::NONE
+            .fill(t.field)
+            .stroke(Stroke::new(1.0, t.border))
+            .corner_radius(CornerRadius::same(5))
+            .show(ui, |ui| ui.add(edit))
+            .inner
+            .on_hover_text(tl!("Current page — type a page number or label (such as iv) and press Enter"));
+        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            // A page label first (logical page numbers, as Acrobat), then a number.
+            let typed = view.page_input.clone();
+            if !view.go_to_typed(&typed, labels) {
+                view.page_input = (view.current + 1).to_string();
+            }
+        }
+    });
+    if let Some(id) = page_display {
+        app.execute(id);
+    }
 }
 
 /// View ▸ Page display and the rail's Page display menu: the layouts and the cover page.

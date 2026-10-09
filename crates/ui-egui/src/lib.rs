@@ -545,6 +545,8 @@ pub struct PdfCraftApp {
     pub last_opened_url: Option<String>,
     /// A document asked to open this address; the user hasn't answered yet (#90, #91).
     pub pending_link: Option<PendingLink>,
+    /// Embed build: set by [`Self::embedded`]; a host page drives this app (`embed`).
+    pub(crate) embed: Option<embed::Embed>,
 }
 
 /// Where in a document a request to open an address came from.
@@ -719,6 +721,7 @@ impl PdfCraftApp {
             text_style: content_ui::default_style(),
             replace_draft: None,
             number_draft: NumberDraft { from: 1, to: 1, style: pdfcraft_engine::LabelStyle::Decimal, prefix: String::new(), start: 1 },
+            embed: None,
         }
     }
 
@@ -1672,6 +1675,8 @@ impl eframe::App for PdfCraftApp {
                 view.receive(ctx, &doc.renderer);
             }
         }
+        // Embed build: run the host's commands and keep view mode (`embed`).
+        self.embed_logic(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -1680,6 +1685,12 @@ impl eframe::App for PdfCraftApp {
         // Fonts registered via set_fonts only take effect next frame; named families would panic now.
         if !self.fonts_ready {
             ctx.request_repaint();
+            return;
+        }
+        // Embed build: the page view and its navigation only; returns before the window title,
+        // so the host page keeps its own (`embed`).
+        if self.embed.is_some() {
+            embed::show(self, ui);
             return;
         }
         // The window shows the active document's name (or title, if it asks for that).
