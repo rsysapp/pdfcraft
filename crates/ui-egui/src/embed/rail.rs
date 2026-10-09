@@ -28,6 +28,6 @@ pub(crate) fn show(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                     view.open_find();
                 }
             }
-            chrome::page_cluster(app, ui, index, page_count, &labels);
+            chrome::page_cluster(app, ui, index, page_count, &labels, true);
         });
 }

@@ -52,6 +52,10 @@ impl PdfCraftApp {
                 HostCommand::SetMarks(_) | HostCommand::SetTheme(_) => {}
             }
         }
+        // A shortcut can still reach full screen; leave it the way the app does, so the window follows.
+        if self.full_screen {
+            self.set_full_screen(ctx, false);
+        }
         self.enforce_view_profile();
         self.embed = Some(embed);
     }

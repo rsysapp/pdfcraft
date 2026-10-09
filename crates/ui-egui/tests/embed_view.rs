@@ -70,3 +70,29 @@ fn a_right_click_on_the_page_opens_no_menu_in_view_mode() {
     right_click_at(&mut h, at);
     assert!(h.query_by_label("Comments panel").is_none(), "view mode has no page menu");
 }
+
+#[test]
+fn the_page_display_menu_has_no_read_or_full_screen_mode_in_view_mode() {
+    let bytes = pages(&[&["First page"], &["Second page"]]);
+
+    // The full app's right rail offers both, so their absence below means something.
+    let page = bytes.clone();
+    let mut full = egui_kittest::Harness::builder().with_size(egui::vec2(900.0, 700.0)).build_eframe(move |_cc| {
+        let mut app = pdfcraft_ui_egui::PdfCraftApp::new();
+        app.open_bytes("two.pdf", None, page).expect("opens");
+        app
+    });
+    full.run_steps(4);
+    full.get_by_label_contains("Page display:").click();
+    full.run_steps(3);
+    full.get_by_label("Read mode");
+    full.get_by_label("Full screen mode");
+
+    let (mut h, bridge) = embedded();
+    open(&mut h, &bridge, "two.pdf", bytes);
+    h.get_by_label_contains("Page display:").click();
+    h.run_steps(3);
+    h.get_by_label("Fit one full page");
+    assert!(h.query_by_label("Read mode").is_none(), "Read mode is not part of the view profile");
+    assert!(h.query_by_label("Full screen mode").is_none(), "Full screen mode is not part of the view profile");
+}

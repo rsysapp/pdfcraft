@@ -293,13 +293,14 @@ pub fn right_rail(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
             }
 
             // Page navigation cluster at the bottom (as in Acrobat's rail).
-            page_cluster(app, ui, index, page_count, &labels);
+            page_cluster(app, ui, index, page_count, &labels, false);
         });
 }
 
 /// The right rail's bottom cluster: zoom, page display, rotate, fit, page count and the page box.
 // Embed build: split out of `right_rail` so the embed build's navigation rail shows the same controls.
-pub(crate) fn page_cluster(app: &mut PdfCraftApp, ui: &mut egui::Ui, index: usize, page_count: usize, labels: &[String]) {
+// `viewing_only` leaves the Read and Full screen mode rows out of the Page display menu.
+pub(crate) fn page_cluster(app: &mut PdfCraftApp, ui: &mut egui::Ui, index: usize, page_count: usize, labels: &[String], viewing_only: bool) {
     let t = Tokens::get(ui.ctx());
     let view = &mut app.views[index];
     let mut page_display = None;
@@ -317,7 +318,7 @@ pub(crate) fn page_cluster(app: &mut PdfCraftApp, ui: &mut egui::Ui, index: usiz
         page_display = egui::Popup::menu(&resp)
             .show(|ui| {
                 ui.set_min_width(220.0);
-                rail_view_menu(ui, view)
+                rail_view_menu(ui, view, viewing_only)
             })
             .and_then(|r| r.inner);
         if icons::button(ui, "rotate-cw", 32.0, false, tl!("Rotate view clockwise (⇧⌘+)")).clicked() {
@@ -387,7 +388,8 @@ fn page_display_menu(ui: &mut egui::Ui, view: &DocView) -> Option<&'static str> 
 
 /// The rail's Page display menu: Acrobat's view choices around the page display. Zoom changes
 /// apply at once; the command a click asks for is returned for the caller to run.
-fn rail_view_menu(ui: &mut egui::Ui, view: &mut DocView) -> Option<&'static str> {
+// Embed build: `viewing_only` omits the mode rows, which the view profile does not have.
+fn rail_view_menu(ui: &mut egui::Ui, view: &mut DocView, viewing_only: bool) -> Option<&'static str> {
     let mut picked = None;
     for (id, label) in [("view.fit_width_scrolling", "Fit to width scrolling"), ("view.fit_one_page", "Fit one full page")] {
         if ui.button(tl!(label)).clicked() {
@@ -408,10 +410,12 @@ fn rail_view_menu(ui: &mut egui::Ui, view: &mut DocView) -> Option<&'static str>
     }
     ui.separator();
     picked = page_display_menu(ui, view).or(picked);
-    ui.separator();
-    for (id, label) in [("view.read_mode", "Read mode"), ("view.full_screen", "Full screen mode")] {
-        if ui.button(tl!(label)).clicked() {
-            picked = Some(id);
+    if !viewing_only {
+        ui.separator();
+        for (id, label) in [("view.read_mode", "Read mode"), ("view.full_screen", "Full screen mode")] {
+            if ui.button(tl!(label)).clicked() {
+                picked = Some(id);
+            }
         }
     }
     if picked.is_some() {
