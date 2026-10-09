@@ -239,12 +239,16 @@ impl PdfCraftApp {
     }
 
     /// Whether host work (a text jump, marks) still waits for text layers (tests).
+    // Public only for the embed build's integration tests; not part of the crate's API.
+    #[doc(hidden)]
     pub fn host_work_pending(&self) -> bool {
         let pages = self.active_page_count();
         self.embed.as_ref().is_some_and(|e| e.jump.is_some() || e.marks_pending(pages))
     }
 
     /// The host marks found: (id, 1-based page, colour), one per line, by page then id (tests).
+    // Public only for the embed build's integration tests; not part of the crate's API.
+    #[doc(hidden)]
     pub fn found_host_marks(&self) -> Vec<(String, usize, egui::Color32)> {
         let mut out: Vec<(String, usize, egui::Color32)> =
             self.embed.iter().flat_map(|e| e.page_marks.iter().map(|m| (m.id.clone(), m.page + 1, m.color))).collect();
@@ -253,6 +257,8 @@ impl PdfCraftApp {
     }
 
     /// Where the host marks are on screen this frame: (id, rectangle) (tests and automation).
+    // Public only for the embed build's integration tests; not part of the crate's API.
+    #[doc(hidden)]
     pub fn host_mark_rects(&self) -> Vec<(String, egui::Rect)> {
         let (Some(embed), Some(view)) = (self.embed.as_ref(), self.active.and_then(|i| self.views.get(i))) else { return Vec::new() };
         embed.page_marks.iter().filter_map(|m| view.page_xform(m.page).map(|xf| (m.id.clone(), xf.view_rect(m.rect)))).collect()

@@ -551,6 +551,8 @@ impl DocView {
     }
 
     /// Whether `page`'s text layer is loaded (embed build tests).
+    // Embed build: public only for its integration tests; not part of the crate's API.
+    #[doc(hidden)]
     pub fn has_text(&self, page: usize) -> bool {
         self.texts.contains_key(&page)
     }
