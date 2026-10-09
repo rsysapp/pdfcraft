@@ -1,6 +1,7 @@
 //! The host bridge's messages (the embed API's commands and events) and the queues that carry them.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use egui::Color32;
@@ -112,12 +113,20 @@ pub struct HostBridge {
     events: Arc<Mutex<Vec<HostEvent>>>,
     /// The app's context once it has run a frame, so a command wakes an idle app.
     ctx: Arc<Mutex<Option<egui::Context>>>,
+    /// Set by [`HostBridge::detach`]; read under each queue's lock, so nothing slips in after it.
+    detached: Arc<AtomicBool>,
 }
 
 impl HostBridge {
     /// Host side: queue a command; the app runs it on its next frame, which this requests.
     pub fn send(&self, command: HostCommand) {
-        self.commands.lock().unwrap_or_else(PoisonError::into_inner).push_back(command);
+        {
+            let mut commands = self.commands.lock().unwrap_or_else(PoisonError::into_inner);
+            if self.detached.load(Ordering::SeqCst) {
+                return;
+            }
+            commands.push_back(command);
+        }
         // Clone out and release the lock first: `request_repaint` takes egui's own lock, and a host
         // thread must not hold ours while it waits for that.
         let ctx = self.ctx.lock().unwrap_or_else(PoisonError::into_inner).clone();
@@ -134,7 +143,7 @@ impl HostBridge {
     /// App side: the context `send` wakes.
     pub fn attach(&self, ctx: &egui::Context) {
         let mut slot = self.ctx.lock().unwrap_or_else(PoisonError::into_inner);
-        if slot.is_none() {
+        if slot.is_none() && !self.detached.load(Ordering::SeqCst) {
             *slot = Some(ctx.clone());
         }
     }
@@ -146,7 +155,23 @@ impl HostBridge {
 
     /// App side: tell the host something.
     pub fn emit(&self, event: HostEvent) {
-        self.events.lock().unwrap_or_else(PoisonError::into_inner).push(event);
+        let mut events = self.events.lock().unwrap_or_else(PoisonError::into_inner);
+        if !self.detached.load(Ordering::SeqCst) {
+            events.push(event);
+        }
+    }
+
+    /// Host side, when the editor is destroyed: drops the app's context and both queues, and
+    /// makes every later call carry nothing. The context would otherwise outlive the stopped
+    /// app through the host's copy of the bridge. The flag is set before each lock is taken, so a
+    /// call that takes the lock after this clears it sees the flag.
+    pub fn detach(&self) {
+        self.detached.store(true, Ordering::SeqCst);
+        // Dropped after our lock is released, as in `send`: the last copy takes egui's state with it.
+        let context = self.ctx.lock().unwrap_or_else(PoisonError::into_inner).take();
+        drop(context);
+        self.commands.lock().unwrap_or_else(PoisonError::into_inner).clear();
+        self.events.lock().unwrap_or_else(PoisonError::into_inner).clear();
     }
 }
 
@@ -348,5 +373,41 @@ mod tests {
         bridge.clone().emit(HostEvent::PageChanged { page: 1 });
         assert_eq!(bridge.take_events(), [HostEvent::SelectionCleared, HostEvent::PageChanged { page: 1 }]);
         assert!(bridge.take_events().is_empty());
+    }
+
+    #[test]
+    fn a_detached_bridge_frees_the_context_and_carries_nothing() {
+        let bridge = HostBridge::default();
+        let woken = Arc::new(AtomicUsize::new(0));
+        let ctx = egui::Context::default();
+        let counter = woken.clone();
+        // The callback lives as long as the context, so its clone of `woken` shows whether the
+        // context is still alive.
+        ctx.set_request_repaint_callback(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        bridge.attach(&ctx);
+        drop(ctx);
+        assert_eq!(Arc::strong_count(&woken), 2, "the bridge keeps the context alive");
+        bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 1 }));
+        bridge.emit(HostEvent::SelectionCleared);
+        let app_side = bridge.clone();
+
+        bridge.detach();
+        assert_eq!(Arc::strong_count(&woken), 1, "detaching drops the context");
+        assert!(app_side.take_commands().is_empty(), "queued commands are dropped");
+        assert!(bridge.take_events().is_empty(), "queued events are dropped");
+
+        let woken_before = woken.load(Ordering::SeqCst);
+        bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 2 }));
+        app_side.emit(HostEvent::PageChanged { page: 2 });
+        let late = egui::Context::default();
+        app_side.attach(&late);
+        bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 3 }));
+        assert_eq!(woken.load(Ordering::SeqCst), woken_before);
+        assert!(app_side.take_commands().is_empty(), "a detached bridge queues no command");
+        assert!(bridge.take_events().is_empty(), "a detached bridge queues no event");
+        assert!(app_side.ctx.lock().map(|slot| slot.is_none()).unwrap_or(false), "a detached bridge keeps no context");
+        bridge.detach();
     }
 }
