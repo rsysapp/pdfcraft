@@ -103,8 +103,11 @@ The command fails for a file that was not built by this repository's release wor
   page count; a page-scoped one loads that page alone. Matching costs O(page text × passage) per
   page searched, on the frame.
 - What a malformed call throws echoes the strings the host sent (a mark's id or colour, a value
-  that failed to parse), and `openFailed` carries the parser's message: show them as text, never
-  as markup.
+  that failed to parse): show it as text, never as markup. `openFailed` carries a fixed, plain
+  message: "This file is damaged or isn't a PDF and can't be shown." for a file the engine cannot
+  read, "This file is password-protected and can't be shown here." for one that needs a password,
+  and the too-large message below. The engine's own reason goes to the browser console as a
+  warning.
 - The command and event queues are unbounded: the host page is trusted not to flood them.
 
 ## Crashes

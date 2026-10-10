@@ -4,7 +4,7 @@ mod embed_support;
 
 use egui_kittest::kittest::Queryable;
 use embed_support::{embedded, open, pages, protected, settle, three_pages};
-use pdfcraft_ui_egui::embed::{HostCommand, HostEvent, JumpTarget, MAX_OPEN_BYTES, OPEN_TOO_LARGE, open_command};
+use pdfcraft_ui_egui::embed::{HostCommand, HostEvent, JumpTarget, MAX_OPEN_BYTES, OPEN_DAMAGED, OPEN_TOO_LARGE, open_command};
 
 #[test]
 fn the_view_profile_shows_the_page_navigation_and_nothing_else() {
@@ -28,7 +28,8 @@ fn the_view_profile_shows_the_page_navigation_and_nothing_else() {
 fn opening_answers_opened_or_open_failed_and_never_prompts() {
     let (mut h, bridge) = embedded();
     let events = open(&mut h, &bridge, "broken.pdf", b"this is not a PDF".to_vec());
-    assert!(matches!(events.as_slice(), [HostEvent::OpenFailed { message }] if message.starts_with("This file can't be shown")), "{events:?}");
+    // A plain, fixed message: the engine's error text goes to the log, never to the host.
+    assert_eq!(events, [HostEvent::OpenFailed { message: OPEN_DAMAGED.into() }]);
     assert!(h.state().views.is_empty());
     let events = open(&mut h, &bridge, "locked.pdf", protected("secret"));
     assert_eq!(events, [HostEvent::OpenFailed { message: "This file is password-protected and can't be shown here.".into() }]);
@@ -68,7 +69,7 @@ fn an_empty_open_is_never_read_and_a_failed_copy_queues_nothing() {
 fn an_empty_open_is_answered_open_failed() {
     let (mut h, bridge) = embedded();
     let events = open(&mut h, &bridge, "gone.pdf", Vec::new());
-    assert!(matches!(events.as_slice(), [HostEvent::OpenFailed { message }] if message.starts_with("This file can't be shown")), "{events:?}");
+    assert_eq!(events, [HostEvent::OpenFailed { message: OPEN_DAMAGED.into() }]);
 }
 
 #[test]

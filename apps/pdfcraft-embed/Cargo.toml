@@ -19,6 +19,8 @@ workspace = true
 pdfcraft-ui-egui = { path = "../../crates/ui-egui", default-features = false }
 eframe = { workspace = true, features = ["default_fonts", "glow"] }
 egui = { workspace = true }
+# Routes the editor's warnings (a file that could not be opened, say) to the browser console.
+log = { workspace = true }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"

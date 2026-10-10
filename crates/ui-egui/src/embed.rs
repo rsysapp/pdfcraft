@@ -28,6 +28,11 @@ use crate::{DocView, Mode, PdfCraftApp, QuickTool};
 /// What `open` answers for a file that needs a password; view mode never prompts.
 const PASSWORD_MESSAGE: &str = "This file is password-protected and can't be shown here.";
 
+/// What `open` answers for a file the engine cannot read. Fixed, as the Word editor's: the engine's
+/// own error names objects, offsets and parser details that mean nothing to the reader, so it goes
+/// to the log for whoever investigates.
+pub const OPEN_DAMAGED: &str = "This file is damaged or isn't a PDF and can't be shown.";
+
 /// What `open_bytes` answers in view mode: only the host opens documents, never a drop or a picker.
 pub(crate) const OPEN_REFUSED: &str = "only the host page opens documents here";
 
@@ -377,7 +382,10 @@ impl PdfCraftApp {
         }
         self.close_for_host_open(embed);
         let event = match self.try_open(name, None, Arc::new(bytes), None) {
-            Err(e) => HostEvent::OpenFailed { message: format!("This file can't be shown: {e}") },
+            Err(e) => {
+                log::warn!("embed: a host file could not be opened: {e}");
+                HostEvent::OpenFailed { message: OPEN_DAMAGED.into() }
+            }
             Ok(()) if self.password_prompt.take().is_some() => HostEvent::OpenFailed { message: PASSWORD_MESSAGE.into() },
             Ok(()) => HostEvent::Opened { pages: self.active_ids().and_then(|(_, id)| self.session.get(id)).map_or(0, |d| d.info.pages.len()) },
         };

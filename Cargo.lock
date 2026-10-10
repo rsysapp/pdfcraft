@@ -3576,6 +3576,7 @@ dependencies = [
  "eframe",
  "egui",
  "js-sys",
+ "log",
  "pdfcraft-ui-egui",
  "wasm-bindgen",
  "wasm-bindgen-futures",

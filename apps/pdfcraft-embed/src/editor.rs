@@ -141,6 +141,9 @@ impl EmbeddedEditor {
 
 async fn start(canvas: web_sys::HtmlCanvasElement, options: JsValue) -> Result<EmbeddedEditor, JsValue> {
     let theme = embed::parse_mount_options(&json_of(&options)?).map_err(|e| JsValue::from(JsError::new(&e)))?;
+    // The editor's own warnings (a host file that could not be opened, with the engine's reason) go
+    // to the console; a second mount keeps the first logger.
+    eframe::WebLogger::init(log::LevelFilter::Warn).ok();
     // A fresh bridge per mount: a bridge keeps the first context it is attached to.
     let bridge = HostBridge::default();
     bridge.send(HostCommand::SetTheme(theme));
