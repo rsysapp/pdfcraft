@@ -72,8 +72,9 @@ source paths).
 ## Limits
 
 - `setMarks` keeps the first 2,000 marks (`MAX_MARKS`) and ignores the rest.
-- Passages are at most 10,000 characters once folded (`MAX_NEEDLE_CHARS`): a longer mark is
-  skipped, a longer text jump answers `jumpNotFound`. A mark that is empty once folded is skipped.
+- Passages are at most 256 KiB of UTF-8 raw (`MAX_RAW_PASSAGE_BYTES`, checked before anything is
+  folded) and 10,000 characters once folded (`MAX_NEEDLE_CHARS`): a longer mark is skipped, a
+  longer text jump answers `jumpNotFound`. A mark that is empty once folded is skipped.
 - Page numbers and occurrences above 2^32-1 saturate to 2^32-1, so they are out of range for any
   document: the jump answers `jumpNotFound`, the mark is skipped. Negative or fractional numbers
   throw.

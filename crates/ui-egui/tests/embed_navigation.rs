@@ -66,6 +66,21 @@ fn text_jumps_fold_text_count_occurrences_and_stay_within_a_page() {
 }
 
 #[test]
+fn a_text_jump_over_the_raw_cap_answers_not_found_and_one_at_the_cap_still_finds() {
+    use pdfcraft_ui_egui::embed::text_match::MAX_RAW_PASSAGE_BYTES;
+    let (mut h, bridge) = embedded();
+    open(&mut h, &bridge, "three.pdf", three_pages());
+    // 300 KiB of blanks around a word that is on the page: refused for its raw size alone.
+    let huge = text(&format!("goods{}", " ".repeat(300 * 1024)), None, 0);
+    let events = jump(&mut h, &bridge, huge.clone());
+    assert_eq!(not_found(&events), [huge], "{events:?}");
+    assert!(!h.state().host_work_pending(), "the refused jump waits for no text");
+    // Exactly at the cap it folds to "goods" and is found.
+    let at_cap = text(&format!("goods{}", " ".repeat(MAX_RAW_PASSAGE_BYTES - "goods".len())), None, 0);
+    assert!(not_found(&jump(&mut h, &bridge, at_cap)).is_empty());
+}
+
+#[test]
 fn text_jumps_match_curly_quotes_and_span_lines() {
     let (mut h, bridge) = embedded();
     open(&mut h, &bridge, "three.pdf", three_pages());

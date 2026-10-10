@@ -13,9 +13,37 @@ use unicode_normalization::char::is_combining_mark;
 /// quadratic in the worst case and runs on the frame).
 pub const MAX_NEEDLE_CHARS: usize = 10_000;
 
+/// Longest passage taken from the host, in UTF-8 bytes of its raw text, checked before anything is
+/// folded: folding is one long, unsplittable pass, so a huge passage that is mostly whitespace (and
+/// would fold to almost nothing) must not get that far. Longer ones match nothing.
+pub const MAX_RAW_PASSAGE_BYTES: usize = 256 * 1024;
+
+/// Whether the host's raw passage `text` is over [`MAX_RAW_PASSAGE_BYTES`] and so matches nothing.
+pub fn exceeds_raw_cap(text: &str) -> bool {
+    text.len() > MAX_RAW_PASSAGE_BYTES
+}
+
+/// A host passage as matching compares it, or `None` when it can never match: over the raw cap
+/// (never folded), blank once folded, or over [`MAX_NEEDLE_CHARS`] folded. Marks take their
+/// needles through here; a jump is refused by [`exceeds_raw_cap`] before it waits for any text.
+pub fn fold_passage(text: &str) -> Option<Vec<char>> {
+    if exceeds_raw_cap(text) {
+        return None;
+    }
+    Some(fold(text)).filter(|needle| !needle.is_empty() && needle.len() <= MAX_NEEDLE_CHARS)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times [`fold`] ran on this thread, so a test can prove a passage was never folded.
+    pub(crate) static FOLD_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// `text` as matching compares it. It runs the same pipeline as the page side ([`fold_mapped`]), so a
 /// needle and the page text can never be folded by different rules.
 pub fn fold(text: &str) -> Vec<char> {
+    #[cfg(test)]
+    FOLD_CALLS.with(|calls| calls.set(calls.get() + 1));
     let chars: Vec<char> = text.chars().collect();
     let mut folded: Vec<char> = fold_mapped(&chars).into_iter().map(|(folded_char, _)| folded_char).collect();
     if folded.last() == Some(&' ') {
@@ -164,6 +192,29 @@ mod tests {
         assert!(find(&text, "").is_empty());
         assert!(find(&text, "   \n\t").is_empty());
         assert!(find(&text, &"a".repeat(MAX_NEEDLE_CHARS + 1)).is_empty());
+    }
+
+    #[test]
+    fn a_passage_over_the_raw_cap_is_never_folded() {
+        let folds_before = FOLD_CALLS.with(std::cell::Cell::get);
+        // 300 KiB that would fold to a single character, so only the raw check can refuse it cheaply.
+        let mostly_blank = format!("x{}", " ".repeat(300 * 1024));
+        assert!(exceeds_raw_cap(&mostly_blank));
+        assert_eq!(fold_passage(&mostly_blank), None);
+        assert_eq!(FOLD_CALLS.with(std::cell::Cell::get), folds_before, "refused before any folding");
+    }
+
+    #[test]
+    fn a_passage_at_the_raw_cap_that_folds_short_still_works() {
+        let padded = format!("The  Goods{}", " ".repeat(MAX_RAW_PASSAGE_BYTES - "The  Goods".len()));
+        assert_eq!(padded.len(), MAX_RAW_PASSAGE_BYTES);
+        assert!(!exceeds_raw_cap(&padded));
+        assert_eq!(fold_passage(&padded).map(|n| n.into_iter().collect::<String>()), Some("the goods".to_string()));
+        assert!(exceeds_raw_cap(&format!("{padded} ")), "one byte over is refused");
+        // The folded-length and blank rules are unchanged.
+        assert_eq!(fold_passage("   "), None);
+        assert_eq!(fold_passage(&"a".repeat(MAX_NEEDLE_CHARS + 1)), None);
+        assert_eq!(fold_passage(&"a".repeat(MAX_NEEDLE_CHARS)).map(|n| n.len()), Some(MAX_NEEDLE_CHARS));
     }
 
     #[test]

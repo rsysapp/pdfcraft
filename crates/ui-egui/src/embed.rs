@@ -94,16 +94,15 @@ impl Embed {
     }
 
     /// Replace every host mark; they are searched for again as text layers arrive. A mark that can
-    /// never match (blank once folded, or longer than matching takes) is skipped here, so it never
-    /// asks for any page's text.
+    /// never match (blank once folded, or longer than matching takes, raw or folded) is skipped
+    /// here, so it never asks for any page's text.
     fn set_marks(&mut self, marks: Vec<Mark>) {
         let (marks, needles): (Vec<Mark>, Vec<Vec<char>>) = marks
             .into_iter()
-            .map(|m| {
-                let needle = text_match::fold(&m.text);
-                (m, needle)
+            .filter_map(|m| {
+                let needle = text_match::fold_passage(&m.text)?;
+                Some((m, needle))
             })
-            .filter(|(_, needle)| !needle.is_empty() && needle.len() <= text_match::MAX_NEEDLE_CHARS)
             .unzip();
         self.needles = needles;
         self.hits = vec![None; marks.len()];
@@ -286,7 +285,10 @@ impl PdfCraftApp {
                 }
                 _ => true,
             },
-            JumpTarget::Text { page, .. } => pages == 0 || page.is_some_and(|p| page_index(p, pages).is_none()),
+            // An over-long passage is answered now: it must not wait for text layers it can never match.
+            JumpTarget::Text { text, page, .. } => {
+                pages == 0 || page.is_some_and(|p| page_index(p, pages).is_none()) || text_match::exceeds_raw_cap(text)
+            }
         };
         if nowhere {
             embed.bridge.emit(HostEvent::JumpNotFound { target });
@@ -513,6 +515,8 @@ pub(crate) fn show(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
 
 #[cfg(test)]
 mod tests {
+    use super::text_match;
+
     /// A page with one line of text, one glyph per character.
     fn page_with(line: &str) -> pdfcraft_render::PageText {
         let mut text = pdfcraft_render::PageText::default();
@@ -545,6 +549,27 @@ mod tests {
         let first_line_matches = embed.page_marks.iter().filter(|m| m.id == "goods").count();
         assert_eq!(first_line_matches, 1, "only the first of two matches on the page");
         assert_eq!(embed.pages_pending(4).count(), 0, "a found mark asks for no more text");
+    }
+
+    #[test]
+    fn a_mark_over_the_raw_cap_is_skipped_without_being_folded() {
+        let folds_before = text_match::FOLD_CALLS.with(std::cell::Cell::get);
+        let mostly_blank = format!("goods{}", " ".repeat(300 * 1024));
+        let mut embed = super::Embed::default();
+        embed.set_marks(vec![mark("huge", &mostly_blank, None)]);
+        assert!(embed.marks.is_empty() && embed.needles.is_empty());
+        assert_eq!(text_match::FOLD_CALLS.with(std::cell::Cell::get), folds_before, "never folded");
+        assert!(!embed.marks_pending(3), "a skipped mark asks for no text");
+    }
+
+    #[test]
+    fn a_mark_at_the_raw_cap_that_folds_short_is_kept() {
+        let padded = format!("the goods{}", " ".repeat(text_match::MAX_RAW_PASSAGE_BYTES - "the goods".len()));
+        let mut embed = super::Embed::default();
+        embed.set_marks(vec![mark("padded", &padded, None)]);
+        assert_eq!(embed.marks.len(), 1);
+        embed.search_page(0, Some(&page_with("pay for the goods")));
+        assert_eq!(embed.page_marks.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["padded"]);
     }
 
     #[test]
