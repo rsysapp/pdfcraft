@@ -1,5 +1,6 @@
 //! `EmbeddedEditor`: the API a host page calls. Values arrive as JavaScript objects and are read
-//! as JSON by the bridge's parsers, so malformed input throws here and queues nothing.
+//! as JSON by the bridge's parsers, so malformed input throws a `TypeError` here and queues
+//! nothing.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -7,7 +8,7 @@ use std::rc::Rc;
 use pdfcraft_ui_egui::PdfCraftApp;
 use pdfcraft_ui_egui::embed::{self, HostBridge, HostCommand};
 use wasm_bindgen::prelude::wasm_bindgen;
-use wasm_bindgen::{JsCast, JsError, JsValue};
+use wasm_bindgen::{JsCast, JsValue};
 
 use crate::app::{EmbedApp, Listener};
 
@@ -23,7 +24,12 @@ pub struct EmbeddedEditor {
 impl EmbeddedEditor {
     /// Starts the editor on the canvas. Resolves once the first frame ran.
     #[wasm_bindgen(unchecked_return_type = "Promise<EmbeddedEditor>")]
-    pub fn mount(canvas: web_sys::HtmlCanvasElement, #[wasm_bindgen(unchecked_param_type = "MountOptions")] options: JsValue) -> js_sys::Promise {
+    pub fn mount(
+        // Taken as a plain value and checked: wasm-bindgen does not check an imported type's
+        // argument, so anything but a canvas would only fail later, inside the runner.
+        #[wasm_bindgen(unchecked_param_type = "HTMLCanvasElement")] canvas: JsValue,
+        #[wasm_bindgen(unchecked_param_type = "MountOptions")] options: JsValue,
+    ) -> js_sys::Promise {
         wasm_bindgen_futures::future_to_promise(async move { start(canvas, options).await.map(JsValue::from) })
     }
 
@@ -31,8 +37,11 @@ impl EmbeddedEditor {
     pub fn open(
         &self,
         #[wasm_bindgen(unchecked_param_type = "Uint8Array")] bytes: JsValue,
-        #[wasm_bindgen(js_name = "fileName")] file_name: String,
+        // A plain value, not `String`: wasm-bindgen's glue would turn a number or an object into
+        // its string form instead of refusing it.
+        #[wasm_bindgen(js_name = "fileName", unchecked_param_type = "string")] file_name: JsValue,
     ) -> Result<(), JsValue> {
+        let file_name = file_name.as_string().ok_or_else(|| type_error("open: fileName must be a string"))?;
         // Taken as a handle, not `Vec<u8>`: wasm-bindgen would copy the whole array into wasm memory
         // before this body runs, after `destroy` and beyond the size cap alike. A failed allocation
         // aborts the module.
@@ -48,25 +57,25 @@ impl EmbeddedEditor {
     }
 
     #[wasm_bindgen(js_name = jumpTo)]
-    pub fn jump_to(&self, #[wasm_bindgen(unchecked_param_type = "JumpTarget")] target: JsValue) -> Result<(), JsError> {
+    pub fn jump_to(&self, #[wasm_bindgen(unchecked_param_type = "JumpTarget")] target: JsValue) -> Result<(), JsValue> {
         check_counts(&target, &["page", "occurrence"], "jumpTo")?;
-        let target = embed::parse_jump_target(&json_of(&target)?).map_err(|e| JsError::new(&e))?;
+        let target = embed::parse_jump_target(&json_of(&target)?).map_err(|e| type_error(&e))?;
         self.send(HostCommand::JumpTo(target));
         Ok(())
     }
 
     /// Replaces every host mark. An empty array clears them.
     #[wasm_bindgen(js_name = setMarks)]
-    pub fn set_marks(&self, #[wasm_bindgen(unchecked_param_type = "Mark[]")] marks: JsValue) -> Result<(), JsError> {
+    pub fn set_marks(&self, #[wasm_bindgen(unchecked_param_type = "Mark[]")] marks: JsValue) -> Result<(), JsValue> {
         check_mark_pages(&marks)?;
-        let marks = embed::parse_marks(&json_of(&marks)?).map_err(|e| JsError::new(&e))?;
+        let marks = embed::parse_marks(&json_of(&marks)?).map_err(|e| type_error(&e))?;
         self.send(HostCommand::SetMarks(marks));
         Ok(())
     }
 
     #[wasm_bindgen(js_name = setTheme)]
-    pub fn set_theme(&self, #[wasm_bindgen(unchecked_param_type = "Theme")] theme: JsValue) -> Result<(), JsError> {
-        let theme = embed::parse_theme(&json_of(&theme)?).map_err(|e| JsError::new(&e))?;
+    pub fn set_theme(&self, #[wasm_bindgen(unchecked_param_type = "Theme")] theme: JsValue) -> Result<(), JsValue> {
+        let theme = embed::parse_theme(&json_of(&theme)?).map_err(|e| type_error(&e))?;
         self.send(HostCommand::SetTheme(theme));
         Ok(())
     }
@@ -74,10 +83,10 @@ impl EmbeddedEditor {
     /// One listener; a second call replaces the first. Events are delivered after the frame that
     /// produced them.
     #[wasm_bindgen(js_name = setListener)]
-    pub fn set_listener(&self, #[wasm_bindgen(unchecked_param_type = "(event: EditorEvent) => void")] listener: JsValue) -> Result<(), JsError> {
+    pub fn set_listener(&self, #[wasm_bindgen(unchecked_param_type = "(event: EditorEvent) => void")] listener: JsValue) -> Result<(), JsValue> {
         // Taken as a plain value and checked: wasm-bindgen does not check a `Function` argument, and
         // a non-function would only fail later, inside event delivery.
-        let listener = listener.dyn_into::<js_sys::Function>().map_err(|_| JsError::new("setListener: expected a function"))?;
+        let listener = listener.dyn_into::<js_sys::Function>().map_err(|_| type_error("setListener: expected a function"))?;
         if !self.destroyed.get()
             && let Ok(mut slot) = self.listener.try_borrow_mut()
         {
@@ -139,8 +148,9 @@ impl EmbeddedEditor {
     }
 }
 
-async fn start(canvas: web_sys::HtmlCanvasElement, options: JsValue) -> Result<EmbeddedEditor, JsValue> {
-    let theme = embed::parse_mount_options(&json_of(&options)?).map_err(|e| JsValue::from(JsError::new(&e)))?;
+async fn start(canvas: JsValue, options: JsValue) -> Result<EmbeddedEditor, JsValue> {
+    let canvas = canvas.dyn_into::<web_sys::HtmlCanvasElement>().map_err(|_| type_error("mount: expected an HTMLCanvasElement"))?;
+    let theme = embed::parse_mount_options(&json_of(&options)?).map_err(|e| type_error(&e))?;
     // The editor's own warnings (a host file that could not be opened, with the engine's reason) go
     // to the console; a second mount keeps the first logger.
     eframe::WebLogger::init(log::LevelFilter::Warn).ok();
@@ -222,29 +232,29 @@ fn copy_bytes(bytes: &js_sys::Uint8Array, len: usize) -> Result<Vec<u8>, JsValue
 /// [`copy_bytes`]). Only the first `MAX_MARKS` marks are read, the ones `parse_marks` keeps, so a wild
 /// `length` costs nothing. A value without a usable `length` is left to the parser, which refuses
 /// anything but an array.
-fn check_mark_pages(marks: &JsValue) -> Result<(), JsError> {
+fn check_mark_pages(marks: &JsValue) -> Result<(), JsValue> {
     if !marks.is_object() {
         return Ok(());
     }
-    let length = js_sys::Reflect::get(marks, &JsValue::from_str("length")).map_err(|_| JsError::new("setMarks: length could not be read"))?;
+    let length = js_sys::Reflect::get(marks, &JsValue::from_str("length")).map_err(|_| type_error("setMarks: length could not be read"))?;
     let Some(length) = length.as_f64().filter(|length| length.is_finite() && *length >= 0.0) else { return Ok(()) };
     // A float-to-integer `as` saturates; the bound is far below u32::MAX.
     let count = length.min(embed::MAX_MARKS as f64) as u32;
     for index in 0..count {
-        let mark = js_sys::Reflect::get_u32(marks, index).map_err(|_| JsError::new(&format!("setMarks: mark {index} could not be read")))?;
+        let mark = js_sys::Reflect::get_u32(marks, index).map_err(|_| type_error(&format!("setMarks: mark {index} could not be read")))?;
         check_counts(&mark, &["page"], "setMarks")?;
     }
     Ok(())
 }
 
-/// What a malformed `open` throws.
+/// What a malformed argument throws, from any method: a `TypeError`, as the embed API asks.
 fn type_error(message: &str) -> JsValue {
     js_sys::TypeError::new(message).into()
 }
 
 /// A JavaScript value as JSON, for the bridge's parsers.
-fn json_of(value: &JsValue) -> Result<String, JsError> {
-    js_sys::JSON::stringify(value).ok().and_then(|s| JsValue::from(s).as_string()).ok_or_else(|| JsError::new("expected a plain object or array"))
+fn json_of(value: &JsValue) -> Result<String, JsValue> {
+    js_sys::JSON::stringify(value).ok().and_then(|s| JsValue::from(s).as_string()).ok_or_else(|| type_error("expected a plain object or array"))
 }
 
 /// Refuses a page or occurrence that is not a whole number of zero or more, on the JavaScript
@@ -252,16 +262,16 @@ fn json_of(value: &JsValue) -> Result<String, JsError> {
 /// which the parsers read as "no page", so a page-scoped jump or mark would quietly search the
 /// whole document. (The parsers refuse fractions and negatives too; this says so earlier.) A value
 /// that is not an object is left to the parsers, which refuse its shape.
-fn check_counts(value: &JsValue, keys: &[&str], what: &str) -> Result<(), JsError> {
+fn check_counts(value: &JsValue, keys: &[&str], what: &str) -> Result<(), JsValue> {
     if !value.is_object() {
         return Ok(());
     }
     for key in keys {
-        let field = js_sys::Reflect::get(value, &JsValue::from_str(key)).map_err(|_| JsError::new(&format!("{what}: {key} could not be read")))?;
+        let field = js_sys::Reflect::get(value, &JsValue::from_str(key)).map_err(|_| type_error(&format!("{what}: {key} could not be read")))?;
         if let Some(number) = field.as_f64()
             && !(number.is_finite() && number.fract() == 0.0 && number >= 0.0)
         {
-            return Err(JsError::new(&format!("{what}: {key} {number} is not a whole number of zero or more")));
+            return Err(type_error(&format!("{what}: {key} {number} is not a whole number of zero or more")));
         }
     }
     Ok(())

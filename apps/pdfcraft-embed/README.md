@@ -73,8 +73,11 @@ The command fails for a file that was not built by this repository's release wor
   hand is a person's selection and is. The editor moving the view (a page jump, a later text jump,
   its page buttons, a find step) or opening a document clears it without an event, and answers a
   selection it had reported with `selectionCleared`. A jump that finds nothing leaves either.
-- Malformed arguments (`open` with anything but a `Uint8Array`, `jumpTo`, `setMarks`, `setTheme`,
-  `mount` options) throw and change nothing.
+- Malformed arguments throw a `TypeError` and change nothing, from every method: `mount` with
+  anything but an `HTMLCanvasElement` or with malformed options (its promise rejects), `open` with
+  anything but a `Uint8Array` and a string, `jumpTo`, `setMarks` and `setTheme` with a wrong shape,
+  a non-integer or negative number, NaN or an infinity, or a bad colour, and `setListener` with
+  anything but a function.
 - `destroy` stops the runner; later calls do nothing. Dropping the object (`free()`) destroys it
   too. Either may be called from any handler, including one eframe triggers inside a frame (its
   text agent's `focusin`/`focusout`, or the `blur` of an opened link): the host hears nothing more
