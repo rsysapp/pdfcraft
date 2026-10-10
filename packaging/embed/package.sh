@@ -6,7 +6,8 @@
 # The version is apps/pdfcraft-embed's own (released as tags embed-v<version>), not the app's.
 # Needs: the wasm32-unknown-unknown target; wasm-bindgen at the version in Cargo.lock
 # (cargo install wasm-bindgen-cli --version <it> --locked, or set WASM_BINDGEN); wasm-opt from
-# binaryen (or set WASM_OPT). The zip holds, at its root, the files the embed API lists.
+# binaryen (or set WASM_OPT); cargo-about at the version below (cargo install cargo-about --locked
+# --features cli --version <it>). The zip holds, at its root, the files the embed API lists.
 set -euo pipefail
 # shellcheck source=../env.sh
 . "$(dirname "${BASH_SOURCE[0]}")/../env.sh"
@@ -28,6 +29,15 @@ if [ "$HAVE" != "$LOCKED" ]; then
   exit 1
 fi
 command -v "$WASM_OPT" >/dev/null || { echo "error: wasm-opt not found (binaryen; or set WASM_OPT)" >&2; exit 1; }
+
+# cargo-about writes THIRD-PARTY-LICENSES.txt. Its licence texts and its choice among "A OR B"
+# licences come with the tool, so the version is pinned (embed-release.yml installs the same one).
+CARGO_ABOUT_VERSION="0.9.2"
+HAVE_ABOUT="$(cargo about --version 2>/dev/null | awk '{ print $2 }')" || true
+if [ "$HAVE_ABOUT" != "$CARGO_ABOUT_VERSION" ]; then
+  echo "error: cargo-about ${HAVE_ABOUT:-not found}; this script needs $CARGO_ABOUT_VERSION (cargo install cargo-about --locked --features cli --version $CARGO_ABOUT_VERSION)" >&2
+  exit 1
+fi
 
 # This package alone: building it beside the apps would turn the `brand` feature back on.
 cargo build --release --locked --target wasm32-unknown-unknown -p pdfcraft-embed
@@ -113,7 +123,36 @@ EOF_LICENCES
 # A build with craft-fonts (CRAFT_FONTS_DIR) embeds those fonts too.
 copy_font_licences "$OUT/licenses"
 
-FILES=(pdfcraft_embed.js pdfcraft_embed_bg.wasm pdfcraft_embed.d.ts LICENSE-MIT LICENSE-APACHE NOTICE ATTRIBUTION.md)
+# The licence notices of the Rust crates compiled into the module. Only the embed crate's
+# dependency closure for wasm32 (about.toml leaves out build scripts and tests). --fail and the
+# accepted list in about.toml stop the package on a crate whose licence is unknown or not accepted.
+about_generate() {
+  cargo about generate --manifest-path "$CRATE/Cargo.toml" --config "$ROOT/about.toml" \
+    --target wasm32-unknown-unknown --locked --fail "$@"
+}
+about_generate "$ROOT/packaging/embed/about.hbs" --output-file "$WORK/third-party-licenses.txt"
+about_generate --format json --output-file "$WORK/third-party-crates.json"
+if ! [ -s "$WORK/third-party-licenses.txt" ] || ! grep -q '^  - egui ' "$WORK/third-party-licenses.txt"; then
+  echo "error: THIRD-PARTY-LICENSES.txt is empty or lacks the module's crates" >&2
+  exit 1
+fi
+cp "$WORK/third-party-licenses.txt" "$OUT/THIRD-PARTY-LICENSES.txt"
+# Apache-2.0 asks that a NOTICE file travel with the work. cargo-about reads licence files only,
+# so the NOTICE files in the crates' folders are appended here (PdfCraft's own crates are covered
+# by NOTICE in the bundle root). None of today's crates ship one; a future one does so unasked.
+while IFS= read -r crate_dir; do
+  case "$crate_dir" in "$ROOT"/crates/* | "$ROOT"/apps/*) continue ;; esac
+  while IFS= read -r notice; do
+    {
+      printf '\n--------------------------------------------------------------------------------\n'
+      printf 'NOTICE of %s\n' "$(basename "$crate_dir")"
+      printf -- '--------------------------------------------------------------------------------\n\n'
+      cat "$notice"
+    } >>"$OUT/THIRD-PARTY-LICENSES.txt"
+  done < <(find "$crate_dir" -maxdepth 1 -type f \( -iname 'NOTICE' -o -iname 'NOTICE.*' \) | LC_ALL=C sort)
+done < <(grep -o '"manifest_path": *"[^"]*"' "$WORK/third-party-crates.json" | sed -e 's/^"manifest_path": *"//' -e 's#/Cargo.toml"$##' | LC_ALL=C sort -u)
+
+FILES=(pdfcraft_embed.js pdfcraft_embed_bg.wasm pdfcraft_embed.d.ts LICENSE-MIT LICENSE-APACHE NOTICE ATTRIBUTION.md THIRD-PARTY-LICENSES.txt)
 while IFS= read -r licence; do
   FILES+=("licenses/$licence")
 done < <(cd "$OUT/licenses" && ls -1 | LC_ALL=C sort)
