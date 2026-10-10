@@ -214,6 +214,9 @@ pub struct DocView {
     pub want_all_text: bool,
     /// Embed build: request just this page's text layer (a page-scoped host jump).
     pub want_text_page: Option<usize>,
+    /// Embed build: the view's own controls (find stepping, page buttons) moved the view since the
+    /// host bridge last looked, so a selection reported to the host sits at stale coordinates.
+    pub(crate) moved_by_controls: bool,
     pages: HashMap<usize, PageTex>,
     /// Pages the renderer could not draw, with the reason (never re-requested).
     errors: HashMap<usize, String>,
@@ -364,6 +367,7 @@ impl DocView {
             compare_marks: Vec::new(),
             want_all_text: false,
             want_text_page: None,
+            moved_by_controls: false,
             pages: HashMap::new(),
             errors: HashMap::new(),
             waiting_since: HashMap::new(),
@@ -631,6 +635,7 @@ impl DocView {
         f.current = Some(next);
         let p = f.matches[next].0;
         self.flash_match(p);
+        self.moved_by_controls = true;
     }
 
     fn flash_match(&mut self, page: usize) {

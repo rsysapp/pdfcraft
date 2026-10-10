@@ -3,8 +3,11 @@
 mod embed_support;
 
 use egui::{Event, Key, Modifiers, PointerButton};
-use embed_support::{embedded, open, pages};
-use pdfcraft_ui_egui::embed::HostEvent;
+use egui_kittest::Harness;
+use egui_kittest::kittest::Queryable;
+use embed_support::{embedded, open, pages, settle, three_pages};
+use pdfcraft_ui_egui::PdfCraftApp;
+use pdfcraft_ui_egui::embed::{HostBridge, HostCommand, HostEvent, JumpTarget};
 
 fn selections(events: &[HostEvent]) -> Vec<HostEvent> {
     events.iter().filter(|e| matches!(e, HostEvent::Selection { .. } | HostEvent::SelectionCleared)).cloned().collect()
@@ -115,4 +118,124 @@ fn a_whitespace_only_selection_clears_the_one_reported() {
     h.state_mut().views[0].select_text(0, 3, 3);
     h.run_steps(2);
     assert!(selections(&bridge.take_events()).is_empty(), "nothing was reported since the clear");
+}
+
+/// Open three pages and select "Definitions" on the first, so the host has been told of a selection.
+fn with_reported_selection() -> (Harness<'static, PdfCraftApp>, HostBridge) {
+    let (mut h, bridge) = embedded();
+    open(&mut h, &bridge, "three.pdf", three_pages());
+    h.state_mut().views[0].select_text(0, 0, 10);
+    h.run_steps(2);
+    let events = selections(&bridge.take_events());
+    assert!(matches!(events.as_slice(), [HostEvent::Selection { text, .. }] if text == "Definitions"), "{events:?}");
+    (h, bridge)
+}
+
+/// Send a jump and return the selection events it caused, after a few more frames so a repeat would show.
+fn selections_after_jump(h: &mut Harness<'static, PdfCraftApp>, bridge: &HostBridge, target: JumpTarget) -> Vec<HostEvent> {
+    bridge.send(HostCommand::JumpTo(target));
+    settle(h);
+    h.run_steps(3);
+    selections(&bridge.take_events())
+}
+
+fn text_target(text: &str, page: Option<u32>) -> JumpTarget {
+    JumpTarget::Text { text: text.into(), page, occurrence: 0 }
+}
+
+#[test]
+fn a_found_text_jump_clears_a_reported_selection_once() {
+    let (mut h, bridge) = with_reported_selection();
+    assert_eq!(selections_after_jump(&mut h, &bridge, text_target("thirty", None)), [HostEvent::SelectionCleared]);
+    assert!(h.state().views[0].selected_text().is_none(), "the view's selection goes with it");
+}
+
+#[test]
+fn a_found_page_jump_clears_a_reported_selection_once() {
+    let (mut h, bridge) = with_reported_selection();
+    assert_eq!(selections_after_jump(&mut h, &bridge, JumpTarget::Page { page: 2 }), [HostEvent::SelectionCleared]);
+}
+
+#[test]
+fn a_find_step_clears_a_reported_selection_once() {
+    let (mut h, bridge) = embedded();
+    open(&mut h, &bridge, "three.pdf", three_pages());
+    h.state_mut().views[0].open_find();
+    if let Some(find) = h.state_mut().views[0].find.as_mut() {
+        find.query = "goods".into();
+    }
+    // The search finishes over every page before the selection is made: the first match is the
+    // find bar's own move, not a step.
+    for _ in 0..500 {
+        h.run_steps(2);
+        if h.state().views[0].find.as_ref().is_some_and(|f| f.matches.len() == 3) && !h.state().render_pending() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    h.state_mut().views[0].select_text(0, 0, 10);
+    h.run_steps(2);
+    let events = selections(&bridge.take_events());
+    assert!(matches!(events.as_slice(), [HostEvent::Selection { .. }]), "{events:?}");
+    h.get_by_label("Next (⌘G)").click();
+    h.run_steps(5);
+    assert_eq!(selections(&bridge.take_events()), [HostEvent::SelectionCleared]);
+}
+
+#[test]
+fn a_page_button_clears_a_reported_selection_once() {
+    let (mut h, bridge) = with_reported_selection();
+    h.get_by_label("Next page").click();
+    h.run_steps(5);
+    assert_eq!(selections(&bridge.take_events()), [HostEvent::SelectionCleared]);
+    assert_eq!(h.state().views[0].current, 1);
+}
+
+#[test]
+fn a_jump_that_finds_nothing_leaves_a_reported_selection_alone() {
+    let (mut h, bridge) = with_reported_selection();
+    for target in [text_target("no such passage", None), text_target("goods", Some(9)), JumpTarget::Page { page: 9 }] {
+        assert!(selections_after_jump(&mut h, &bridge, target).is_empty());
+    }
+    assert!(h.state().views[0].selected_text().is_some(), "the selection stays");
+    // It was never cleared, so a later move still clears it.
+    assert_eq!(selections_after_jump(&mut h, &bridge, JumpTarget::Page { page: 2 }), [HostEvent::SelectionCleared]);
+}
+
+#[test]
+fn opening_a_document_clears_a_reported_selection_before_opened() {
+    let (mut h, bridge) = with_reported_selection();
+    let events = open(&mut h, &bridge, "other.pdf", three_pages());
+    assert_eq!(events, [HostEvent::SelectionCleared, HostEvent::Opened { pages: 3 }, HostEvent::PageChanged { page: 1 }]);
+}
+
+#[test]
+fn without_a_reported_selection_jumps_find_steps_page_buttons_and_opens_send_no_clear() {
+    let (mut h, bridge) = embedded();
+    open(&mut h, &bridge, "three.pdf", three_pages());
+    for target in [text_target("thirty", None), JumpTarget::Page { page: 1 }, text_target("missing", None)] {
+        assert!(selections_after_jump(&mut h, &bridge, target).is_empty());
+    }
+    // The match is outlined, as the editor's own mark, and still not reported as a selection.
+    assert!(selections_after_jump(&mut h, &bridge, text_target("goods", None)).is_empty());
+    assert!(h.state().views[0].flash.is_some());
+    h.get_by_label("Next page").click();
+    h.run_steps(5);
+    assert!(selections(&bridge.take_events()).is_empty());
+    h.state_mut().views[0].open_find();
+    h.run_steps(2);
+    h.get_by_label("Next (⌘G)").click();
+    h.run_steps(5);
+    assert!(selections(&bridge.take_events()).is_empty());
+    let events = open(&mut h, &bridge, "other.pdf", three_pages());
+    assert_eq!(events, [HostEvent::Opened { pages: 3 }, HostEvent::PageChanged { page: 1 }]);
+}
+
+#[test]
+fn a_selection_cleared_after_a_move_is_not_cleared_again_by_the_next_one() {
+    let (mut h, bridge) = with_reported_selection();
+    assert_eq!(selections_after_jump(&mut h, &bridge, JumpTarget::Page { page: 2 }), [HostEvent::SelectionCleared]);
+    assert!(selections_after_jump(&mut h, &bridge, JumpTarget::Page { page: 3 }).is_empty());
+    let events = open(&mut h, &bridge, "other.pdf", three_pages());
+    assert_eq!(events, [HostEvent::Opened { pages: 3 }, HostEvent::PageChanged { page: 1 }]);
 }

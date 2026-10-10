@@ -334,9 +334,11 @@ pub(crate) fn page_cluster(app: &mut PdfCraftApp, ui: &mut egui::Ui, index: usiz
         ui.add_space(6.0);
         if icons::button(ui, "chevron-down", 30.0, false, tl!("Next page")).clicked() {
             view.step_page(true);
+            view.moved_by_controls = true;
         }
         if icons::button(ui, "chevron-up", 30.0, false, tl!("Previous page")).clicked() {
             view.step_page(false);
+            view.moved_by_controls = true;
         }
         ui.label(egui::RichText::new(page_count.to_string()).font(theme::regular(11.0)).color(t.text_muted));
         let edit = egui::TextEdit::singleline(&mut view.page_input)
@@ -355,7 +357,9 @@ pub(crate) fn page_cluster(app: &mut PdfCraftApp, ui: &mut egui::Ui, index: usiz
         if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
             // A page label first (logical page numbers, as Acrobat), then a number.
             let typed = view.page_input.clone();
-            if !view.go_to_typed(&typed, labels) {
+            if view.go_to_typed(&typed, labels) {
+                view.moved_by_controls = true;
+            } else {
                 view.page_input = (view.current + 1).to_string();
             }
         }

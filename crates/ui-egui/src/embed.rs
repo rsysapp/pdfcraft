@@ -82,6 +82,8 @@ pub(crate) struct PageMark {
 impl Embed {
     /// Forget what belonged to the document that was open, marks included.
     fn document_closed(&mut self) {
+        // The host's toolbar belongs to the closed document's selection; tell it before `opened`.
+        self.clear_reported_selection(None);
         // A jump still waiting for text belonged to the closed document: answer it with its own
         // target, so the host is never left waiting and it is never run against the next document.
         if let Some(target) = self.jump.take() {
@@ -91,6 +93,22 @@ impl Embed {
         self.last_selection = None;
         self.selection_reported = false;
         self.set_marks(Vec::new());
+    }
+
+    /// When the editor itself moves the view or replaces the document, a selection the host was
+    /// told of is cleared: the host's Comment/Copy toolbar sits at the reported coordinates, which
+    /// go stale. Says nothing when none was reported. `view` is the one showing the selection.
+    fn clear_reported_selection(&mut self, view: Option<&mut DocView>) {
+        if !self.selection_reported {
+            return;
+        }
+        self.bridge.emit(HostEvent::SelectionCleared);
+        self.selection_reported = false;
+        // The view's own selection goes too, or the host and the view would disagree about it.
+        self.last_selection = None;
+        if let Some(view) = view {
+            view.clear_selection();
+        }
     }
 
     /// Replace every host mark; they are searched for again as text layers arrive. A mark that can
@@ -281,6 +299,7 @@ impl PdfCraftApp {
             JumpTarget::Page { page } => match (page_index(*page, pages), self.active.and_then(|i| self.views.get_mut(i))) {
                 (Some(p), Some(view)) => {
                     view.go_to_page(p);
+                    embed.clear_reported_selection(Some(view));
                     false
                 }
                 _ => true,
@@ -321,6 +340,10 @@ impl PdfCraftApp {
             })
             .nth(wanted);
         let found = hit.is_some_and(|(p, range)| jump_to_match(view, &doc.info, p, range));
+        // A jump that finds nothing leaves the view, and so a reported selection, where it was.
+        if found {
+            embed.clear_reported_selection(Some(view));
+        }
         match embed.jump.take() {
             Some(target) if !found => embed.bridge.emit(HostEvent::JumpNotFound { target }),
             _ => {}
@@ -435,7 +458,11 @@ fn jump_to_match(view: &mut DocView, info: &DocInfo, page: usize, range: Range<u
 /// What the host hears about the frame just drawn.
 fn collect_events(app: &mut PdfCraftApp, ctx: &egui::Context) {
     let Some(embed) = app.embed.as_mut() else { return };
-    let Some(view) = app.active.and_then(|i| app.views.get(i)) else { return };
+    let Some(view) = app.active.and_then(|i| app.views.get_mut(i)) else { return };
+    // The find bar or page buttons moved the view this frame (`moved_by_controls`).
+    if std::mem::take(&mut view.moved_by_controls) {
+        embed.clear_reported_selection(Some(view));
+    }
     if embed.last_page != Some(view.current) {
         embed.last_page = Some(view.current);
         embed.bridge.emit(HostEvent::PageChanged { page: view.current + 1 });
