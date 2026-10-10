@@ -80,21 +80,40 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      # Only for the attestation below: the OIDC token that Sigstore signs the provenance with,
+      # and the right to store the attestation against this repository.
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: pdfcraft-embed
           path: release
+      - name: Check the download against its checksum
+        id: files
+        run: |
+          version="${GITHUB_REF_NAME#embed-v}"
+          (cd release && sha256sum -c "pdfcraft-embed-$version.zip.sha256")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      # Signed build provenance (Sigstore, through GitHub): ties the zip to this repository, this
+      # workflow and this tag, so a host can check where the file came from, not only that it
+      # matches its checksum. The checksum file is a separate release asset, so it is attested too.
+      # `gh attestation verify pdfcraft-embed-<version>.zip --repo rsysapp/pdfcraft`
+      - name: Attest the release files
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            release/pdfcraft-embed-${{ steps.files.outputs.version }}.zip
+            release/pdfcraft-embed-${{ steps.files.outputs.version }}.zip.sha256
       - name: Attach to the release
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.files.outputs.version }}
         run: |
-          version="${GITHUB_REF_NAME#embed-v}"
           cd release
-          sha256sum -c "pdfcraft-embed-$version.zip.sha256"
-          gh release create "$GITHUB_REF_NAME" "pdfcraft-embed-$version.zip" "pdfcraft-embed-$version.zip.sha256" \
+          gh release create "$GITHUB_REF_NAME" "pdfcraft-embed-$VERSION.zip" "pdfcraft-embed-$VERSION.zip.sha256" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "Embed build $version" \
-            --notes "pdfcraft-embed-$version.zip: the embed build's WebAssembly module, generated JavaScript glue and TypeScript declarations, licences (including those of the compiled-in Rust crates) and SHA256SUMS. See apps/pdfcraft-embed/README.md." \
+            --title "Embed build $VERSION" \
+            --notes "pdfcraft-embed-$VERSION.zip: the embed build's WebAssembly module, generated JavaScript glue and TypeScript declarations, licences (including those of the compiled-in Rust crates) and SHA256SUMS. See apps/pdfcraft-embed/README.md." \
             --latest=false \
             --verify-tag

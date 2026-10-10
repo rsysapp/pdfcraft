@@ -42,6 +42,17 @@ A tag `embed-v<version>` releases it
 The zip's hash is reproducible on the same toolchain and checkout path (the module records
 source paths).
 
+The release job also attests the zip and its `.sha256` file with GitHub artifact attestation
+(signed SLSA build provenance, `actions/attest-build-provenance`). The checksum only shows that
+a file is consistent with itself; the attestation shows which repository, workflow and tag built
+it. A host verifies a downloaded zip before trusting it, with the GitHub CLI:
+
+```sh
+gh attestation verify pdfcraft-embed-<version>.zip --repo rsysapp/pdfcraft
+```
+
+The command fails for a file that was not built by this repository's release workflow.
+
 ## Behaviour a host page relies on
 
 - Call the module's default export (`init`) before `EmbeddedEditor.mount`. `mount` resolves after
