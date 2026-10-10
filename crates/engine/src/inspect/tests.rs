@@ -101,7 +101,7 @@ fn pages_pdf(pages: &[PageSpec], extras: &[Vec<u8>]) -> Vec<u8> {
         let content = first_page + 2 * i + 1;
         bodies.push(
             format!(
-                "<< /Type /Page /Parent 2 0 R /Contents {content} 0 R /Resources << /Font << /F1 3 0 R >> /XObject << {images}>> >> {} >>",
+                "<< /Type /Page /Parent 2 0 R /Contents {content} 0 R /Resources << /Font << /F1 3 0 R >> /XObject << {images}>> /ExtGState << /Half << /ca 0.5 >> >> >> {} >>",
                 spec.extra
             )
             .into_bytes(),
@@ -116,6 +116,12 @@ fn pages_pdf(pages: &[PageSpec], extras: &[Vec<u8>]) -> Vec<u8> {
 const HELVETICA_WIDTHS: &str = "278 278 355 556 556 889 667 191 333 333 389 584 278 333 278 278 556 556 556 556 556 556 556 556 556 556 \
     278 278 584 584 584 556 1015 667 667 722 722 667 611 778 722 278 500 667 556 833 722 778 667 778 722 667 611 722 667 944 667 667 611 \
     278 278 278 469 556 333 556 556 500 556 556 278 556 556 222 222 500 222 833 556 556 556 556 333 500 278 556 500 722 500 500 500 334 260 334 584";
+
+/// The width of `text` in 12 pt Helvetica (the test font), in points.
+fn width_of(text: &str) -> f32 {
+    let widths: Vec<f32> = HELVETICA_WIDTHS.split_whitespace().map(|w| w.parse().unwrap()).collect();
+    text.bytes().map(|b| widths[usize::from(b) - 32]).sum::<f32>() * 12.0 / 1000.0
+}
 
 /// The object number of page `index` in [`pages_pdf`] with `extras` extra objects.
 fn page_object(extras: usize, index: usize) -> u32 {
@@ -639,6 +645,13 @@ fn a_real_redaction_through_a_word_adds_no_text() {
     assert_eq!(inspection.content, ContentChanges { pages_with_content_removed: 1, ..ContentChanges::default() });
     assert_eq!(inspection.annotations, AnnotationChanges::default());
     assert_eq!(inspection.pages, PageChanges { before: 1, after: 1, ..PageChanges::default() });
+    // The applied box, where the mark was.
+    assert_eq!(inspection.redaction_areas.len(), 1, "{:?}", inspection.redaction_areas);
+    let (page, area) = inspection.redaction_areas[0];
+    assert_eq!(page, 1);
+    for (got, want) in area.iter().zip([18.0, 144.0, 61.0, 163.0]) {
+        assert!((got - want).abs() < 0.5, "{area:?}");
+    }
 }
 
 #[test]
@@ -701,6 +714,47 @@ fn a_page_rotated_and_redacted_in_one_save_is_compared_upright() {
     assert!(!inspection.base_kept);
     assert_eq!(inspection.pages.rotated, 1);
     assert_eq!(inspection.content.pages_changed_outside_redactions, 0);
+}
+
+/// "Buyer may not terminate", or the same line with "not" left out and `cover` drawn over the gap
+/// ("terminate" where it was).
+fn may_not_terminate(cover: Option<&str>) -> Vec<u8> {
+    let not_at = 20.0 + width_of("Buyer may ");
+    let terminate_at = 20.0 + width_of("Buyer may not ");
+    let content = match cover {
+        None => text_line(20.0, 150.0, "Buyer may not terminate"),
+        Some(paint) => {
+            let box_ = format!("{paint} {} 146 {} 16 re f 0 g\n", not_at - 0.5, width_of("not") + 1.0);
+            format!("{}{}{box_}", text_line(20.0, 150.0, "Buyer may"), text_line(terminate_at, 150.0, "terminate"))
+        }
+    };
+    pages_pdf(&[page(&content)], &[])
+}
+
+#[test]
+fn a_deletion_under_a_coloured_box_is_not_a_redaction() {
+    let base = may_not_terminate(None);
+    for (case, paint) in [("red", "1 0 0 rg"), ("grey", "0.2 g"), ("translucent black", "/Half gs 0 g")] {
+        let inspection = run(&base, &may_not_terminate(Some(paint))).unwrap();
+        // The text left is a subsequence of the base: only the box can tell.
+        assert_eq!(inspection.text, TextChanges { pages_with_text_removed: 1, pages_with_text_added: 0 }, "{case}");
+        assert_eq!(inspection.content.pages_changed_outside_redactions, 1, "{case}");
+        assert!(inspection.redaction_areas.is_empty(), "{case}");
+    }
+}
+
+#[test]
+fn the_same_deletion_under_a_black_box_is_reported_as_a_redaction_there() {
+    let base = may_not_terminate(None);
+    let inspection = run(&base, &may_not_terminate(Some("0 g"))).unwrap();
+    assert_eq!(inspection.content.pages_changed_outside_redactions, 0);
+    assert_eq!(inspection.redaction_areas.len(), 1, "{:?}", inspection.redaction_areas);
+    let (page, area) = inspection.redaction_areas[0];
+    assert_eq!(page, 1);
+    let x0 = 20.0 + width_of("Buyer may ") - 0.5;
+    for (got, want) in area.iter().zip([x0, 146.0, x0 + width_of("not") + 1.0, 162.0]) {
+        assert!((got - want).abs() < 0.5, "{area:?}");
+    }
 }
 
 // ── 10. encryption ──────────────────────────────────────────────────────────────────────────
@@ -798,6 +852,25 @@ fn work_bounds_stop_with_too_complex() {
     }
     let nested = pages_pdf(&[page("/Im1 Do")], &extras);
     assert_eq!(run(&nested, &nested), Err(InspectError::TooComplex));
+}
+
+#[test]
+fn pages_of_millions_of_operations_stop_on_the_work_budget_not_the_clock() {
+    // Within the 4 MiB content bound: two million path operators, or 300,000 small fills.
+    let no_clock = Limits { deadline: Duration::from_secs(3_600), ..Limits::default() };
+    for (case, content) in [("closepaths", "h\n".repeat(2_000_000)), ("fills", "1 1 1 1 re f\n".repeat(300_000))] {
+        let file = pages_pdf(&[page(&content)], &[]);
+        let started = Instant::now();
+        assert_eq!(inspect_with(&file, &file, no_clock), Err(InspectError::TooComplex), "{case}");
+        assert!(started.elapsed() < Duration::from_secs(10), "{case}: {:?}", started.elapsed());
+    }
+}
+
+#[test]
+fn two_thousand_pages_compare_within_the_work_bounds() {
+    let file = fixture(MAX_PAGES);
+    let inspection = inspect_with(&file, &file, Limits { deadline: Duration::from_secs(3_600), ..Limits::default() }).unwrap();
+    assert_eq!(inspection.pages.before, MAX_PAGES as u32);
 }
 
 // ── 12. never panics, on a valid file broken in many ways ───────────────────────────────────

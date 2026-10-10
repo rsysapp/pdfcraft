@@ -30,8 +30,14 @@ const BACK_REFERENCES: [&[u8]; 3] = [b"Parent", b"P", b"Popup"];
 /// Page-dictionary entries compared on their own (or resolved through inheritance).
 const PAGE_OWN_KEYS: [&[u8]; 7] = [b"Parent", b"Annots", b"Rotate", b"Contents", b"Resources", b"MediaBox", b"CropBox"];
 
-/// Catalog entries the comparison reports through other facts, or that do not change what a page
-/// shows: the page tree, the form, the layers (compared on their own), metadata and tags.
+/// Catalog entries the document-level check leaves out; a change to any other entry (actions,
+/// names, outlines, page labels, permissions, …) fails the inspection, since no fact reports it.
+/// - `/Pages`, `/AcroForm`, `/OCProperties`: compared on their own (pages, form fields, and the
+///   layers, which count every page as changed);
+/// - `/Metadata` (the XMP packet), `/StructTreeRoot` and `/MarkInfo` (tags), `/Version` (the PDF
+///   version): nothing a viewer draws, and editors update them on ordinary saves (a redaction
+///   cleans tags; a save may restamp metadata). Left out deliberately, so a changed `/Metadata`
+///   can carry different document information with no trace in the result.
 const CATALOG_REPORTED: [&[u8]; 7] = [b"Pages", b"AcroForm", b"OCProperties", b"Metadata", b"StructTreeRoot", b"MarkInfo", b"Version"];
 
 /// The deepest chain of references followed while digesting one object.

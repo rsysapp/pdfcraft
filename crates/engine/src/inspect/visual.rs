@@ -5,7 +5,11 @@
 //! error away from where the original glyph-by-glyph advances put it, which moves an anti-aliased
 //! edge by a level or two). Every connected region of changed pixels must be explained by
 //! uniformly filled rectangles of the edited render:
-//! - the region's fill colour is the colour most of its changed pixels now have;
+//! - the region's fill colour is the colour most of its changed pixels now have, and it must be
+//!   the editor's redaction fill: opaque and in [`REDACTION_FILLS`] (pdfcraft's Redact look fills
+//!   black). A box of another colour, or one with transparency (which blends with what lies under
+//!   it), is not an applied redaction: a deletion covered by a coloured box can change the meaning
+//!   of what is left (drop "not"), and only the editor's own fill is accepted as a redaction;
 //! - a fill is a connected part of what survives an opening of that colour's pixels by a 5 × 5
 //!   square (so it is at least 5 pixels wide and high everywhere: strokes, glyph shapes and thin
 //!   lines do not survive), reached from changed pixels of that colour;
@@ -21,6 +25,11 @@ use std::collections::HashMap;
 
 use pdfcraft_render::content::UprightRaster;
 
+/// The fills a redaction is applied with, as rendered (premultiplied RGBA): opaque black, the
+/// Redact look's fill (`pdfcraft_annot`, `Style::default_for` of `Shape::Redact`). An embed that
+/// offered other fill colours would have its redactions refused until they are listed here.
+pub(crate) const REDACTION_FILLS: [u32; 1] = [u32::from_le_bytes([0, 0, 0, 255])];
+
 /// The largest difference in a channel (of 255) that is not a change: well below what can be seen.
 const NOISE: u8 = 8;
 /// A fill contains, at every one of its pixels, a square of this side (an odd number).
@@ -30,8 +39,6 @@ const EDGE: usize = 2;
 /// How far a fill may reach past the changed pixels (content of the fill colour it covered, such
 /// as the strokes of redacted text, which do not change).
 const REACH: usize = 16;
-/// More fill colours than this on one page is not a set of redaction boxes.
-const MAX_FILL_COLOURS: usize = 8;
 
 fn channels(image: &UprightRaster, index: usize) -> Option<&[u8]> {
     let at = index.checked_mul(4)?;
@@ -136,16 +143,58 @@ fn without_holes(region: &[usize], width: usize) -> bool {
     rows.values().chain(columns.values()).all(|(low, high, count)| high - low + 1 == *count)
 }
 
-/// Whether the edited render differs from the base render anywhere filled boxes do not explain.
-pub(crate) fn changed_outside_filled_rectangles(base: &UprightRaster, edited: &UprightRaster) -> bool {
+/// A rectangle of render pixels: columns `x0..x1`, rows `y0..y1`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PixelRect {
+    pub x0: usize,
+    pub y0: usize,
+    pub x1: usize,
+    pub y1: usize,
+}
+
+/// What the visual comparison found on a page.
+#[derive(Debug, Default)]
+pub(crate) struct Verdict {
+    /// Something changed that the redaction boxes do not explain.
+    pub outside: bool,
+    /// The redaction boxes that explain the changes (empty when `outside`), each box's area as
+    /// rectangles: boxes that overlap (the line boxes of one mark) are one area, split into the
+    /// fewest row bands.
+    pub boxes: Vec<PixelRect>,
+}
+
+const OUTSIDE: Verdict = Verdict { outside: true, boxes: Vec::new() };
+
+/// A hole-free region (each row one run) as row bands of equal runs.
+fn bands(region: &[usize], width: usize) -> Vec<PixelRect> {
+    let width = width.max(1);
+    let mut rows: std::collections::BTreeMap<usize, (usize, usize)> = std::collections::BTreeMap::new();
+    for &index in region {
+        let (x, y) = (index % width, index / width);
+        let run = rows.entry(y).or_insert((x, x));
+        *run = (run.0.min(x), run.1.max(x));
+    }
+    let mut out: Vec<PixelRect> = Vec::new();
+    for (y, (x0, x1)) in rows {
+        match out.last_mut() {
+            Some(last) if last.y1 == y && last.x0 == x0 && last.x1 == x1 + 1 => last.y1 = y + 1,
+            _ => out.push(PixelRect { x0, y0: y, x1: x1 + 1, y1: y + 1 }),
+        }
+    }
+    out
+}
+
+/// Whether the edited render differs from the base render anywhere the editor's redaction boxes
+/// do not explain, and which boxes explain the rest.
+pub(crate) fn redaction_boxes(base: &UprightRaster, edited: &UprightRaster) -> Verdict {
     if base.width != edited.width || base.height != edited.height || base.rgba.len() != edited.rgba.len() {
-        return true;
+        return OUTSIDE;
     }
     let (width, height) = (edited.width as usize, edited.height as usize);
     let total = width.saturating_mul(height);
     let changed: Vec<bool> = (0..total).map(|i| differs(base, edited, i)).collect();
     if !changed.contains(&true) {
-        return false;
+        return Verdict::default();
     }
     // Each changed region's fill colour: what most of its pixels are now.
     let mut fill_of = vec![None::<u32>; total];
@@ -162,11 +211,11 @@ pub(crate) fn changed_outside_filled_rectangles(base: &UprightRaster, edited: &U
                 *votes.entry(c).or_default() += 1;
             }
         }
-        let Some(fill) = votes.into_iter().max_by_key(|(c, n)| (*n, *c)).map(|(c, _)| c) else { return true };
+        let Some(fill) = votes.into_iter().max_by_key(|(c, n)| (*n, *c)).map(|(c, _)| c) else { return OUTSIDE };
+        if !REDACTION_FILLS.contains(&fill) {
+            return OUTSIDE;
+        }
         if !colours.contains(&fill) {
-            if colours.len() >= MAX_FILL_COLOURS {
-                return true;
-            }
             colours.push(fill);
         }
         for index in region {
@@ -176,6 +225,7 @@ pub(crate) fn changed_outside_filled_rectangles(base: &UprightRaster, edited: &U
         }
     }
     let near_change = dilate(&changed, width, height, REACH);
+    let mut verdict = Verdict::default();
     let radius = FILL / 2;
     for fill in colours {
         let painted: Vec<bool> = (0..total).map(|i| colour(edited, i) == Some(fill)).collect();
@@ -191,6 +241,7 @@ pub(crate) fn changed_outside_filled_rectangles(base: &UprightRaster, edited: &U
             let region = flood(start, &opened, &mut reached, width, height);
             let drawn = region.iter().all(|i| near_change.get(*i).copied().unwrap_or(false)) && without_holes(&region, width);
             if drawn {
+                verdict.boxes.extend(bands(&region, width));
                 for index in region {
                     if let Some(slot) = boxes.get_mut(index) {
                         *slot = true;
@@ -201,10 +252,10 @@ pub(crate) fn changed_outside_filled_rectangles(base: &UprightRaster, edited: &U
         let explained = dilate(&boxes, width, height, EDGE);
         let unexplained = (0..total).any(|i| fill_of.get(i).copied().flatten() == Some(fill) && !explained.get(i).copied().unwrap_or(false));
         if unexplained {
-            return true;
+            return OUTSIDE;
         }
     }
-    false
+    verdict
 }
 
 /// Whether `area` (user space) is, in the edited render, one uniform colour that was not

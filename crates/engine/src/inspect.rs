@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pdfcraft_cos::{CosError, Document, ObjRef};
-use pdfcraft_render::content::{ContentDocument, ContentOpenError, UprightRaster};
+use pdfcraft_render::content::{ContentDocument, ContentError, ContentOpenError, UprightRaster};
 
 mod structure;
 mod visual;
@@ -33,18 +33,32 @@ use structure::{Annot, Digest, PageFacts, Structure};
 /// A longer document is refused rather than compared slowly.
 pub const MAX_PAGES: usize = 2_000;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Inspection {
     /// The edited file starts with the base's bytes: the edit is an appended update.
     pub base_kept: bool,
     pub pages: PageChanges,
     /// Form fields (by full name) whose value, field dictionary or widgets changed, appeared or
     /// went, plus one when the form's own dictionary (`/AcroForm` without `/Fields`) changed.
+    /// A widget's appearance changing with its value unchanged counts here (it can show other
+    /// text than the value), as does `/NeedAppearances` (it lets viewers redraw every field):
+    /// both are form changes, not annotations.
     pub form_fields_changed: u32,
     pub annotations: AnnotationChanges,
     pub text: TextChanges,
     pub content: ContentChanges,
+    /// Rewrites only (empty for appended updates): the applied redaction boxes that explain the
+    /// changes, as (page number in the edited file, from 1; rectangle `[x0, y0, x1, y1]` in that
+    /// page's user space, PDF points). Boxes that overlap (the line boxes of one mark) are one
+    /// area, given as the fewest row bands; each is accurate to a pixel of the comparison render
+    /// (at most about half a point on a letter or A4 page). Pages counted in
+    /// `content.pages_changed_outside_redactions` contribute none. Ordered by page, then top to
+    /// bottom. More than [`MAX_REDACTION_AREAS`] is [`InspectError::TooComplex`].
+    pub redaction_areas: Vec<(u32, [f32; 4])>,
 }
+
+/// The most redaction areas an inspection reports.
+pub const MAX_REDACTION_AREAS: usize = 10_000;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PageChanges {
@@ -107,7 +121,9 @@ pub struct ContentChanges {
     /// every page present in both when the document's layer configuration changed.
     pub pages_with_content_changed: u32,
     /// Rewrites only (0 for appended updates): pages whose content, rendered upright without
-    /// annotations, changed anywhere but inside uniformly filled rectangles (applied redactions).
+    /// annotations, changed anywhere but inside the editor's redaction boxes: opaque, uniformly
+    /// filled rectangles in the redaction fill colour (black). A deletion under a box of any other
+    /// colour, or a translucent one, counts here.
     pub pages_changed_outside_redactions: u32,
 }
 
@@ -128,8 +144,11 @@ pub enum InspectError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InspectLimits {
     /// Wall-clock time for the whole comparison, checked between units of work (a page's text,
-    /// a page render, a batch of objects). Not measured on wasm32, which has no clock here: the
-    /// work bounds still apply there.
+    /// a page render, a batch of objects). Not measured on wasm32, which has no clock here.
+    /// The work bounds hold on every target and do not depend on a clock. They are what bounds
+    /// the time on wasm32: each page's text and render, and the comparison as a whole, may do
+    /// only a fixed amount of interpreter work, at most about half a second a page and half a
+    /// minute in all, as measured natively.
     pub deadline: Duration,
 }
 
@@ -170,6 +189,13 @@ pub(crate) struct Limits {
     pub page_render_content: usize,
     /// The longer side of a page render, in pixels.
     pub render_side: u32,
+    /// The work one interpretation (a page's text, a page's render) may do, in hayro's work units:
+    /// one per operator and glyph, and each fill, stroke, image or shading by its device area
+    /// (one unit per 256 pixels). Measured: about 0.7 µs a unit at worst (tiny fills), so a page
+    /// is bounded to well under a second whatever it draws, with or without a clock.
+    pub page_work: u64,
+    /// The work all interpretations of both files may do together.
+    pub work: u64,
 }
 
 impl Default for Limits {
@@ -185,6 +211,8 @@ impl Default for Limits {
             page_image_pixels: 1 << 26,
             page_render_content: 4 << 20,
             render_side: 1_600,
+            page_work: 1_000_000,
+            work: 64_000_000,
         }
     }
 }
@@ -225,6 +253,7 @@ pub(crate) struct Budget {
     pixels_left: u64,
     objects_left: usize,
     uses_left: usize,
+    work_left: u64,
     ticks: u32,
     pub limits: Limits,
 }
@@ -239,6 +268,7 @@ impl Budget {
             pixels_left: limits.rendered_pixels,
             objects_left: limits.objects,
             uses_left: limits.uses,
+            work_left: limits.work,
             ticks: 0,
             limits,
         }
@@ -288,6 +318,13 @@ impl Budget {
         self.tick()
     }
 
+    /// Charge the work `hayro` did since it had done `before`.
+    fn work(&mut self, hayro: &ContentDocument, before: u64) -> Result<(), Fail> {
+        let done = hayro.work_spent().saturating_sub(before);
+        self.work_left = self.work_left.checked_sub(done).ok_or(Fail::TooComplex)?;
+        Ok(())
+    }
+
     fn pixels(&mut self, pixels: u64) -> Result<(), Fail> {
         self.pixels_left = self.pixels_left.checked_sub(pixels).ok_or(Fail::TooComplex)?;
         Ok(())
@@ -329,6 +366,7 @@ fn compare(base: &[u8], edited: &[u8], limits: Limits) -> Result<Inspection, Ins
     inspection.form_fields_changed = fields_changed(&before.structure, &after.structure);
     let mut rasters = Rasters::default();
     compare_pages(&before, &after, &pairs, base_kept, layers_changed, &mut budget, &mut rasters, &mut inspection)?;
+    inspection.redaction_areas.sort_by(|(page_a, a), (page_b, b)| page_a.cmp(page_b).then(b[3].total_cmp(&a[3])).then(a[0].total_cmp(&b[0])));
     inspection.annotations = compare_annotations(&before, &after, &pairs, base_kept, &mut budget, &mut rasters)?;
     Ok(inspection)
 }
@@ -354,7 +392,7 @@ fn read_side(bytes: &[u8], against: Option<(&[u8], &Structure, bool)>, budget: &
         structure::check_chain(&structure.sections, base_bytes.len(), &base.sections, base_kept)?;
     }
     drop(doc);
-    let hayro = match ContentDocument::open(shared) {
+    let hayro = match ContentDocument::open(shared, budget.limits.page_work) {
         Ok(hayro) => hayro,
         Err(ContentOpenError::Encrypted) => return Err(Fail::Encrypted),
         Err(ContentOpenError::Invalid) => return Err(Fail::Read("the file could not be parsed for its content".into())),
@@ -371,13 +409,23 @@ fn read_side(bytes: &[u8], against: Option<(&[u8], &Structure, bool)>, budget: &
         }
         page.size = side.hayro.upright_size(index).ok_or_else(|| Fail::Read(format!("page {number} could not be read")))?;
         budget.content(page.interpreted)?;
-        page.text = side.hayro.text(index).map_err(Fail::Read)?;
+        let before = side.hayro.work_spent();
+        let text = side.hayro.text(index);
+        budget.work(&side.hayro, before)?;
+        page.text = text.map_err(content_failure)?;
         page.fingerprint = structure::fingerprint(page);
     }
     if side.hayro.repaired() {
         return Err(Fail::Read("the file's cross-reference data is damaged".into()));
     }
     Ok(side)
+}
+
+fn content_failure(error: ContentError) -> Fail {
+    match error {
+        ContentError::Unreadable(message) => Fail::Read(message),
+        ContentError::TooComplex => Fail::TooComplex,
+    }
 }
 
 /// Pages present in both files: (base page, edited page).
@@ -519,7 +567,10 @@ fn render(side: &Side, index: usize, budget: &mut Budget) -> Result<UprightRaste
     let side_px = u64::from(budget.limits.render_side);
     budget.pixels(side_px.saturating_mul(side_px))?;
     budget.content(page.interpreted)?;
-    side.hayro.render_upright(index, budget.limits.render_side).map_err(Fail::Read)
+    let before = side.hayro.work_spent();
+    let raster = side.hayro.render_upright(index, budget.limits.render_side);
+    budget.work(&side.hayro, before)?;
+    raster.map_err(content_failure)
 }
 
 /// Per-page counts, in [`ContentChanges`] and [`TextChanges`] order.
@@ -563,7 +614,15 @@ fn compare_pages(
             counts.content_changed += usize::from(drawn_differently);
         } else if drawn_differently {
             let (base_raster, edited_raster) = rasters.get(before, after, (old, new), budget)?;
-            counts.outside_redactions += usize::from(visual::changed_outside_filled_rectangles(&base_raster, &edited_raster));
+            let verdict = visual::redaction_boxes(&base_raster, &edited_raster);
+            counts.outside_redactions += usize::from(verdict.outside);
+            let page = u32::try_from(new.saturating_add(1)).unwrap_or(u32::MAX);
+            for rect in verdict.boxes {
+                if inspection.redaction_areas.len() >= MAX_REDACTION_AREAS {
+                    return Err(InspectError::TooComplex);
+                }
+                inspection.redaction_areas.push((page, user_rect(&edited_raster, rect)));
+            }
         }
     }
     inspection.text = TextChanges { pages_with_text_removed: count(counts.text_removed), pages_with_text_added: count(counts.text_added) };
@@ -575,6 +634,16 @@ fn compare_pages(
         pages_changed_outside_redactions: count(counts.outside_redactions),
     };
     Ok(())
+}
+
+/// A box of render pixels in the page's user space (PDF points), widened by its anti-aliased edge.
+fn user_rect(raster: &UprightRaster, rect: visual::PixelRect) -> [f32; 4] {
+    let scale = if raster.scale > 0.0 { raster.scale } else { 1.0 };
+    let x = |px: usize| raster.crop[0] + px as f32 / scale;
+    let y = |py: usize| raster.crop[1] + raster.height_pt - py as f32 / scale;
+    let (x0, x1) = (rect.x0.saturating_sub(1), rect.x1.saturating_add(1).min(raster.width as usize));
+    let (top, bottom) = (rect.y0.saturating_sub(1), rect.y1.saturating_add(1).min(raster.height as usize));
+    [x(x0), y(bottom), x(x1), y(top)]
 }
 
 fn fields_changed(before: &Structure, after: &Structure) -> u32 {
