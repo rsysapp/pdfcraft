@@ -230,11 +230,20 @@ impl Stream {
 
     /// Decoded data; any corruption is an error.
     pub fn decoded_strict(&self) -> Result<Vec<u8>, CosError> {
+        self.decoded_strict_within(MAX_DECODED)
+    }
+
+    /// Embed build: like [`Stream::decoded_strict`], and decoding past `max` bytes is an error too
+    /// (a caller with a work budget, such as a save inspector).
+    pub fn decoded_strict_within(&self, max: usize) -> Result<Vec<u8>, CosError> {
         let chain = self.filters();
         if chain.is_empty() {
+            if self.raw.len() > max {
+                return Err(CosError::Filter(format!("decoded output exceeds the limit of {max} bytes")));
+            }
             return Ok(self.raw.as_ref().clone());
         }
-        pdfcraft_filters::decode(&chain, &self.raw, MAX_DECODED).map_err(|e| CosError::Filter(e.to_string()))
+        pdfcraft_filters::decode(&chain, &self.raw, max.min(MAX_DECODED)).map_err(|e| CosError::Filter(e.to_string()))
     }
 }
 
