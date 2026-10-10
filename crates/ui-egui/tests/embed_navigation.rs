@@ -77,7 +77,7 @@ fn text_jumps_match_curly_quotes_and_span_lines() {
 }
 
 #[test]
-fn jumps_without_a_document_or_overtaken_by_an_open() {
+fn a_jump_without_a_document_or_overtaken_by_an_open_answers_not_found() {
     let (mut h, bridge) = embedded();
     h.run_steps(2);
     for target in [JumpTarget::Page { page: 1 }, text("anything", None, 0)] {
@@ -85,14 +85,19 @@ fn jumps_without_a_document_or_overtaken_by_an_open() {
     }
     open(&mut h, &bridge, "three.pdf", three_pages());
     // Page 3's text layer isn't loaded yet, so this jump waits; the open replaces the document first.
-    bridge.send(HostCommand::JumpTo(text("thirty", None, 0)));
+    let waiting = text("thirty", None, 0);
+    bridge.send(HostCommand::JumpTo(waiting.clone()));
     bridge.send(HostCommand::Open { name: "other.pdf".into(), bytes: three_pages() });
     h.run_steps(3);
     settle(&mut h);
-    // Exactly the new document's events: the waiting jump was dropped, not run against it.
-    assert_eq!(bridge.take_events(), [HostEvent::Opened { pages: 3 }, HostEvent::PageChanged { page: 1 }]);
-    assert_eq!(h.state().views[0].current, 0, "the dropped jump did not move the new document");
-    assert!(h.state().views[0].flash.is_none(), "the dropped jump outlined nothing");
+    // The waiting jump is answered with its own target, never dropped and never run against the new document.
+    let events = bridge.take_events();
+    assert_eq!(not_found(&events), [waiting], "{events:?}");
+    assert!(events.contains(&HostEvent::Opened { pages: 3 }), "{events:?}");
+    assert_eq!(events.len(), 3, "only jumpNotFound, opened and the first page: {events:?}");
+    assert_eq!(h.state().views[0].current, 0, "the answered jump did not move the new document");
+    assert!(h.state().views[0].flash.is_none(), "the answered jump outlined nothing");
+    assert!(!h.state().host_work_pending(), "nothing is left waiting");
 }
 
 #[test]

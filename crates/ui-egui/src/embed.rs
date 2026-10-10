@@ -82,7 +82,11 @@ pub(crate) struct PageMark {
 impl Embed {
     /// Forget what belonged to the document that was open, marks included.
     fn document_closed(&mut self) {
-        self.jump = None;
+        // A jump still waiting for text belonged to the closed document: answer it with its own
+        // target, so the host is never left waiting and it is never run against the next document.
+        if let Some(target) = self.jump.take() {
+            self.bridge.emit(HostEvent::JumpNotFound { target });
+        }
         self.last_page = None;
         self.last_selection = None;
         self.selection_reported = false;
