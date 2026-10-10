@@ -2,8 +2,10 @@
 
 mod embed_support;
 
-use egui::Color32;
-use embed_support::embedded;
+use egui::{Color32, ViewportCommand, ViewportId};
+use egui_kittest::Harness;
+use embed_support::{embedded, embedded_with};
+use pdfcraft_ui_egui::PdfCraftApp;
 use pdfcraft_ui_egui::embed::{HostCommand, Theme};
 use pdfcraft_ui_egui::theme::{ThemeKind, Tokens};
 
@@ -38,4 +40,35 @@ fn without_a_host_theme_the_default_tokens_are_untouched() {
     assert_eq!(tokens.accent_text, defaults.accent_text);
     assert_eq!(tokens.accent_soft, defaults.accent_soft);
     assert_eq!(tokens.badge_new, defaults.badge_new);
+}
+
+/// Send the host's theme, then count the `SetTheme` viewport commands the frames that follow sent.
+fn window_theme_commands(h: &mut Harness<'static, PdfCraftApp>, bridge: &pdfcraft_ui_egui::embed::HostBridge, dark: bool) -> usize {
+    bridge.send(HostCommand::SetTheme(Theme { dark, accent: Color32::from_rgb(0x0F, 0x76, 0x6E), accent_content: Color32::WHITE }));
+    let mut sent = 0;
+    for _ in 0..4 {
+        h.step();
+        let commands = &h.output().viewport_output[&ViewportId::ROOT].commands;
+        sent += commands.iter().filter(|command| matches!(command, ViewportCommand::SetTheme(_))).count();
+    }
+    sent
+}
+
+#[test]
+fn a_host_theme_change_sends_no_window_theme_command() {
+    let (mut h, bridge) = embedded();
+    h.run_steps(2);
+    assert_eq!(window_theme_commands(&mut h, &bridge, true), 0, "dark");
+    assert_eq!(window_theme_commands(&mut h, &bridge, false), 0, "dark to light");
+    assert!(!Tokens::get(&h.ctx).dark(), "the theme itself still changes");
+    assert_eq!(h.ctx.options(|o| o.theme_preference), egui::ThemePreference::Light, "the preference stays explicit");
+}
+
+#[test]
+fn without_the_embed_context_setup_a_theme_change_sends_one() {
+    // What the test above rules out: egui's window-theme sync, which the web backend only logs.
+    let (mut h, bridge) = embedded_with(false);
+    h.run_steps(2);
+    window_theme_commands(&mut h, &bridge, true);
+    assert!(window_theme_commands(&mut h, &bridge, false) > 0);
 }

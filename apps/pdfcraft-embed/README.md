@@ -66,9 +66,12 @@ The command fails for a file that was not built by this repository's release wor
   jump waits until the pages it searches have their text; a newer jump replaces a waiting one.
 - `selection` is sent when a selection settles (button released, or a keyboard selection);
   `x`, `y` are CSS pixels from the canvas's top-left at the end of its last line.
-- Malformed arguments (`jumpTo`, `setMarks`, `setTheme`, `mount` options) throw and change nothing.
+- Malformed arguments (`open` with anything but a `Uint8Array`, `jumpTo`, `setMarks`, `setTheme`,
+  `mount` options) throw and change nothing.
 - `destroy` stops the runner; later calls do nothing. Dropping the object (`free()`) destroys it
-  too.
+  too. Either may be called from any handler, including one eframe triggers inside a frame (its
+  text agent's `focusin`/`focusout`, or the `blur` of an opened link): the host hears nothing more
+  from the call on, and the runner is torn down once the frame has returned.
 - Put a timeout on `mount` in the host page: it resolves after the first frame, which a canvas
   that never shows (or a failed start) does not produce.
 - Each `mount` installs eframe's panic hook. Mounting and destroying repeatedly in one page chains
@@ -89,7 +92,10 @@ The command fails for a file that was not built by this repository's release wor
 - Page numbers and occurrences above 2^32-1 saturate to 2^32-1, so they are out of range for any
   document: the jump answers `jumpNotFound`, the mark is skipped. Negative or fractional numbers
   throw.
-- `open` has no size cap of its own: the host caps the file size it passes.
+- `open` takes files of at most 100 MiB (`MAX_OPEN_BYTES`). A larger one is answered, in order,
+  `openFailed` ("This file is too large to be shown here.") and replaces the open document like a
+  broken file does; its bytes are never copied into the module. After `destroy`, `open` copies
+  nothing.
 - A text jump or mark without a page loads every page's text layer, so its cost grows with the
   page count; a page-scoped one loads that page alone. Matching costs O(page text × passage) per
   page searched, on the frame.

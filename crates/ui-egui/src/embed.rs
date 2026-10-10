@@ -11,8 +11,8 @@ mod rail;
 pub mod text_match;
 
 pub use protocol::{
-    HostBridge, HostCommand, HostEvent, JumpTarget, MAX_MARKS, Mark, Theme, parse_color, parse_jump_target, parse_marks, parse_mount_options,
-    parse_theme,
+    HostBridge, HostCommand, HostEvent, JumpTarget, MAX_MARKS, MAX_OPEN_BYTES, Mark, OPEN_TOO_LARGE, Theme, open_command, open_too_large,
+    parse_color, parse_jump_target, parse_marks, parse_mount_options, parse_theme,
 };
 
 use std::collections::HashSet;
@@ -198,6 +198,15 @@ impl Embed {
     }
 }
 
+/// Set up the embed build's egui context, once, when the runner creates the app.
+pub fn prepare_context(ctx: &egui::Context) {
+    // egui sends `ViewportCommand::SetTheme` whenever the theme derived from the preference changes,
+    // so a native window's decorations follow it. A canvas has no decorations, and eframe's web
+    // backend only logs the command as unhandled, once per host theme change. The explicit theme
+    // preference stays (`apply_host_theme`); only the window sync goes.
+    ctx.options_mut(|options| options.sync_window_theme = false);
+}
+
 impl PdfCraftApp {
     /// An app driven by a host page through `bridge`, in view mode: the page view with its
     /// navigation, zoom and find, and nothing that changes, saves, prints or opens files.
@@ -224,6 +233,7 @@ impl PdfCraftApp {
         for command in embed.bridge.take_commands() {
             match command {
                 HostCommand::Open { name, bytes } => self.host_open(&mut embed, &name, bytes),
+                HostCommand::OpenTooLarge { .. } => self.host_open_refused(&mut embed, OPEN_TOO_LARGE),
                 HostCommand::JumpTo(target) => self.host_jump(&mut embed, target),
                 HostCommand::SetMarks(marks) => embed.set_marks(marks),
                 HostCommand::SetTheme(theme) => embed.theme = Some(theme),
@@ -361,16 +371,33 @@ impl PdfCraftApp {
     /// Open the host's file in place of the current one: `opened`, or `openFailed` for a broken
     /// file or one that needs a password.
     fn host_open(&mut self, embed: &mut Embed, name: &str, bytes: Vec<u8>) {
-        while !self.views.is_empty() {
-            self.close_tab(0);
+        // The embed crate refuses these before copying them; a native caller may still send one.
+        if open_too_large(bytes.len()) {
+            return self.host_open_refused(embed, OPEN_TOO_LARGE);
         }
-        embed.document_closed();
+        self.close_for_host_open(embed);
         let event = match self.try_open(name, None, Arc::new(bytes), None) {
             Err(e) => HostEvent::OpenFailed { message: format!("This file can't be shown: {e}") },
             Ok(()) if self.password_prompt.take().is_some() => HostEvent::OpenFailed { message: PASSWORD_MESSAGE.into() },
             Ok(()) => HostEvent::Opened { pages: self.active_ids().and_then(|(_, id)| self.session.get(id)).map_or(0, |d| d.info.pages.len()) },
         };
         embed.bridge.emit(event);
+    }
+
+    /// An open refused before parsing: it replaces the current document like any other, so the
+    /// host hears the same events in the same order, ending with `openFailed`.
+    fn host_open_refused(&mut self, embed: &mut Embed, message: &str) {
+        self.close_for_host_open(embed);
+        embed.bridge.emit(HostEvent::OpenFailed { message: message.into() });
+    }
+
+    /// Close the open document for the host's next one (`selectionCleared` and a waiting jump's
+    /// `jumpNotFound` go first).
+    fn close_for_host_open(&mut self, embed: &mut Embed) {
+        while !self.views.is_empty() {
+            self.close_tab(0);
+        }
+        embed.document_closed();
     }
 
     /// Keep view mode whatever ran this frame (a notice button, a link, a key): no panel, dialog,

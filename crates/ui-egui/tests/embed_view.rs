@@ -3,8 +3,8 @@
 mod embed_support;
 
 use egui_kittest::kittest::Queryable;
-use embed_support::{embedded, open, pages, protected};
-use pdfcraft_ui_egui::embed::HostEvent;
+use embed_support::{embedded, open, pages, protected, settle, three_pages};
+use pdfcraft_ui_egui::embed::{HostCommand, HostEvent, JumpTarget, MAX_OPEN_BYTES, OPEN_TOO_LARGE, open_command};
 
 #[test]
 fn the_view_profile_shows_the_page_navigation_and_nothing_else() {
@@ -39,6 +39,39 @@ fn opening_answers_opened_or_open_failed_and_never_prompts() {
     assert_eq!(second.first(), Some(&HostEvent::Opened { pages: 3 }));
     assert_eq!(h.state().views.len(), 1, "open replaces the document");
     assert!(h.state().session.view_only());
+}
+
+#[test]
+fn an_open_over_the_size_cap_never_copies_its_bytes() {
+    for len in [MAX_OPEN_BYTES + 1, usize::MAX] {
+        let mut copied = false;
+        let command = open_command("big.pdf".into(), len, || {
+            copied = true;
+            Vec::new()
+        });
+        assert_eq!(command, HostCommand::OpenTooLarge { len });
+        assert!(!copied, "{len} bytes are refused before the copy");
+    }
+    let at_cap = open_command("cap.pdf".into(), MAX_OPEN_BYTES, || b"%PDF-".to_vec());
+    assert_eq!(at_cap, HostCommand::Open { name: "cap.pdf".into(), bytes: b"%PDF-".to_vec() });
+}
+
+#[test]
+fn an_open_over_the_size_cap_is_answered_in_order_and_replaces_the_document() {
+    let (mut h, bridge) = embedded();
+    open(&mut h, &bridge, "three.pdf", three_pages());
+    let jump = JumpTarget::Text { text: "nowhere in the document".into(), page: None, occurrence: 0 };
+    bridge.send(HostCommand::JumpTo(jump.clone()));
+    bridge.send(open_command("huge.pdf".into(), MAX_OPEN_BYTES + 1, Vec::new));
+    bridge.send(HostCommand::Open { name: "a.pdf".into(), bytes: pages(&[&["Alpha"]]) });
+    // A native caller that sends the bytes anyway hears the same answer.
+    bridge.send(HostCommand::Open { name: "huge.pdf".into(), bytes: vec![0; MAX_OPEN_BYTES + 1] });
+    h.run_steps(3);
+    settle(&mut h);
+    let too_large = HostEvent::OpenFailed { message: OPEN_TOO_LARGE.into() };
+    assert_eq!(bridge.take_events(), [HostEvent::JumpNotFound { target: jump }, too_large.clone(), HostEvent::Opened { pages: 1 }, too_large]);
+    assert!(h.state().views.is_empty(), "a refused open replaces the document, as a broken file does");
+    assert!(!h.state().host_work_pending());
 }
 
 fn right_click_at(h: &mut egui_kittest::Harness<'static, pdfcraft_ui_egui::PdfCraftApp>, at: egui::Pos2) {

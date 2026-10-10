@@ -9,6 +9,26 @@ use egui::Color32;
 /// Most marks one `setMarks` keeps; the rest are ignored.
 pub const MAX_MARKS: usize = 2_000;
 
+/// Largest file `open` takes. A larger one is answered `openFailed` ([`OPEN_TOO_LARGE`]) without
+/// its bytes ever being copied into WebAssembly memory: a failed allocation aborts the module, and
+/// that memory never shrinks.
+pub const MAX_OPEN_BYTES: usize = 100 << 20;
+
+/// What `open` answers for a file over [`MAX_OPEN_BYTES`].
+pub const OPEN_TOO_LARGE: &str = "This file is too large to be shown here.";
+
+/// Whether a file of `len` bytes is refused before anything reads it.
+pub fn open_too_large(len: usize) -> bool {
+    len > MAX_OPEN_BYTES
+}
+
+/// The command for a host's `open` of a file of `len` bytes. `copy` brings the bytes over and is
+/// called only for a file `open` takes, so a refused file is never copied; the refusal still goes
+/// through the queue, so every open is answered once, in the order the host made them.
+pub fn open_command(name: String, len: usize, copy: impl FnOnce() -> Vec<u8>) -> HostCommand {
+    if open_too_large(len) { HostCommand::OpenTooLarge { len } } else { HostCommand::Open { name, bytes: copy() } }
+}
+
 /// Where a host jump goes.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -77,7 +97,14 @@ pub struct Theme {
 /// What the host asks for. The embed crate builds these from JavaScript values.
 #[derive(Clone, Debug, PartialEq)]
 pub enum HostCommand {
-    Open { name: String, bytes: Vec<u8> },
+    Open {
+        name: String,
+        bytes: Vec<u8>,
+    },
+    /// An `open` refused before its bytes were copied ([`open_command`]): only its length came over.
+    OpenTooLarge {
+        len: usize,
+    },
     JumpTo(JumpTarget),
     SetMarks(Vec<Mark>),
     SetTheme(Theme),

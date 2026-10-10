@@ -53,12 +53,21 @@ pub fn protected(user: &str) -> Vec<u8> {
     pdfcraft_cos::write_full(&doc, &Default::default()).expect("writes")
 }
 
-/// The embedded app and the host's end of its bridge.
+/// The embedded app and the host's end of its bridge, its context set up as the embed build's is.
 pub fn embedded() -> (Harness<'static, PdfCraftApp>, HostBridge) {
+    embedded_with(true)
+}
+
+/// [`embedded`], with or without the embed build's context setup (`embed::prepare_context`).
+pub fn embedded_with(prepared: bool) -> (Harness<'static, PdfCraftApp>, HostBridge) {
     let bridge = HostBridge::default();
     let app_bridge = bridge.clone();
-    let h =
-        Harness::builder().with_size(egui::vec2(900.0, 700.0)).with_step_dt(1.0 / 60.0).build_eframe(move |_cc| PdfCraftApp::embedded(app_bridge));
+    let h = Harness::builder().with_size(egui::vec2(900.0, 700.0)).with_step_dt(1.0 / 60.0).build_eframe(move |cc| {
+        if prepared {
+            pdfcraft_ui_egui::embed::prepare_context(&cc.egui_ctx);
+        }
+        PdfCraftApp::embedded(app_bridge)
+    });
     (h, bridge)
 }
 
