@@ -127,12 +127,38 @@ pub fn render<'a>(
     interpreter_settings: &InterpreterSettings,
     render_settings: &RenderSettings,
 ) -> Pixmap {
+    // Embed build: the body moved to `render_with`, shared with `render_upright`.
+    render_with(page, cache, interpreter_settings, render_settings, page.initial_transform(true).to_kurbo(), page.render_dimensions())
+}
+
+/// Embed build: render the page as if its `/Rotate` were 0 (the crop box upright, y down), for
+/// comparing a page's content with another version of it whose rotation may differ.
+pub fn render_upright<'a>(
+    page: &'a Page<'a>,
+    cache: &RenderCache<'a>,
+    interpreter_settings: &InterpreterSettings,
+    render_settings: &RenderSettings,
+) -> Pixmap {
+    let crop_box = page.intersected_crop_box().to_kurbo();
+    let (width, height) = page.base_dimensions();
+    let upright = Affine::new([1.0, 0.0, 0.0, -1.0, 0.0, height as f64]) * Affine::translate((-crop_box.x0, -crop_box.y0));
+    render_with(page, cache, interpreter_settings, render_settings, upright, (width, height))
+}
+
+// Embed build: the body of `render`, for a given page transform and page size (in points).
+fn render_with<'a>(
+    page: &'a Page<'a>,
+    cache: &RenderCache<'a>,
+    interpreter_settings: &InterpreterSettings,
+    render_settings: &RenderSettings,
+    page_transform: Affine,
+    (width, height): (f32, f32),
+) -> Pixmap {
     let (x_scale, y_scale) = (render_settings.x_scale, render_settings.y_scale);
-    let (width, height) = page.render_dimensions();
     let (scaled_width, scaled_height) = ((width * x_scale) as f64, (height * y_scale) as f64);
     let initial_transform = Affine::translate((-render_settings.x_offset as f64, -render_settings.y_offset as f64))
         * Affine::scale_non_uniform(x_scale as f64, y_scale as f64)
-        * page.initial_transform(true).to_kurbo();
+        * page_transform;
 
     let (pix_width, pix_height) = (
         render_settings.width.unwrap_or(scaled_width.floor() as u16),

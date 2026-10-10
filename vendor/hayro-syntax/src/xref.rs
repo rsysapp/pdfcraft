@@ -381,7 +381,9 @@ impl XRef {
         Ok(xref)
     }
 
-    fn is_repaired(&self) -> bool {
+    /// Embed build (public): the cross-reference data was rebuilt by scanning the file, either
+    /// on opening or later, when an object was not where the table said.
+    pub fn is_repaired(&self) -> bool {
         match &self.0 {
             Inner::Dummy => false,
             Inner::Some(r) => {

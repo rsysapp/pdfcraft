@@ -17,3 +17,10 @@ the fix. Vendoring copyleft code is never allowed (plan/adr/0001).
 Temporary: hayro is the bootstrap renderer and lopdf the bootstrap inspector (ADR-0004); M2.6 replaces them with our own devices and `cos`/`model`.
 
 Text extraction: hayro-interpret exposes `OutlineGlyph::is_vertical` from a Type0 font’s CMap writing mode. PdfCraft follows negative glyph-space y for WMode 1 so upright vertical columns can be searched (#126).
+
+Embed build patches (marked `Embed build:` in the source; used by the save inspector, `pdfcraft-engine` `inspect`):
+
+| Crate | Patch | Why | Test |
+|---|---|---|---|
+| hayro | `render_upright`: render a page as if its `/Rotate` were 0 (`render`'s body moved into `render_with`, which takes the page transform and size) | Comparing a page with an earlier version whose rotation differs; un-rotating the pixels of a rotated render is not pixel-identical to an upright render | `pdfcraft-render` `content::tests::renders_a_rotated_page_upright`, `pdfcraft-engine` `inspect::tests::a_page_rotated_and_redacted_in_one_save_is_compared_upright` |
+| hayro-syntax | `XRef::is_repaired` made public | hayro rebuilds a broken cross-reference table silently, on opening or on the first object it cannot find; what it then reads may differ from what other readers read, so the inspector refuses such a file | `pdfcraft-render` `content::tests::says_when_the_cross_reference_data_was_rebuilt` |
