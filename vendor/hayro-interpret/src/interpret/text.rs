@@ -64,6 +64,19 @@ pub(crate) fn show_glyph<'a>(
     if !ctx.ocg_state.is_visible() {
         return;
     }
+    // Embed build: every glyph is work (four units: placing and reading it costs more than an
+    // operator); an outline glyph also costs the area of its em square (1,000 units of glyph
+    // space). A Type 3 glyph's procedure is charged as it runs.
+    let units = match glyph {
+        Glyph::Outline(_) => {
+            let em = kurbo::Rect::new(0.0, -200.0, 1000.0, 800.0);
+            1 + crate::context::paint_work(ctx, (ctx.get().ctm * glyph_transform).transform_rect_bbox(em))
+        }
+        Glyph::Type3(_) => 4,
+    };
+    if !crate::context::take_work(ctx, units) {
+        return;
+    }
 
     device.set_soft_mask(ctx.get().graphics_state.soft_mask.clone());
     device.set_blend_mode(ctx.get().graphics_state.blend_mode);

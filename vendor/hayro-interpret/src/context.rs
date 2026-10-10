@@ -31,6 +31,41 @@ pub(crate) const MAX_NESTED_PAINTS: u32 = 50_000;
 
 std::thread_local! {
     static NESTED_PAINTS: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+    // Embed build: the work this interpretation did, and whether it ran out.
+    static WORK: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+    static WORK_EXCEEDED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Embed build: the work done by the latest interpretation on this thread (see
+/// `InterpreterSettings::work_budget`), up to the point it stopped.
+pub fn work_spent() -> u64 {
+    WORK.with(|w| w.get())
+}
+
+/// Embed build: spend `units` of the interpretation's work budget; `false` once it is spent (the
+/// caller skips the work), with `WorkBudgetExceeded` sent the first time.
+pub(crate) fn take_work(context: &Context<'_>, units: u64) -> bool {
+    let budget = context.settings.work_budget;
+    let total = WORK.with(|w| {
+        let total = w.get().saturating_add(units);
+        w.set(total);
+        total
+    });
+    if total <= budget {
+        return true;
+    }
+    if !WORK_EXCEEDED.with(|e| e.replace(true)) {
+        (context.settings.warning_sink)(crate::InterpreterWarning::WorkBudgetExceeded);
+    }
+    false
+}
+
+/// Embed build: the work of painting over `area` (device space, before clipping): three units,
+/// and one per 256 device pixels of it inside the current clip.
+pub(crate) fn paint_work(context: &Context<'_>, area: Rect) -> u64 {
+    let covered = context.bbox().intersect(area);
+    let pixels = if covered.is_finite() { covered.area().max(0.0) } else { 0.0 };
+    3 + (pixels / 256.0).min(u64::MAX as f64 / 2.0) as u64
 }
 
 /// PdfCraft patch: count a paint at `depth` (top-level ones are free); `false` once this
@@ -103,6 +138,9 @@ impl<'a> Context<'a> {
         let state = State::new(initial_transform);
         // PdfCraft patch: a page (or other top-level content) starts with a fresh budget.
         NESTED_PAINTS.with(|n| n.set(0));
+        // Embed build: and with no work done.
+        WORK.with(|w| w.set(0));
+        WORK_EXCEEDED.with(|e| e.set(false));
 
         Self::new_with(initial_transform, bbox, cache, xref, settings, state, 0)
     }

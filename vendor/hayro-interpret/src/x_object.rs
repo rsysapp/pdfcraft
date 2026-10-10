@@ -199,6 +199,15 @@ pub(crate) fn draw_image_xobject<'a, 'b>(
     let width = x_object.width as f64;
     let height = x_object.height as f64;
 
+    // Embed build: an image costs the area it covers (the unit square under the CTM).
+    let area = context.get().ctm.transform_rect_bbox(Rect::new(0.0, 0.0, 1.0, 1.0));
+    if !crate::context::take_work(context, crate::context::paint_work(context, area)) {
+        if has_oc {
+            context.ocg_state.end_marked_content();
+        }
+        return;
+    }
+
     context.save_state();
     context.pre_concat_affine(Affine::new([
         1.0 / width,

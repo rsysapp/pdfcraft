@@ -109,6 +109,11 @@ pub struct InterpreterSettings {
     /// PdfCraft patch: viewer overrides for optional content groups (object number, generation,
     /// visible), applied on top of the document's default configuration (Layers panel toggles).
     pub ocg_overrides: Arc<Vec<(i32, i32, bool)>>,
+    /// Embed build: the work one interpretation (a page, from `Context::new`) may do, in units
+    /// of [`work_spent`]: one per operator and glyph, and each fill, stroke, image or shading
+    /// by the device area it covers. Past it the rest is skipped and
+    /// [`InterpreterWarning::WorkBudgetExceeded`] is sent once. Unbounded by default.
+    pub work_budget: u64,
 }
 
 impl Default for InterpreterSettings {
@@ -129,6 +134,7 @@ impl Default for InterpreterSettings {
             render_annotations: true,
             hide_comments: false,
             ocg_overrides: Arc::new(Vec::new()),
+            work_budget: u64::MAX,
         }
     }
 }
@@ -142,6 +148,9 @@ pub enum InterpreterWarning {
     UnsupportedFont,
     /// An image failed to decode.
     ImageDecodeFailure,
+    /// Embed build: the interpretation spent `InterpreterSettings::work_budget`; the rest of the
+    /// content was skipped.
+    WorkBudgetExceeded,
 }
 
 /// interpret the contents of the page and render them into the device.
@@ -325,6 +334,10 @@ pub fn interpret<'a>(
     context.save_state();
 
     while let Some(op) = ops.next() {
+        // Embed build: every operator is work, whatever it does.
+        if !crate::context::take_work(context, 1) {
+            break;
+        }
         match op {
             TypedInstruction::SaveState(_) => context.save_state(),
             TypedInstruction::StrokeColorDeviceRgb(s) => {

@@ -70,6 +70,11 @@ pub(crate) fn fill_path_impl<'a>(
     }
 
     let base_transform = context.get().ctm;
+    // Embed build: a fill costs the area it covers.
+    let area = base_transform.transform_rect_bbox(path.unwrap_or(context.path()).fast_bounding_box());
+    if !crate::context::take_work(context, crate::context::paint_work(context, area)) {
+        return;
+    }
 
     let paint = get_paint(context, false);
     device.set_soft_mask(context.get().graphics_state.soft_mask.clone());
@@ -130,6 +135,12 @@ pub(crate) fn stroke_path_impl<'a>(
     }
 
     let base_transform = context.get().ctm;
+    // Embed build: a stroke costs the area it covers (its path's box, widened by the line).
+    let half = f64::from(context.get().graphics_state.stroke_props.line_width.abs()) / 2.0;
+    let area = base_transform.transform_rect_bbox(path.unwrap_or(context.path()).fast_bounding_box().inflate(half, half));
+    if !crate::context::take_work(context, crate::context::paint_work(context, area)) {
+        return;
+    }
 
     let stroke_props = context.stroke_props();
     device.set_soft_mask(context.get().graphics_state.soft_mask.clone());
