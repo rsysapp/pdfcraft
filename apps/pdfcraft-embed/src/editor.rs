@@ -98,6 +98,12 @@ impl EmbeddedEditor {
     /// Stops the runner and frees the canvas. The object is unusable afterwards: later calls queue
     /// nothing and deliver nothing (malformed arguments still throw), and a second `destroy` does
     /// nothing.
+    ///
+    /// Throws nothing by itself: nothing here can fail on a sound instance. After a crash (a trap)
+    /// it may throw, and after `free()` wasm-bindgen refuses the call, so a host calls it inside a
+    /// `try` there. A crashed instance is discarded whole: the next editor is mounted from a fresh
+    /// import of the glue (a new URL) and a new WebAssembly instance, never on this one (README.md,
+    /// "Crashes").
     pub fn destroy(&self) {
         if self.destroyed.replace(true) {
             return;

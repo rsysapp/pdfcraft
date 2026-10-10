@@ -122,11 +122,34 @@ The command fails for a file that was not built by this repository's release wor
 
 ## Crashes
 
-A Rust panic aborts the WebAssembly module: there is no unwinding on wasm32. After one the editor
-sends nothing more and later calls may throw. The host therefore puts a timeout on `open`: no
-`opened` or `openFailed` within it (or a call that throws) is a failure, after which the host shows
-its own failure panel, calls `destroy` and mounts a fresh editor for the next document. On a
-`mount` timeout, keep the promise and `destroy` the editor if it resolves late.
+A Rust panic aborts the WebAssembly module: there is no unwinding on wasm32. A stack overflow or a
+failed allocation traps it the same way. After a trap the editor sends nothing more and later calls
+may throw. The host therefore treats "no `opened` or `openFailed` within its timeout after `open`",
+or a call that throws, as a failure: it shows its own failure panel and discards the whole module
+instance, never mounting on it again.
+
+A trap leaves the instance's memory as it was: locks held, the stack pointer not restored. And
+`init` returns the same cached instance. A new editor mounted on it can therefore crash at once or
+hang until the host's timeout. So after a failure the host:
+
+1. calls `destroy()` on the failed editor inside a `try`, since after a trap it may throw;
+2. drops every reference to that editor and to the module it came from;
+3. for the next mount, loads a fresh instance: a new `import()` of the glue under a new URL (its own
+   module record, for example `pdfcraft_embed.js?attempt=2`), then that glue's `init`, which makes
+   a new WebAssembly instance with its own memory. The compiled `WebAssembly.Module` may be reused
+   (pass it to `init` as `module_or_path`); only the instance must be new. A recreated iframe or
+   worker that loads the glue is a fresh instance too.
+
+`destroy()` throws nothing by itself. It can throw only after a trap, or after `free()`
+(wasm-bindgen refuses any call on a freed object). Both are cases where the host's `try` is needed
+anyway.
+
+On a `mount` timeout, keep the promise and `destroy` the editor if it resolves late. eframe paints
+on animation frames, which a browser does not run in a hidden or background tab: there `mount`'s
+first frame, and the `opened` or `openFailed` that answers an `open`, wait until the tab is visible
+again. A host therefore pauses its `open` and `mount` timeouts while `document.hidden` is true
+(resuming them on `visibilitychange`), or a document opened in a background tab is taken for a
+crash.
 
 ## Branding
 
