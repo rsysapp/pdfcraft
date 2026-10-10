@@ -28,16 +28,31 @@ pub enum JumpTarget {
     },
 }
 
-/// A non-negative JSON integer, saturated to `u32::MAX`: JavaScript integers reach 2^53, and one
-/// beyond `u32` is merely out of range for any document (the jump answers not found), not malformed.
+/// A non-negative whole JSON number, saturated to `u32::MAX`: any size is merely out of range for a
+/// document (the jump answers not found, the mark is skipped), not malformed. That includes digits
+/// beyond `u64` and the exponent form (`1e+21`) that `JSON.stringify` writes for integers from 1e21,
+/// so the value is read as a number, not as an integer type. Negatives, fractions and non-numbers
+/// stay errors; `3.0` is the whole number 3.
 fn saturating_u32<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
-    let value = <u64 as serde::Deserialize>::deserialize(deserializer)?;
-    Ok(u32::try_from(value).unwrap_or(u32::MAX))
+    let number = <serde_json::Number as serde::Deserialize>::deserialize(deserializer)?;
+    whole_number_saturated(&number).map_err(serde::de::Error::custom)
 }
 
 fn saturating_optional_u32<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<u32>, D::Error> {
-    let value = <Option<u64> as serde::Deserialize>::deserialize(deserializer)?;
-    Ok(value.map(|number| u32::try_from(number).unwrap_or(u32::MAX)))
+    let number = <Option<serde_json::Number> as serde::Deserialize>::deserialize(deserializer)?;
+    number.map(|number| whole_number_saturated(&number).map_err(serde::de::Error::custom)).transpose()
+}
+
+fn whole_number_saturated(number: &serde_json::Number) -> Result<u32, String> {
+    if let Some(unsigned) = number.as_u64() {
+        return Ok(u32::try_from(unsigned).unwrap_or(u32::MAX));
+    }
+    // Remaining: negative integers, and anything written with a fraction or exponent (or beyond u64).
+    match number.as_f64() {
+        // `as` saturates for floats, so values past u32 (and past u64) land on u32::MAX.
+        Some(float) if float.is_finite() && float.fract() == 0.0 && float >= 0.0 => Ok(float as u32),
+        _ => Err(format!("{number} is not a whole number of zero or more")),
+    }
 }
 
 /// A passage the host wants painted, validated.
@@ -297,6 +312,33 @@ mod tests {
         ] {
             assert!(parse_jump_target(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn any_whole_host_number_saturates_and_the_rest_is_refused() {
+        // Digits beyond u64 and exponent forms (what JSON.stringify writes from 1e21) saturate.
+        for huge in ["18446744073709551615", "18446744073709551616", "100000000000000000000", "1e+21", "1e300", "4294967296"] {
+            let target = parse_jump_target(&format!(r#"{{"kind":"page","page":{huge}}}"#)).unwrap_or_else(|e| panic!("{huge}: {e}"));
+            assert_eq!(target, JumpTarget::Page { page: u32::MAX }, "{huge}");
+            let text = format!(r#"{{"kind":"text","text":"x","page":{huge},"occurrence":{huge}}}"#);
+            assert_eq!(parse_jump_target(&text), Ok(JumpTarget::Text { text: "x".into(), page: Some(u32::MAX), occurrence: u32::MAX }), "{huge}");
+            let marks = format!(r##"[{{"id":"m","text":"x","page":{huge},"color":"#000000ff"}}]"##);
+            assert_eq!(parse_marks(&marks).expect("saturates")[0].page, Some(u32::MAX), "{huge}");
+        }
+        assert_eq!(parse_jump_target(r#"{"kind":"page","page":3.0}"#), Ok(JumpTarget::Page { page: 3 }));
+        assert_eq!(parse_jump_target(r#"{"kind":"page","page":4294967295}"#), Ok(JumpTarget::Page { page: u32::MAX }));
+        for bad in ["-1", "1.5", "-0.5", "\"2\"", "-1e300", "true"] {
+            assert!(parse_jump_target(&format!(r#"{{"kind":"page","page":{bad}}}"#)).is_err(), "{bad}");
+            let text = format!(r#"{{"kind":"text","text":"x","page":null,"occurrence":{bad}}}"#);
+            assert!(parse_jump_target(&text).is_err(), "occurrence {bad}");
+            let marks = format!(r##"[{{"id":"m","text":"x","page":{bad},"color":"#000000ff"}}]"##);
+            assert!(parse_marks(&marks).is_err(), "mark {bad}");
+        }
+        // An omitted page still means "no page".
+        assert_eq!(
+            parse_jump_target(r#"{"kind":"text","text":"x","occurrence":0}"#),
+            Ok(JumpTarget::Text { text: "x".into(), page: None, occurrence: 0 })
+        );
     }
 
     #[test]
