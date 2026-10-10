@@ -59,10 +59,18 @@ pub(crate) struct Embed {
     jump: Option<JumpTarget>,
     /// The page last reported (`pageChanged`), 0-based.
     last_page: Option<usize>,
-    /// The selection last settled, as (page, glyph range), blank ones included.
+    /// The selection last settled, as (page, glyph range), blank ones included: a person's (told to
+    /// the host or not) or one the editor made itself (`own_selection`). A selection that differs
+    /// from it is a person's new one.
     last_selection: Option<(usize, Range<usize>)>,
     /// Whether the host was last told of a selection (`selection`), not of none (`selectionCleared`).
     selection_reported: bool,
+    /// The settled selection is the editor's own (a found text jump's), never told to the host.
+    own_selection: bool,
+    /// A person pressed or dragged since the selection last settled, so it is told again when it
+    /// settles, even unchanged: the host hides its toolbar on input, and selecting the same passage
+    /// again must bring it back.
+    settle_again: bool,
     /// The host's marks as it sent them, and their texts folded for matching.
     marks: Vec<Mark>,
     needles: Vec<Vec<char>>,
@@ -88,7 +96,7 @@ impl Embed {
     /// Forget what belonged to the document that was open, marks included.
     fn document_closed(&mut self) {
         // The host's toolbar belongs to the closed document's selection; tell it before `opened`.
-        self.clear_reported_selection(None);
+        self.clear_selection_for_move(None);
         // A jump still waiting for text belonged to the closed document: answer it with its own
         // target, so the host is never left waiting and it is never run against the next document.
         if let Some(target) = self.jump.take() {
@@ -97,23 +105,37 @@ impl Embed {
         self.last_page = None;
         self.last_selection = None;
         self.selection_reported = false;
+        self.own_selection = false;
+        self.settle_again = false;
         self.set_marks(Vec::new());
     }
 
     /// When the editor itself moves the view or replaces the document, a selection the host was
     /// told of is cleared: the host's Comment/Copy toolbar sits at the reported coordinates, which
-    /// go stale. Says nothing when none was reported. `view` is the one showing the selection.
-    fn clear_reported_selection(&mut self, view: Option<&mut DocView>) {
-        if !self.selection_reported {
+    /// go stale. The editor's own selection (a jump's) goes too, without a word, since the host was
+    /// never told of it. Leaves any other selection alone. `view` is the one showing the selection.
+    fn clear_selection_for_move(&mut self, view: Option<&mut DocView>) {
+        if self.selection_reported {
+            self.bridge.emit(HostEvent::SelectionCleared);
+            self.selection_reported = false;
+        } else if !self.own_selection {
             return;
         }
-        self.bridge.emit(HostEvent::SelectionCleared);
-        self.selection_reported = false;
+        self.own_selection = false;
+        self.settle_again = false;
         // The view's own selection goes too, or the host and the view would disagree about it.
         self.last_selection = None;
         if let Some(view) = view {
             view.clear_selection();
         }
+    }
+
+    /// A found text jump selected its match: the editor's own selection, settled as it is so it is
+    /// never reported (a person's later change to it is).
+    fn note_own_selection(&mut self, view: &DocView) {
+        self.last_selection = view.selection_span();
+        self.own_selection = self.last_selection.is_some();
+        self.settle_again = false;
     }
 
     /// Replace every host mark; they are searched for again as text layers arrive. A mark that can
@@ -314,7 +336,7 @@ impl PdfCraftApp {
             JumpTarget::Page { page } => match (page_index(*page, pages), self.active.and_then(|i| self.views.get_mut(i))) {
                 (Some(p), Some(view)) => {
                     view.go_to_page(p);
-                    embed.clear_reported_selection(Some(view));
+                    embed.clear_selection_for_move(Some(view));
                     false
                 }
                 _ => true,
@@ -354,11 +376,21 @@ impl PdfCraftApp {
                 found.into_iter().flatten().map(move |r| (p, r))
             })
             .nth(wanted);
-        let found = hit.is_some_and(|(p, range)| jump_to_match(view, &doc.info, p, range));
-        // A jump that finds nothing leaves the view, and so a reported selection, where it was.
-        if found {
-            embed.clear_reported_selection(Some(view));
-        }
+        let found = hit.is_some_and(|(p, range)| {
+            if !jump_to_match(view, &doc.info, p, range.clone()) {
+                return false;
+            }
+            // The view moved: a selection the host was told of, or an earlier jump's, goes first.
+            embed.clear_selection_for_move(Some(view));
+            // The match is selected, so it shows as the find bar's current match does; the
+            // selection is the editor's own and never reported.
+            if let Some(last) = range.end.checked_sub(1).filter(|last| *last >= range.start) {
+                view.select_text(p, range.start, last);
+                embed.note_own_selection(view);
+            }
+            true
+        });
+        // A jump that finds nothing leaves the view, and so a selection, where it was.
         match embed.jump.take() {
             Some(target) if !found => embed.bridge.emit(HostEvent::JumpNotFound { target }),
             _ => {}
@@ -473,7 +505,7 @@ fn page_index(page: u32, pages: usize) -> Option<usize> {
     usize::try_from(page).ok()?.checked_sub(1).filter(|p| *p < pages)
 }
 
-/// Bring a match into view as the find bar does, and outline it briefly. `false` when the page's
+/// Bring a match into view as the find bar does, and outline it briefly (the caller selects it). `false` when the page's
 /// text or the match's lines are unexpectedly missing, so the host hears `jumpNotFound`.
 fn jump_to_match(view: &mut DocView, info: &DocInfo, page: usize, range: Range<usize>) -> bool {
     let Some(text) = view.texts.get(&page).cloned() else { return false };
@@ -496,7 +528,7 @@ fn collect_events(app: &mut PdfCraftApp, ctx: &egui::Context) {
     let Some(view) = app.active.and_then(|i| app.views.get_mut(i)) else { return };
     // The find bar or page buttons moved the view this frame (`moved_by_controls`).
     if std::mem::take(&mut view.moved_by_controls) {
-        embed.clear_reported_selection(Some(view));
+        embed.clear_selection_for_move(Some(view));
     }
     if embed.last_page != Some(view.current) {
         embed.last_page = Some(view.current);
@@ -504,7 +536,19 @@ fn collect_events(app: &mut PdfCraftApp, ctx: &egui::Context) {
     }
     // A selection settles when no button is down: drags report on release, keys at once.
     let now = view.selection_span();
-    if now == embed.last_selection || ctx.input(|i| i.pointer.any_down()) {
+    let (pressed, down) = ctx.input(|i| (i.pointer.any_pressed(), i.pointer.any_down()));
+    // A press after a reported selection is told again on release, even unchanged (the host hid its
+    // toolbar on the input). Only a reported one: the editor's own selection stays unreported
+    // through presses that leave it as it is (a page button, the pasteboard).
+    if pressed && embed.selection_reported {
+        embed.settle_again = true;
+    }
+    // A drag that changes the selection on its way is a person's, even when it ends on the
+    // selection settled before (a jump's match selected again by hand).
+    if down && now != embed.last_selection {
+        embed.settle_again = true;
+    }
+    if down || (now == embed.last_selection && !embed.settle_again) {
         return;
     }
     let reading = match &now {
@@ -528,6 +572,8 @@ fn collect_events(app: &mut PdfCraftApp, ctx: &egui::Context) {
         }
     }
     embed.last_selection = now;
+    embed.own_selection = false;
+    embed.settle_again = false;
 }
 
 /// A settled selection as the host would hear of it.

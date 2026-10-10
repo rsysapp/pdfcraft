@@ -17,15 +17,14 @@ fn two_lines() -> Vec<u8> {
     pages(&[&["The quick brown fox", "jumps over the dog"]])
 }
 
-#[test]
-fn a_dragged_selection_is_reported_once_the_button_is_released() {
-    let (mut h, bridge) = embedded();
-    open(&mut h, &bridge, "lines.pdf", two_lines());
-    // Glyphs: "The" 0–2, a space 3, "quick" 4–8.
-    let (a, b) = {
-        let view = &h.state().views[0];
-        (view.glyph_screen_pos(0, 4).expect("q on screen"), view.glyph_screen_pos(0, 8).expect("k on screen"))
-    };
+/// Where glyphs 4 ("q") and 8 ("k") of [`two_lines`]'s first line are: "The" 0–2, a space 3, "quick" 4–8.
+fn quick_ends(h: &Harness<'static, PdfCraftApp>) -> (egui::Pos2, egui::Pos2) {
+    let view = &h.state().views[0];
+    (view.glyph_screen_pos(0, 4).expect("q on screen"), view.glyph_screen_pos(0, 8).expect("k on screen"))
+}
+
+/// Press at `a`, drag to `b` and hold the button there; `release` lets it go.
+fn drag_and_hold(h: &mut Harness<'static, PdfCraftApp>, a: egui::Pos2, b: egui::Pos2) {
     h.hover_at(a);
     h.run_steps(1);
     h.event(Event::PointerButton { pos: a, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE });
@@ -34,9 +33,49 @@ fn a_dragged_selection_is_reported_once_the_button_is_released() {
         h.event(Event::PointerMoved(a + (b - a) * (k as f32 / 4.0)));
         h.run_steps(1);
     }
-    assert!(selections(&bridge.take_events()).is_empty(), "nothing while the button is down");
-    h.event(Event::PointerButton { pos: b, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
+}
+
+fn release(h: &mut Harness<'static, PdfCraftApp>, at: egui::Pos2) {
+    h.event(Event::PointerButton { pos: at, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
     h.run_steps(2);
+}
+
+/// Drag from `a` to `b` by hand and let go.
+fn drag(h: &mut Harness<'static, PdfCraftApp>, a: egui::Pos2, b: egui::Pos2) {
+    drag_and_hold(h, a, b);
+    release(h, b);
+}
+
+/// A click (press and release without moving) at `at`.
+fn click_at(h: &mut Harness<'static, PdfCraftApp>, at: egui::Pos2) {
+    h.hover_at(at);
+    h.run_steps(1);
+    h.event(Event::PointerButton { pos: at, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE });
+    h.run_steps(1);
+    release(h, at);
+}
+
+/// A point on the pasteboard beside the first page: no text, no control.
+fn pasteboard(h: &Harness<'static, PdfCraftApp>) -> egui::Pos2 {
+    let view = &h.state().views[0];
+    let page = view.page_screen_rect(0).expect("on screen");
+    let at = egui::pos2(page.max.x + 30.0, page.center().y);
+    assert!(view.viewport_rect().shrink(20.0).contains(at), "{at:?} lies in the document area {:?}", view.viewport_rect());
+    at
+}
+
+fn is_selection_of(events: &[HostEvent], want: &str) -> bool {
+    matches!(events, [HostEvent::Selection { text, .. }] if text == want)
+}
+
+#[test]
+fn a_dragged_selection_is_reported_once_the_button_is_released() {
+    let (mut h, bridge) = embedded();
+    open(&mut h, &bridge, "lines.pdf", two_lines());
+    let (a, b) = quick_ends(&h);
+    drag_and_hold(&mut h, a, b);
+    assert!(selections(&bridge.take_events()).is_empty(), "nothing while the button is down");
+    release(&mut h, b);
     let events = selections(&bridge.take_events());
     let [HostEvent::Selection { text, copy_text, page, x, y }] = events.as_slice() else { panic!("one selection event: {events:?}") };
     assert_eq!((text.as_str(), copy_text.as_str(), *page), ("quick", "quick", Some(1)));
@@ -44,6 +83,28 @@ fn a_dragged_selection_is_reported_once_the_button_is_released() {
     assert!(*x >= b.x && *y >= b.y && page_rect.expand(1.0).contains(egui::pos2(*x, *y)), "({x}, {y}) ends the selection");
     h.run_steps(3);
     assert!(selections(&bridge.take_events()).is_empty(), "reported once");
+}
+
+#[test]
+fn selecting_the_same_passage_again_is_reported_again() {
+    let (mut h, bridge) = embedded();
+    open(&mut h, &bridge, "lines.pdf", two_lines());
+    let (a, b) = quick_ends(&h);
+    drag(&mut h, a, b);
+    assert!(is_selection_of(&selections(&bridge.take_events()), "quick"));
+    // The host hid its toolbar on the press; the same passage selected again must bring it back.
+    drag(&mut h, a, b);
+    let events = selections(&bridge.take_events());
+    assert!(is_selection_of(&events, "quick"), "a second selection event for the same passage: {events:?}");
+    // Settled, it is not told again frame after frame.
+    h.run_steps(5);
+    assert!(selections(&bridge.take_events()).is_empty(), "once per settling");
+    // A press and release that leave it as it is (here, on the pasteboard) settle it again too.
+    let beside = pasteboard(&h);
+    click_at(&mut h, beside);
+    let events = selections(&bridge.take_events());
+    assert!(is_selection_of(&events, "quick"), "told again on release: {events:?}");
+    assert_eq!(h.state().views[0].selected_text().as_deref(), Some("quick"));
 }
 
 #[test]
@@ -147,7 +208,75 @@ fn text_target(text: &str, page: Option<u32>) -> JumpTarget {
 fn a_found_text_jump_clears_a_reported_selection_once() {
     let (mut h, bridge) = with_reported_selection();
     assert_eq!(selections_after_jump(&mut h, &bridge, text_target("thirty", None)), [HostEvent::SelectionCleared]);
-    assert!(h.state().views[0].selected_text().is_none(), "the view's selection goes with it");
+    // The view's selection is now the match, the editor's own, and is never reported.
+    assert_eq!(h.state().views[0].selected_text().as_deref(), Some("thirty"), "the reported selection made way for the match");
+}
+
+#[test]
+fn a_found_text_jump_selects_its_match_and_never_reports_it() {
+    let (mut h, bridge) = embedded();
+    open(&mut h, &bridge, "lines.pdf", two_lines());
+    // The match is selected, so it is highlighted as a selection is, and stays unreported.
+    assert!(selections_after_jump(&mut h, &bridge, text_target("QUICK", None)).is_empty());
+    assert_eq!(h.state().views[0].selected_text().as_deref(), Some("quick"));
+    // A press and release that leave it as it is do not make it a person's selection.
+    let beside = pasteboard(&h);
+    click_at(&mut h, beside);
+    h.run_steps(3);
+    assert!(selections(&bridge.take_events()).is_empty(), "the editor's own selection is never reported");
+    assert_eq!(h.state().views[0].selected_text().as_deref(), Some("quick"));
+    // Selecting the same passage by hand is a person's selection: it is reported.
+    let (a, b) = quick_ends(&h);
+    drag(&mut h, a, b);
+    let events = selections(&bridge.take_events());
+    assert!(is_selection_of(&events, "quick"), "the person's selection of the jump's match: {events:?}");
+}
+
+#[test]
+fn a_found_text_jump_replaces_a_jumps_selection_and_a_miss_keeps_it() {
+    let (mut h, bridge) = embedded();
+    open(&mut h, &bridge, "three.pdf", three_pages());
+    assert!(selections_after_jump(&mut h, &bridge, text_target("five days", None)).is_empty());
+    assert_eq!(h.state().views[0].selected_text().as_deref(), Some("five days"));
+    assert!(selections_after_jump(&mut h, &bridge, text_target("no such passage", None)).is_empty());
+    assert_eq!(h.state().views[0].selected_text().as_deref(), Some("five days"), "a jump that finds nothing leaves it");
+    assert!(selections_after_jump(&mut h, &bridge, text_target("thirty", Some(3))).is_empty());
+    assert_eq!(h.state().views[0].selected_text().as_deref(), Some("thirty"));
+}
+
+#[test]
+fn moving_the_view_clears_a_jumps_selection_without_a_word() {
+    // A page jump, a page button, a find step and an open each move the view.
+    let jumped = || {
+        let (mut h, bridge) = embedded();
+        open(&mut h, &bridge, "three.pdf", three_pages());
+        assert!(selections_after_jump(&mut h, &bridge, text_target("thirty", None)).is_empty());
+        assert_eq!(h.state().views[0].selected_text().as_deref(), Some("thirty"));
+        (h, bridge)
+    };
+    let (mut h, bridge) = jumped();
+    assert!(selections_after_jump(&mut h, &bridge, JumpTarget::Page { page: 1 }).is_empty());
+    assert!(h.state().views[0].selected_text().is_none(), "a page jump clears the match");
+
+    let (mut h, bridge) = jumped();
+    h.get_by_label("Previous page").click();
+    h.run_steps(5);
+    assert!(selections(&bridge.take_events()).is_empty());
+    assert!(h.state().views[0].selected_text().is_none(), "a page button clears the match");
+
+    let (mut h, bridge) = jumped();
+    search_goods(&mut h);
+    assert!(selections_after_jump(&mut h, &bridge, text_target("thirty", None)).is_empty());
+    assert_eq!(h.state().views[0].selected_text().as_deref(), Some("thirty"));
+    h.get_by_label("Next (⌘G)").click();
+    h.run_steps(5);
+    assert!(selections(&bridge.take_events()).is_empty());
+    assert!(h.state().views[0].selected_text().is_none(), "a find step clears the match");
+
+    let (mut h, bridge) = jumped();
+    let events = open(&mut h, &bridge, "other.pdf", three_pages());
+    assert_eq!(events, [HostEvent::Opened { pages: 3 }, HostEvent::PageChanged { page: 1 }]);
+    assert!(h.state().views[0].selected_text().is_none());
 }
 
 #[test]
@@ -156,23 +285,29 @@ fn a_found_page_jump_clears_a_reported_selection_once() {
     assert_eq!(selections_after_jump(&mut h, &bridge, JumpTarget::Page { page: 2 }), [HostEvent::SelectionCleared]);
 }
 
-#[test]
-fn a_find_step_clears_a_reported_selection_once() {
-    let (mut h, bridge) = embedded();
-    open(&mut h, &bridge, "three.pdf", three_pages());
+/// Search for "goods" in the find bar and wait until it found every match (three pages): the first
+/// match is the find bar's own move, not a step.
+fn search_goods(h: &mut Harness<'static, PdfCraftApp>) {
     h.state_mut().views[0].open_find();
     if let Some(find) = h.state_mut().views[0].find.as_mut() {
         find.query = "goods".into();
     }
-    // The search finishes over every page before the selection is made: the first match is the
-    // find bar's own move, not a step.
     for _ in 0..500 {
         h.run_steps(2);
         if h.state().views[0].find.as_ref().is_some_and(|f| f.matches.len() == 3) && !h.state().render_pending() {
-            break;
+            return;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
+    panic!("the find bar did not find the three matches");
+}
+
+#[test]
+fn a_find_step_clears_a_reported_selection_once() {
+    let (mut h, bridge) = embedded();
+    open(&mut h, &bridge, "three.pdf", three_pages());
+    // The search finishes over every page before the selection is made.
+    search_goods(&mut h);
     h.state_mut().views[0].select_text(0, 0, 10);
     h.run_steps(2);
     let events = selections(&bridge.take_events());

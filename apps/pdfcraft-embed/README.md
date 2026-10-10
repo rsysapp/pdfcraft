@@ -64,8 +64,15 @@ The command fails for a file that was not built by this repository's release wor
 - Text jumps and marks match with whitespace runs as one space, Unicode compatibility forms
   folded (NFKC), curly quotes and dashes straightened and case folded, within one page. A text
   jump waits until the pages it searches have their text; a newer jump replaces a waiting one.
-- `selection` is sent when a selection settles (button released, or a keyboard selection);
+- `selection` is sent each time a selection settles (button released, or a keyboard selection),
+  not on every frame, and again when it equals the one reported before: a press and release, or
+  the same passage selected again, settle it anew, since the host hides its toolbar on input.
   `x`, `y` are CSS pixels from the canvas's top-left at the end of its last line.
+- A found text jump selects its match, so it shows highlighted. That selection is the editor's
+  own and is never reported, not even after a press that leaves it as it is; selecting it again by
+  hand is a person's selection and is. The editor moving the view (a page jump, a later text jump,
+  its page buttons, a find step) or opening a document clears it without an event, and answers a
+  selection it had reported with `selectionCleared`. A jump that finds nothing leaves either.
 - Malformed arguments (`open` with anything but a `Uint8Array`, `jumpTo`, `setMarks`, `setTheme`,
   `mount` options) throw and change nothing.
 - `destroy` stops the runner; later calls do nothing. Dropping the object (`free()`) destroys it
