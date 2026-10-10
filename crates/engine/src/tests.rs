@@ -722,7 +722,8 @@ fn protection_is_validated_undoable_and_never_logged() {
 }
 
 /// A one-page form: a text field and a check box (with appearance states).
-fn form_fixture() -> Vec<u8> {
+// Embed build: shared with the inspector's tests.
+pub(crate) fn form_fixture() -> Vec<u8> {
     let objs = [
         "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [4 0 R 5 0 R] /DA (/Helv 0 Tf 0 g) /DR << /Font << /Helv 6 0 R >> >> >> >>",
         "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 300] >>",

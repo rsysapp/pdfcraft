@@ -23,6 +23,8 @@ pub mod ocr;
 pub mod optimizer;
 pub mod signature_image;
 pub mod xfa;
+// Embed build: the edited-against-base comparison a host's server runs on every save.
+pub mod inspect;
 // Embed build: view-only sessions.
 mod view_only;
 
