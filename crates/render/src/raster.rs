@@ -51,7 +51,8 @@ pub struct RenderConfig {
 }
 
 impl RenderConfig {
-    fn settings(&self) -> InterpreterSettings {
+    // Embed build: also used by `content` (the save inspector's reader).
+    pub(crate) fn settings(&self) -> InterpreterSettings {
         let standard = InterpreterSettings::default().font_resolver;
         InterpreterSettings {
             ocg_overrides: self.layers.clone(),

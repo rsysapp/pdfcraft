@@ -8,6 +8,8 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+// Embed build: hayro's side of the save inspector (pdfcraft-engine `inspect`).
+pub mod content;
 mod inspect;
 mod raster;
 pub mod text;
