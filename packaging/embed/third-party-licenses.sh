@@ -8,7 +8,11 @@
 #   - an accepted list in about.toml that differs from deny.toml's allowlist;
 #   - a crate whose notice still shows a placeholder ("<year>", "<copyright holders>"), unless
 #     about-placeholder-allowlist.txt names it;
-#   - a cargo-about other than the pinned one (cargo-about.env).
+#   - a cargo-about other than the pinned one (cargo-about.env);
+#   - a clarification in about.toml whose files cargo-about could not validate (a changed checksum
+#     is only a warning to cargo-about, which then falls back to a generic text);
+#   - a rustc other than the toolchain the release workflow pins (its standard library notices
+#     are part of the output).
 # Needs: cargo-about, jq, python3, and the rust toolchain the module is built with (its standard
 # library notices are part of the output).
 set -euo pipefail
@@ -24,6 +28,20 @@ CRATE="$ROOT/apps/pdfcraft-embed"
 for tool in jq python3 rustc; do
   command -v "$tool" >/dev/null || { echo "error: $tool not found" >&2; exit 1; }
 done
+# The standard library notices come from the toolchain that is running, and the release workflow
+# decides which toolchain builds the module: its `toolchain:` line is the one pin, so this reads
+# it from there rather than keeping a second copy. (RUSTUP_TOOLCHAIN=<version> selects it locally.)
+RELEASE_WORKFLOW="$ROOT/.github/workflows/embed-release.yml"
+PINNED_RUST="$(awk '$1 == "toolchain:" && $2 ~ /^[0-9]+\.[0-9]+\.[0-9]+$/ { print $2; exit }' "$RELEASE_WORKFLOW" 2>/dev/null)" || true
+if [ -z "$PINNED_RUST" ]; then
+  echo "error: no 'toolchain: <x.y.z>' line in ${RELEASE_WORKFLOW#"$ROOT"/}; that line is where this script reads the pinned Rust version" >&2
+  exit 1
+fi
+HAVE_RUST="$(rustc --version | awk '{ print $2 }')"
+if [ "$HAVE_RUST" != "$PINNED_RUST" ]; then
+  echo "error: rustc $HAVE_RUST is active; the module is built with $PINNED_RUST (toolchain: in ${RELEASE_WORKFLOW#"$ROOT"/}), and its standard library notices must come from that release. Use RUSTUP_TOOLCHAIN=$PINNED_RUST, or update the workflows' toolchain: lines together." >&2
+  exit 1
+fi
 HAVE_ABOUT="$(cargo about --version 2>/dev/null | awk '{ print $2 }')" || true
 if [ "$HAVE_ABOUT" != "$CARGO_ABOUT_VERSION" ]; then
   echo "error: cargo-about ${HAVE_ABOUT:-not found}; this needs $CARGO_ABOUT_VERSION (packaging/embed/install-cargo-about.sh, or cargo install cargo-about --locked --features cli --version $CARGO_ABOUT_VERSION)" >&2
@@ -44,14 +62,33 @@ trap 'rm -rf "$WORK"' EXIT
 
 # Only the embed crate's dependency closure for wasm32 (about.toml leaves out build scripts and
 # tests). --fail and the accepted list stop the run on a crate whose licence is unknown or not
-# accepted. A clarification whose checksum no longer matches is only a warning to cargo-about; the
-# placeholder check below catches the text it falls back to.
+# accepted. A clarification whose files no longer match its checksum is only a warning to
+# cargo-about, which then falls back to a generic text; the warnings are collected here and
+# checked below. The placeholder check further down is the second net.
+ABOUT_LOG="$WORK/cargo-about-stderr.txt"
 about_generate() {
+  local run_log="$WORK/cargo-about-run.txt" status=0
   cargo about generate --manifest-path "$CRATE/Cargo.toml" --config "$ROOT/about.toml" \
-    --target wasm32-unknown-unknown --locked --fail "$@"
+    --target wasm32-unknown-unknown --locked --fail "$@" 2>"$run_log" || status=$?
+  cat "$run_log" >&2
+  cat "$run_log" >>"$ABOUT_LOG"
+  return "$status"
 }
 about_generate "$HERE/about.hbs" --output-file "$WORK/crates.txt"
 about_generate --format json --output-file "$WORK/crates.json"
+
+# cargo-about colours its log lines when stderr is a terminal and starts each with a timestamp
+# (the two runs would otherwise list one warning twice); strip both before matching.
+UNVALIDATED="$(sed -E -e $'s/\033\\[[0-9;]*m//g' -e 's/^[0-9T:.Z-]+ //' "$ABOUT_LOG" | grep -E '(WARN|ERROR).*clarif' | LC_ALL=C sort -u)" || true
+if [ -n "$UNVALIDATED" ]; then
+  echo "error: cargo-about could not validate a clarification in about.toml (its files or checksum no longer match):" >&2
+  while IFS= read -r warning_line; do
+    crate_name="$(printf '%s\n' "$warning_line" | sed -nE "s/.*for crate '?([^ ':]+)'?[ :].*/\1/p")"
+    echo "  crate ${crate_name:-?}: ${warning_line#*] }" >&2
+  done <<<"$UNVALIDATED"
+  echo "Review the crate's licence file at its new version, then update that [<crate>.clarify] checksum in about.toml." >&2
+  exit 1
+fi
 if ! [ -s "$WORK/crates.txt" ] || ! grep -q '^  - egui ' "$WORK/crates.txt"; then
   echo "error: the licence notices are empty or lack the module's crates" >&2
   exit 1

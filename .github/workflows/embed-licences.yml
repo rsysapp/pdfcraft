@@ -1,0 +1,42 @@
+# The embed build's THIRD-PARTY-LICENSES.txt is generated at release time; this runs the same
+# generation (no build, no zip) so a licence problem shows before a release: an unaccepted
+# licence, a changed or unvalidated licence file, a notice with a placeholder, about.toml out of
+# step with deny.toml, a toolchain other than the release workflow's.
+#
+# A workflow of its own, not a job in ci.yml: the embed branch needs this check on its pushes, and
+# adding that branch to ci.yml would run the whole upstream CI there.
+name: Embed licences
+
+on:
+  push:
+    branches: [main, clauflow-embed]
+  pull_request:
+  workflow_dispatch:
+
+# Read-only, like the release workflow's build job.
+permissions:
+  contents: read
+
+concurrency:
+  group: embed-licences-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  embed-licences:
+    name: embed build licence notices
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # The release workflow's toolchain, so the standard library notices are the same ones.
+      # third-party-licenses.sh fails when the two differ.
+      - uses: dtolnay/rust-toolchain@1d64bbcee8ef0c191a54710c227fd268a0d5014b # 1.95.0
+        with:
+          toolchain: 1.95.0
+      - name: Install cargo-about
+        run: packaging/embed/install-cargo-about.sh
+      - name: Generate the licence notices
+        run: packaging/embed/third-party-licenses.sh "$RUNNER_TEMP/THIRD-PARTY-LICENSES.txt"
