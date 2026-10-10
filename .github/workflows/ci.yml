@@ -106,6 +106,25 @@ jobs:
         with:
           command: check
 
+  # The embed build's THIRD-PARTY-LICENSES.txt is generated at release time; this runs the same
+  # generation (no build, no zip) so a licence problem shows here: an unaccepted licence, a
+  # changed licence file, a notice with a placeholder, about.toml out of step with deny.toml.
+  embed-licences:
+    name: embed build licence notices
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # The release workflow's toolchain, so the standard library notices are the same ones.
+      - uses: dtolnay/rust-toolchain@1d64bbcee8ef0c191a54710c227fd268a0d5014b # 1.95.0
+        with:
+          toolchain: 1.95.0
+      - name: Install cargo-about
+        run: packaging/embed/install-cargo-about.sh
+      - name: Generate the licence notices
+        run: packaging/embed/third-party-licenses.sh "$RUNNER_TEMP/THIRD-PARTY-LICENSES.txt"
+
   fuzz:
     name: fuzz (mutation, 15 min)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'

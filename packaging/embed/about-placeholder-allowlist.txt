@@ -1,0 +1,8 @@
+# Crates allowed to show a licence text with no real holder line, one per line: crate name, then
+# the reason. third-party-licenses.sh fails on any other crate whose text is synthesised or still
+# holds a template placeholder ("<year>", "<copyright holders>", "<owner>"), so a new dependency
+# cannot reach the bundle with a placeholder unnoticed. Fix such a crate with a [crate.clarify]
+# section in about.toml first; list it here only when its package and upstream repository carry
+# no licence file that names a holder.
+flatbuffers  Apache-2.0 only: the repository's LICENSE is the unmodified standard text (no holder line); authors come from the crate metadata
+ryu-js       Apache-2.0 option: the package's LICENSE-APACHE is the unmodified standard text (no holder line); authors come from the crate metadata

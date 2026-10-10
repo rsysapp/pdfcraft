@@ -20,8 +20,493 @@ ignore-build-dependencies = true
 ignore-dev-dependencies = true
 targets = ["wasm32-unknown-unknown"]
 
+# cargo-about's own fix for chrono, whose LICENSE.txt holds the MIT and Apache-2.0 texts together.
+workarounds = ["chrono"]
+
 # egui's default UI fonts (Ubuntu-Light, Hack, emoji-icon-font, Noto Emoji): the crate is
 # MIT/Apache-2.0 code plus font licences, the same exception deny.toml makes. The font licence
 # texts the crate ships are also copied into licenses/ by package.sh.
 [epaint_default_fonts]
 accepted = ["OFL-1.1", "Ubuntu-font-1.0"]
+
+# Crates whose package has no licence file, or only a template or a combined one: the licence
+# file is clarified so its real copyright holder line is shown (checksums pin the exact text; a
+# release that changes it fails the package until this section is reviewed). 'git' files come
+# from the upstream repository at the commit each package was published from (.cargo_vcs_info.json);
+# the PdfCraft crates point at this workspace's LICENSE-MIT.
+# upstream licence files (checked out at the commit each package was published from)
+[egui.clarify]
+license = "MIT OR Apache-2.0"
+[[egui.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c"
+license = "MIT"
+
+[eframe.clarify]
+license = "MIT OR Apache-2.0"
+[[eframe.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c"
+license = "MIT"
+
+[ecolor.clarify]
+license = "MIT OR Apache-2.0"
+[[ecolor.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c"
+license = "MIT"
+
+[egui-wgpu.clarify]
+license = "MIT OR Apache-2.0"
+[[egui-wgpu.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c"
+license = "MIT"
+
+[egui_extras.clarify]
+license = "MIT OR Apache-2.0"
+[[egui_extras.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c"
+license = "MIT"
+
+[egui_glow.clarify]
+license = "MIT OR Apache-2.0"
+[[egui_glow.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c"
+license = "MIT"
+
+[emath.clarify]
+license = "MIT OR Apache-2.0"
+[[emath.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c"
+license = "MIT"
+
+[epaint.clarify]
+license = "MIT OR Apache-2.0"
+[[epaint.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c"
+license = "MIT"
+
+[accesskit.clarify]
+license = "(MIT OR Apache-2.0) AND BSD-3-Clause"
+[[accesskit.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+license = "MIT"
+[[accesskit.clarify.git]]
+path = "LICENSE.chromium"
+checksum = "845022e0c1db1abb41a6ba4cd3c4b674ec290f3359d9d3c78ae558d4c0ed9308"
+license = "BSD-3-Clause"
+
+[alloc-stdlib.clarify]
+license = "BSD-3-Clause"
+[[alloc-stdlib.clarify.git]]
+path = "LICENSE"
+checksum = "c0c56f26d9c051cac4d200c34c84e7ae9aaa853e01a982a1df08b09931e518ae"
+license = "BSD-3-Clause"
+
+[boa_ast.clarify]
+license = "Unlicense OR MIT"
+[[boa_ast.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "60d7cf4b66cef6bab24701e25f87829c4ce01fb734def53c41e5ed79ab434cb3"
+license = "MIT"
+
+[boa_engine.clarify]
+license = "Unlicense OR MIT"
+[[boa_engine.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "60d7cf4b66cef6bab24701e25f87829c4ce01fb734def53c41e5ed79ab434cb3"
+license = "MIT"
+
+[boa_gc.clarify]
+license = "Unlicense OR MIT"
+[[boa_gc.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "60d7cf4b66cef6bab24701e25f87829c4ce01fb734def53c41e5ed79ab434cb3"
+license = "MIT"
+
+[boa_interner.clarify]
+license = "Unlicense OR MIT"
+[[boa_interner.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "60d7cf4b66cef6bab24701e25f87829c4ce01fb734def53c41e5ed79ab434cb3"
+license = "MIT"
+
+[boa_macros.clarify]
+license = "Unlicense OR MIT"
+[[boa_macros.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "60d7cf4b66cef6bab24701e25f87829c4ce01fb734def53c41e5ed79ab434cb3"
+license = "MIT"
+
+[boa_parser.clarify]
+license = "Unlicense OR MIT"
+[[boa_parser.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "60d7cf4b66cef6bab24701e25f87829c4ce01fb734def53c41e5ed79ab434cb3"
+license = "MIT"
+
+[boa_string.clarify]
+license = "Unlicense OR MIT"
+[[boa_string.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "60d7cf4b66cef6bab24701e25f87829c4ce01fb734def53c41e5ed79ab434cb3"
+license = "MIT"
+
+[small_btree.clarify]
+license = "Unlicense OR MIT"
+[[small_btree.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "60d7cf4b66cef6bab24701e25f87829c4ce01fb734def53c41e5ed79ab434cb3"
+license = "MIT"
+
+[tag_ptr.clarify]
+license = "Unlicense OR MIT"
+[[tag_ptr.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "60d7cf4b66cef6bab24701e25f87829c4ce01fb734def53c41e5ed79ab434cb3"
+license = "MIT"
+
+[ocrs.clarify]
+license = "MIT OR Apache-2.0"
+[[ocrs.clarify.git]]
+path = "LICENSE-MIT.txt"
+checksum = "96b5371602fbd3cb11a680dade714465520c72b02397be5095a3c29b1a3fb30a"
+license = "MIT"
+
+[rten.clarify]
+license = "MIT OR Apache-2.0"
+[[rten.clarify.git]]
+path = "LICENSE-MIT.txt"
+checksum = "5096967f408fab8da02f4b6dfac6b00ccc19ca17c635f9009ee74594ac275e18"
+license = "MIT"
+
+[rten-base.clarify]
+license = "MIT OR Apache-2.0"
+[[rten-base.clarify.git]]
+path = "LICENSE-MIT.txt"
+checksum = "5096967f408fab8da02f4b6dfac6b00ccc19ca17c635f9009ee74594ac275e18"
+license = "MIT"
+
+[rten-gemm.clarify]
+license = "MIT OR Apache-2.0"
+[[rten-gemm.clarify.git]]
+path = "LICENSE-MIT.txt"
+checksum = "5096967f408fab8da02f4b6dfac6b00ccc19ca17c635f9009ee74594ac275e18"
+license = "MIT"
+
+[rten-imageproc.clarify]
+license = "MIT OR Apache-2.0"
+[[rten-imageproc.clarify.git]]
+path = "LICENSE-MIT.txt"
+checksum = "5096967f408fab8da02f4b6dfac6b00ccc19ca17c635f9009ee74594ac275e18"
+license = "MIT"
+
+[rten-model-file.clarify]
+license = "MIT OR Apache-2.0"
+[[rten-model-file.clarify.git]]
+path = "LICENSE-MIT.txt"
+checksum = "5096967f408fab8da02f4b6dfac6b00ccc19ca17c635f9009ee74594ac275e18"
+license = "MIT"
+
+[rten-parallel.clarify]
+license = "MIT OR Apache-2.0"
+[[rten-parallel.clarify.git]]
+path = "LICENSE-MIT.txt"
+checksum = "5096967f408fab8da02f4b6dfac6b00ccc19ca17c635f9009ee74594ac275e18"
+license = "MIT"
+
+[rten-shape-inference.clarify]
+license = "MIT OR Apache-2.0"
+[[rten-shape-inference.clarify.git]]
+path = "LICENSE-MIT.txt"
+checksum = "5096967f408fab8da02f4b6dfac6b00ccc19ca17c635f9009ee74594ac275e18"
+license = "MIT"
+
+[rten-simd.clarify]
+license = "MIT OR Apache-2.0"
+[[rten-simd.clarify.git]]
+path = "LICENSE-MIT.txt"
+checksum = "5096967f408fab8da02f4b6dfac6b00ccc19ca17c635f9009ee74594ac275e18"
+license = "MIT"
+
+[rten-tensor.clarify]
+license = "MIT OR Apache-2.0"
+[[rten-tensor.clarify.git]]
+path = "LICENSE-MIT.txt"
+checksum = "5096967f408fab8da02f4b6dfac6b00ccc19ca17c635f9009ee74594ac275e18"
+license = "MIT"
+
+[rten-vecmath.clarify]
+license = "MIT OR Apache-2.0"
+[[rten-vecmath.clarify.git]]
+path = "LICENSE-MIT.txt"
+checksum = "5096967f408fab8da02f4b6dfac6b00ccc19ca17c635f9009ee74594ac275e18"
+license = "MIT"
+
+[profiling.clarify]
+license = "MIT OR Apache-2.0"
+[[profiling.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "c8167fdeeed46d3f244d3f85c5bf998ce889343691c32be2c61a8bc4b5c08333"
+license = "MIT"
+
+[pdfcraft-a11y.clarify]
+license = "MIT OR Apache-2.0"
+[[pdfcraft-a11y.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "cd7032ea33b71427f188e34ffb4aee9d6868a57fd196037c5c8b2be03a2a0352"
+license = "MIT"
+
+[pdfcraft-annot.clarify]
+license = "MIT OR Apache-2.0"
+[[pdfcraft-annot.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "cd7032ea33b71427f188e34ffb4aee9d6868a57fd196037c5c8b2be03a2a0352"
+license = "MIT"
+
+[pdfcraft-compare.clarify]
+license = "MIT OR Apache-2.0"
+[[pdfcraft-compare.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "cd7032ea33b71427f188e34ffb4aee9d6868a57fd196037c5c8b2be03a2a0352"
+license = "MIT"
+
+[pdfcraft-content.clarify]
+license = "MIT OR Apache-2.0"
+[[pdfcraft-content.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "cd7032ea33b71427f188e34ffb4aee9d6868a57fd196037c5c8b2be03a2a0352"
+license = "MIT"
+
+[pdfcraft-cos.clarify]
+license = "MIT OR Apache-2.0"
+[[pdfcraft-cos.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "cd7032ea33b71427f188e34ffb4aee9d6868a57fd196037c5c8b2be03a2a0352"
+license = "MIT"
+
+[pdfcraft-create.clarify]
+license = "MIT OR Apache-2.0"
+[[pdfcraft-create.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "cd7032ea33b71427f188e34ffb4aee9d6868a57fd196037c5c8b2be03a2a0352"
+license = "MIT"
+
+[pdfcraft-crypt.clarify]
+license = "MIT OR Apache-2.0"
+[[pdfcraft-crypt.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "cd7032ea33b71427f188e34ffb4aee9d6868a57fd196037c5c8b2be03a2a0352"
+license = "MIT"
+
+[pdfcraft-edit.clarify]
+license = "MIT OR Apache-2.0"
+[[pdfcraft-edit.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "cd7032ea33b71427f188e34ffb4aee9d6868a57fd196037c5c8b2be03a2a0352"
+license = "MIT"
+
+[pdfcraft-embed.clarify]
+license = "MIT OR Apache-2.0"
+[[pdfcraft-embed.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "cd7032ea33b71427f188e34ffb4aee9d6868a57fd196037c5c8b2be03a2a0352"
+license = "MIT"
+
+[pdfcraft-engine.clarify]
+license = "MIT OR Apache-2.0"
+[[pdfcraft-engine.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "cd7032ea33b71427f188e34ffb4aee9d6868a57fd196037c5c8b2be03a2a0352"
+license = "MIT"
+
+[pdfcraft-export.clarify]
+license = "MIT OR Apache-2.0"
+[[pdfcraft-export.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "cd7032ea33b71427f188e34ffb4aee9d6868a57fd196037c5c8b2be03a2a0352"
+license = "MIT"
+
+[pdfcraft-filters.clarify]
+license = "MIT OR Apache-2.0"
+[[pdfcraft-filters.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "cd7032ea33b71427f188e34ffb4aee9d6868a57fd196037c5c8b2be03a2a0352"
+license = "MIT"
+
+[pdfcraft-fonts.clarify]
+license = "MIT OR Apache-2.0"
+[[pdfcraft-fonts.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "cd7032ea33b71427f188e34ffb4aee9d6868a57fd196037c5c8b2be03a2a0352"
+license = "MIT"
+
+[pdfcraft-forms.clarify]
+license = "MIT OR Apache-2.0"
+[[pdfcraft-forms.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "cd7032ea33b71427f188e34ffb4aee9d6868a57fd196037c5c8b2be03a2a0352"
+license = "MIT"
+
+[pdfcraft-js.clarify]
+license = "MIT OR Apache-2.0"
+[[pdfcraft-js.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "cd7032ea33b71427f188e34ffb4aee9d6868a57fd196037c5c8b2be03a2a0352"
+license = "MIT"
+
+[pdfcraft-measure.clarify]
+license = "MIT OR Apache-2.0"
+[[pdfcraft-measure.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "cd7032ea33b71427f188e34ffb4aee9d6868a57fd196037c5c8b2be03a2a0352"
+license = "MIT"
+
+[pdfcraft-model.clarify]
+license = "MIT OR Apache-2.0"
+[[pdfcraft-model.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "cd7032ea33b71427f188e34ffb4aee9d6868a57fd196037c5c8b2be03a2a0352"
+license = "MIT"
+
+[pdfcraft-ocr.clarify]
+license = "MIT OR Apache-2.0"
+[[pdfcraft-ocr.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "cd7032ea33b71427f188e34ffb4aee9d6868a57fd196037c5c8b2be03a2a0352"
+license = "MIT"
+
+[pdfcraft-optimize.clarify]
+license = "MIT OR Apache-2.0"
+[[pdfcraft-optimize.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "cd7032ea33b71427f188e34ffb4aee9d6868a57fd196037c5c8b2be03a2a0352"
+license = "MIT"
+
+[pdfcraft-organize.clarify]
+license = "MIT OR Apache-2.0"
+[[pdfcraft-organize.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "cd7032ea33b71427f188e34ffb4aee9d6868a57fd196037c5c8b2be03a2a0352"
+license = "MIT"
+
+[pdfcraft-platform.clarify]
+license = "MIT OR Apache-2.0"
+[[pdfcraft-platform.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "cd7032ea33b71427f188e34ffb4aee9d6868a57fd196037c5c8b2be03a2a0352"
+license = "MIT"
+
+[pdfcraft-preflight.clarify]
+license = "MIT OR Apache-2.0"
+[[pdfcraft-preflight.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "cd7032ea33b71427f188e34ffb4aee9d6868a57fd196037c5c8b2be03a2a0352"
+license = "MIT"
+
+[pdfcraft-print.clarify]
+license = "MIT OR Apache-2.0"
+[[pdfcraft-print.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "cd7032ea33b71427f188e34ffb4aee9d6868a57fd196037c5c8b2be03a2a0352"
+license = "MIT"
+
+[pdfcraft-redact.clarify]
+license = "MIT OR Apache-2.0"
+[[pdfcraft-redact.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "cd7032ea33b71427f188e34ffb4aee9d6868a57fd196037c5c8b2be03a2a0352"
+license = "MIT"
+
+[pdfcraft-render.clarify]
+license = "MIT OR Apache-2.0"
+[[pdfcraft-render.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "cd7032ea33b71427f188e34ffb4aee9d6868a57fd196037c5c8b2be03a2a0352"
+license = "MIT"
+
+[pdfcraft-sign.clarify]
+license = "MIT OR Apache-2.0"
+[[pdfcraft-sign.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "cd7032ea33b71427f188e34ffb4aee9d6868a57fd196037c5c8b2be03a2a0352"
+license = "MIT"
+
+[pdfcraft-ui-egui.clarify]
+license = "MIT OR Apache-2.0"
+[[pdfcraft-ui-egui.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "cd7032ea33b71427f188e34ffb4aee9d6868a57fd196037c5c8b2be03a2a0352"
+license = "MIT"
+
+[pdfcraft-xfa.clarify]
+license = "MIT OR Apache-2.0"
+[[pdfcraft-xfa.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "cd7032ea33b71427f188e34ffb4aee9d6868a57fd196037c5c8b2be03a2a0352"
+license = "MIT"
+
+[pdfcraft-xfdf.clarify]
+license = "MIT OR Apache-2.0"
+[[pdfcraft-xfdf.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "cd7032ea33b71427f188e34ffb4aee9d6868a57fd196037c5c8b2be03a2a0352"
+license = "MIT"
+
+
+# licence files inside the published package
+[type-map.clarify]
+license = "MIT OR Apache-2.0"
+[[type-map.clarify.files]]
+path = "LICENSE-MIT"
+checksum = "b47fb719a40d9ef9c8e3be525c41ce129c46d613cfc96a91bddd7c19dcebf7a1"
+license = "MIT"
+
+[brotli-decompressor.clarify]
+license = "BSD-3-Clause"
+[[brotli-decompressor.clarify.files]]
+path = "LICENSE"
+checksum = "c0c56f26d9c051cac4d200c34c84e7ae9aaa853e01a982a1df08b09931e518ae"
+license = "BSD-3-Clause"
+
+[libm.clarify]
+license = "MIT"
+[[libm.clarify.files]]
+path = "LICENSE.txt"
+checksum = "3823dda7cf046602f4b4e77ec8e227863dc4736037cc85bb33d9f19febe16bb7"
+license = "MIT"
+
+[enum-map.clarify]
+license = "MIT OR Apache-2.0"
+[[enum-map.clarify.files]]
+path = "src/lib.rs"
+checksum = "2af6f255759d0b6f2bec90785bb0186a526ecd8277fb789ab5fa8f10e7c24afe"
+license = "MIT"
+start = "SPDX-FileCopyrightText: 2017 - 2023 Kamila"
+end = "Mateusz Kowalczyk <fuuzetsu@fuuzetsu.co.uk>"
+[[enum-map.clarify.files]]
+path = "LICENSES/MIT.txt"
+checksum = "fd80a26fbb3f644af1fa994134446702932968519797227e07a1368dea80f0bc"
+license = "MIT"
+start = "Permission is hereby granted"
+
+[enum-map-derive.clarify]
+license = "MIT OR Apache-2.0"
+[[enum-map-derive.clarify.files]]
+path = "src/lib.rs"
+checksum = "c807cc3459950217900cf90fa90aec43f4d2bdf4116ce09f1b2febf94f334d12"
+license = "MIT"
+start = "SPDX-FileCopyrightText: 2017 - 2022 Kamila"
+end = "Dietrich <dietrich@teilgedanken.de>"
+[[enum-map-derive.clarify.files]]
+path = "LICENSES/MIT.txt"
+checksum = "fd80a26fbb3f644af1fa994134446702932968519797227e07a1368dea80f0bc"
+license = "MIT"
+start = "Permission is hereby granted"
+
