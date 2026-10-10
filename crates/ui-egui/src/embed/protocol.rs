@@ -317,7 +317,7 @@ mod tests {
     #[test]
     fn any_whole_host_number_saturates_and_the_rest_is_refused() {
         // Digits beyond u64 and exponent forms (what JSON.stringify writes from 1e21) saturate.
-        for huge in ["18446744073709551615", "18446744073709551616", "100000000000000000000", "1e+21", "1e300", "4294967296"] {
+        for huge in ["18446744073709551615", "18446744073709551616", "100000000000000000000", "1e+21", "1e300", "4294967296", "1.5e10"] {
             let target = parse_jump_target(&format!(r#"{{"kind":"page","page":{huge}}}"#)).unwrap_or_else(|e| panic!("{huge}: {e}"));
             assert_eq!(target, JumpTarget::Page { page: u32::MAX }, "{huge}");
             let text = format!(r#"{{"kind":"text","text":"x","page":{huge},"occurrence":{huge}}}"#);
