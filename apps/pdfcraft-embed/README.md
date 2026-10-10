@@ -93,9 +93,12 @@ The command fails for a file that was not built by this repository's release wor
   document: the jump answers `jumpNotFound`, the mark is skipped. Negative or fractional numbers
   throw.
 - `open` takes files of at most 100 MiB (`MAX_OPEN_BYTES`). A larger one is answered, in order,
-  `openFailed` ("This file is too large to be shown here.") and replaces the open document like a
-  broken file does; its bytes are never copied into the module. After `destroy`, `open` copies
-  nothing.
+  `openFailed` ("This file is too large or complex to be shown here.", as the Word editor says) and
+  changes nothing else: the open document, its marks and any waiting jump stay. Its bytes are never
+  copied into the module. An empty array, which is how a detached or transferred buffer reads, is
+  answered `openFailed` as a broken file. After `destroy`, `open` copies nothing.
+- `open` requires a `Uint8Array` from the host page's own realm (not from another frame or window):
+  anything else throws a `TypeError`, as does an array whose buffer cannot be read.
 - A text jump or mark without a page loads every page's text layer, so its cost grows with the
   page count; a page-scoped one loads that page alone. Matching costs O(page text × passage) per
   page searched, on the frame.

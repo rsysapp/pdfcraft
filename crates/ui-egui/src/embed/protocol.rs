@@ -14,19 +14,25 @@ pub const MAX_MARKS: usize = 2_000;
 /// that memory never shrinks.
 pub const MAX_OPEN_BYTES: usize = 100 << 20;
 
-/// What `open` answers for a file over [`MAX_OPEN_BYTES`].
-pub const OPEN_TOO_LARGE: &str = "This file is too large to be shown here.";
+/// What `open` answers for a file over [`MAX_OPEN_BYTES`] (the same words as the Word editor's).
+pub const OPEN_TOO_LARGE: &str = "This file is too large or complex to be shown here.";
 
 /// Whether a file of `len` bytes is refused before anything reads it.
 pub fn open_too_large(len: usize) -> bool {
     len > MAX_OPEN_BYTES
 }
 
-/// The command for a host's `open` of a file of `len` bytes. `copy` brings the bytes over and is
-/// called only for a file `open` takes, so a refused file is never copied; the refusal still goes
-/// through the queue, so every open is answered once, in the order the host made them.
-pub fn open_command(name: String, len: usize, copy: impl FnOnce() -> Vec<u8>) -> HostCommand {
-    if open_too_large(len) { HostCommand::OpenTooLarge { len } } else { HostCommand::Open { name, bytes: copy() } }
+/// The command for a host's `open` of a file of `len` bytes. The size is checked first, so an
+/// oversized file is always "too large". `copy` brings the bytes over and is called only for a file
+/// `open` takes that has bytes: a refused or empty one is never read (an empty one is answered
+/// `openFailed` as a broken file). The refusal still goes through the queue, so every open is
+/// answered once, in the order the host made them. An `Err` from `copy` queues nothing.
+pub fn open_command<E>(name: String, len: usize, copy: impl FnOnce() -> Result<Vec<u8>, E>) -> Result<HostCommand, E> {
+    if open_too_large(len) {
+        return Ok(HostCommand::OpenTooLarge { len });
+    }
+    let bytes = if len == 0 { Vec::new() } else { copy()? };
+    Ok(HostCommand::Open { name, bytes })
 }
 
 /// Where a host jump goes.

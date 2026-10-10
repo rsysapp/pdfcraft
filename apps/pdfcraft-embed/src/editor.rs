@@ -32,17 +32,18 @@ impl EmbeddedEditor {
         &self,
         #[wasm_bindgen(unchecked_param_type = "Uint8Array")] bytes: JsValue,
         #[wasm_bindgen(js_name = "fileName")] file_name: String,
-    ) -> Result<(), JsError> {
+    ) -> Result<(), JsValue> {
         // Taken as a handle, not `Vec<u8>`: wasm-bindgen would copy the whole array into wasm memory
         // before this body runs, after `destroy` and beyond the size cap alike. A failed allocation
         // aborts the module.
-        let bytes = bytes.dyn_into::<js_sys::Uint8Array>().map_err(|_| JsError::new("open: bytes must be a Uint8Array"))?;
+        let bytes = bytes.dyn_into::<js_sys::Uint8Array>().map_err(|_| type_error("open: bytes must be a Uint8Array"))?;
         if self.destroyed.get() {
             return Ok(());
         }
-        let len = usize::try_from(bytes.length()).unwrap_or(usize::MAX);
-        // Copied once, only when the size is taken, then moved into the queue.
-        self.send(embed::open_command(file_name, len, || bytes.to_vec()));
+        let len = byte_length(&bytes)?;
+        // Copied once, only for a file `open` takes, then moved into the queue. An empty array (a
+        // detached or transferred buffer reads as one) is never touched; it is answered `openFailed`.
+        self.send(embed::open_command(file_name, len, || copy_bytes(&bytes, len))?);
         Ok(())
     }
 
@@ -57,11 +58,7 @@ impl EmbeddedEditor {
     /// Replaces every host mark. An empty array clears them.
     #[wasm_bindgen(js_name = setMarks)]
     pub fn set_marks(&self, #[wasm_bindgen(unchecked_param_type = "Mark[]")] marks: JsValue) -> Result<(), JsError> {
-        if js_sys::Array::is_array(&marks) {
-            for mark in marks.unchecked_ref::<js_sys::Array>().iter() {
-                check_counts(&mark, &["page"], "setMarks")?;
-            }
-        }
+        check_mark_pages(&marks)?;
         let marks = embed::parse_marks(&json_of(&marks)?).map_err(|e| JsError::new(&e))?;
         self.send(HostCommand::SetMarks(marks));
         Ok(())
@@ -179,6 +176,67 @@ async fn start(canvas: web_sys::HtmlCanvasElement, options: JsValue) -> Result<E
         return Err(error);
     }
     Ok(EmbeddedEditor { runner, bridge, listener, destroyed: Cell::new(false) })
+}
+
+#[wasm_bindgen]
+extern "C" {
+    /// `Uint8Array.prototype.set.call(target, source)`: `target.set(source)` on a view of wasm memory.
+    /// js-sys's own `copy_to`/`to_vec` call this without `catch`; this one returns what it throws.
+    #[wasm_bindgen(catch, js_namespace = Uint8Array, js_name = "prototype.set.call")]
+    fn set_into(target: &mut [u8], source: &js_sys::Uint8Array) -> Result<(), JsValue>;
+}
+
+/// The array's `length`, read once. Through `Reflect::get`, so a subclass's throwing getter is an
+/// error here.
+fn byte_length(bytes: &js_sys::Uint8Array) -> Result<usize, JsValue> {
+    let length = js_sys::Reflect::get(bytes, &JsValue::from_str("length")).map_err(|_| type_error("open: the length of bytes could not be read"))?;
+    match length.as_f64() {
+        // A float-to-integer `as` saturates, and anything past the size cap is refused uncopied.
+        Some(length) if length.is_finite() && length.fract() == 0.0 && length >= 0.0 => Ok(length as usize),
+        _ => Err(type_error("open: bytes has no usable length")),
+    }
+}
+
+/// `len` bytes of `bytes`, copied into a buffer of exactly that size.
+///
+/// Every JavaScript call that could throw here is a `catch` import. An exception thrown through a
+/// non-`catch` import unwinds past this method's Rust frames without running their cleanup (there is
+/// no unwinding on wasm32), and that cleanup includes releasing the borrow of `self` that
+/// wasm-bindgen takes for the call: `free()` would then throw "attempted to take ownership ... while
+/// borrowed" and garbage collection would never run `Drop`. js-sys's `to_vec` is such a call: `set`
+/// throws for a detached or transferred buffer, and its `copy_to` asserts (an abort) if `length`
+/// changes between its two reads. Here `length` is read once, the copy throws into an `Err`, and a
+/// source longer than the view (a length that changed since) is refused by `set` with a RangeError,
+/// also an `Err`. A shorter one leaves the rest zeroed.
+fn copy_bytes(bytes: &js_sys::Uint8Array, len: usize) -> Result<Vec<u8>, JsValue> {
+    let mut copy = vec![0; len];
+    set_into(&mut copy, bytes).map_err(|_| type_error("open: bytes could not be read (a detached or changed buffer)"))?;
+    Ok(copy)
+}
+
+/// [`check_counts`] for each mark's page. Every read goes through `Reflect::get`, so a throwing
+/// getter or a revoked Proxy is an error here, not an exception thrown through Rust (see
+/// [`copy_bytes`]). Only the first `MAX_MARKS` marks are read, the ones `parse_marks` keeps, so a wild
+/// `length` costs nothing. A value without a usable `length` is left to the parser, which refuses
+/// anything but an array.
+fn check_mark_pages(marks: &JsValue) -> Result<(), JsError> {
+    if !marks.is_object() {
+        return Ok(());
+    }
+    let length = js_sys::Reflect::get(marks, &JsValue::from_str("length")).map_err(|_| JsError::new("setMarks: length could not be read"))?;
+    let Some(length) = length.as_f64().filter(|length| length.is_finite() && *length >= 0.0) else { return Ok(()) };
+    // A float-to-integer `as` saturates; the bound is far below u32::MAX.
+    let count = length.min(embed::MAX_MARKS as f64) as u32;
+    for index in 0..count {
+        let mark = js_sys::Reflect::get_u32(marks, index).map_err(|_| JsError::new(&format!("setMarks: mark {index} could not be read")))?;
+        check_counts(&mark, &["page"], "setMarks")?;
+    }
+    Ok(())
+}
+
+/// What a malformed `open` throws.
+fn type_error(message: &str) -> JsValue {
+    js_sys::TypeError::new(message).into()
 }
 
 /// A JavaScript value as JSON, for the bridge's parsers.

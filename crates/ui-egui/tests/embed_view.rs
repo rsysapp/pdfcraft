@@ -47,30 +47,58 @@ fn an_open_over_the_size_cap_never_copies_its_bytes() {
         let mut copied = false;
         let command = open_command("big.pdf".into(), len, || {
             copied = true;
-            Vec::new()
+            Ok::<_, ()>(Vec::new())
         });
-        assert_eq!(command, HostCommand::OpenTooLarge { len });
+        assert_eq!(command, Ok(HostCommand::OpenTooLarge { len }));
         assert!(!copied, "{len} bytes are refused before the copy");
     }
-    let at_cap = open_command("cap.pdf".into(), MAX_OPEN_BYTES, || b"%PDF-".to_vec());
-    assert_eq!(at_cap, HostCommand::Open { name: "cap.pdf".into(), bytes: b"%PDF-".to_vec() });
+    let at_cap = open_command("cap.pdf".into(), MAX_OPEN_BYTES, || Ok::<_, ()>(b"%PDF-".to_vec()));
+    assert_eq!(at_cap, Ok(HostCommand::Open { name: "cap.pdf".into(), bytes: b"%PDF-".to_vec() }));
 }
 
 #[test]
-fn an_open_over_the_size_cap_is_answered_in_order_and_replaces_the_document() {
+fn an_empty_open_is_never_read_and_a_failed_copy_queues_nothing() {
+    // A detached or transferred buffer has length 0; reading it would throw.
+    let empty = open_command("gone.pdf".into(), 0, || -> Result<Vec<u8>, &str> { panic!("an empty file is never read") });
+    assert_eq!(empty, Ok(HostCommand::Open { name: "gone.pdf".into(), bytes: Vec::new() }));
+    assert_eq!(open_command("a.pdf".into(), 5, || Err("detached")), Err("detached"));
+}
+
+#[test]
+fn an_empty_open_is_answered_open_failed() {
+    let (mut h, bridge) = embedded();
+    let events = open(&mut h, &bridge, "gone.pdf", Vec::new());
+    assert!(matches!(events.as_slice(), [HostEvent::OpenFailed { message }] if message.starts_with("This file can't be shown")), "{events:?}");
+}
+
+#[test]
+fn an_open_over_the_size_cap_is_answered_in_order_and_changes_nothing_else() {
     let (mut h, bridge) = embedded();
     open(&mut h, &bridge, "three.pdf", three_pages());
-    let jump = JumpTarget::Text { text: "nowhere in the document".into(), page: None, occurrence: 0 };
-    bridge.send(HostCommand::JumpTo(jump.clone()));
-    bridge.send(open_command("huge.pdf".into(), MAX_OPEN_BYTES + 1, Vec::new));
-    bridge.send(HostCommand::Open { name: "a.pdf".into(), bytes: pages(&[&["Alpha"]]) });
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 2 }));
+    h.run_steps(3);
+    bridge.take_events();
+    let too_large = HostEvent::OpenFailed { message: OPEN_TOO_LARGE.into() };
+    assert_eq!(OPEN_TOO_LARGE, "This file is too large or complex to be shown here.", "the Word editor's words");
+
+    let refused = open_command("huge.pdf".into(), MAX_OPEN_BYTES + 1, || Ok::<_, ()>(Vec::new())).expect("never copies");
+    bridge.send(refused.clone());
     // A native caller that sends the bytes anyway hears the same answer.
     bridge.send(HostCommand::Open { name: "huge.pdf".into(), bytes: vec![0; MAX_OPEN_BYTES + 1] });
     h.run_steps(3);
     settle(&mut h);
-    let too_large = HostEvent::OpenFailed { message: OPEN_TOO_LARGE.into() };
-    assert_eq!(bridge.take_events(), [HostEvent::JumpNotFound { target: jump }, too_large.clone(), HostEvent::Opened { pages: 1 }, too_large]);
-    assert!(h.state().views.is_empty(), "a refused open replaces the document, as a broken file does");
+    assert_eq!(bridge.take_events(), [too_large.clone(), too_large.clone()], "only the answers");
+    assert_eq!(h.state().views.len(), 1, "the open document stays");
+    assert_eq!(h.state().views[0].current, 1, "where the host left it");
+
+    // In order among other answers: before the next open's, and the document that open brings stays.
+    bridge.send(refused.clone());
+    bridge.send(HostCommand::Open { name: "a.pdf".into(), bytes: pages(&[&["Alpha"]]) });
+    bridge.send(refused);
+    h.run_steps(3);
+    settle(&mut h);
+    assert_eq!(bridge.take_events(), [too_large.clone(), HostEvent::Opened { pages: 1 }, too_large, HostEvent::PageChanged { page: 1 }]);
+    assert_eq!(h.state().views.len(), 1);
     assert!(!h.state().host_work_pending());
 }
 

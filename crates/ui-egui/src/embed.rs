@@ -384,10 +384,10 @@ impl PdfCraftApp {
         embed.bridge.emit(event);
     }
 
-    /// An open refused before parsing: it replaces the current document like any other, so the
-    /// host hears the same events in the same order, ending with `openFailed`.
+    /// An open refused before its file was read: answered `openFailed` in its place among the
+    /// answers, and nothing else changes (the open document, its marks, a waiting jump and a
+    /// reported selection all stay), as in the Word editor.
     fn host_open_refused(&mut self, embed: &mut Embed, message: &str) {
-        self.close_for_host_open(embed);
         embed.bridge.emit(HostEvent::OpenFailed { message: message.into() });
     }
 
