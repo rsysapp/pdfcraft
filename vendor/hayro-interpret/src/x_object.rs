@@ -65,7 +65,15 @@ impl<'a> FormXObject<'a> {
     pub(crate) fn new(stream: &Stream<'a>) -> Option<Self> {
         let dict = stream.dict();
 
-        let decoded = stream.decoded().ok()?;
+        // Embed build: a form whose content cannot be decoded is not drawn: recorded as a
+        // content stream not read (`resolved::content_stopped`).
+        let decoded = match stream.decoded() {
+            Ok(decoded) => decoded,
+            Err(_) => {
+                hayro_syntax::resolved::content_stopped();
+                return None;
+            }
+        };
         let resources = dict.get::<Dict<'_>>(RESOURCES).unwrap_or_default();
 
         let matrix = Affine::new(
@@ -144,7 +152,7 @@ pub(crate) fn draw_form_xobject<'a, 'b>(
     device.set_soft_mask(context.get().graphics_state.soft_mask.clone());
     device.set_blend_mode(context.get().graphics_state.blend_mode);
 
-    device.push_clip_path(&ClipPath {
+    let clip = ClipPath {
         path: context.get().ctm
             * Rect::new(
                 x_object.bbox[0] as f64,
@@ -154,7 +162,15 @@ pub(crate) fn draw_form_xobject<'a, 'b>(
             )
             .to_path(0.1),
         fill: FillRule::NonZero,
-    });
+    };
+    // Embed build: say which form is interpreted, where, and from what decoded content.
+    let id = x_object.dict.obj_id();
+    device.draw_form(id, &clip.path);
+    hayro_syntax::resolved::content(
+        id.map(|id| (id.obj_number, id.gen_number)),
+        x_object.decoded.as_ref(),
+    );
+    device.push_clip_path(&clip);
 
     interpret(
         iter,

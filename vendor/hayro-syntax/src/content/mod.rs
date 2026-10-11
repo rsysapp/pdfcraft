@@ -96,6 +96,10 @@ impl<'a> Readable<'a> for Operator<'a> {
 /// heuristic re-parsed the rest of the stream for every candidate, and each re-parse ran the
 /// heuristic again on the inline images it met: a fuzzed file hung for minutes.
 const MAX_EI_CANDIDATES: u32 = 256;
+
+/// Embed build: the path-construction operators after which a typed reading stops when their
+/// operands are not what they take (moved here, unchanged, from `TypedIter::next`).
+const PATH_OPERATORS: [&[u8]; 7] = [b"m", b"l", b"c", b"v", b"y", b"h", b"re"];
 const MAX_EI_LOOKAHEAD_STEPS: u32 = 256;
 
 /// An iterator over operators in the PDF content streams, providing raw access to the instructions.
@@ -133,6 +137,38 @@ impl<'a> UntypedIter<'a> {
     /// Return the next instruction.
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<Instruction<'_, 'a>> {
+        // Embed build: reading that stops before the end of the data is recorded
+        // (`resolved::content_stopped`): what follows is never interpreted, though another reader
+        // may draw it. The look-ahead of the end-of-data heuristic only probes, and is not recorded.
+        if self.advance().is_none() {
+            if !self.lookahead && !self.rest_is_trivia() {
+                crate::resolved::content_stopped();
+            }
+            return None;
+        }
+
+        let operator = self.operator.as_ref()?;
+        // Embed build: `TypedIter` stops at a path operator it cannot read; whether that stops
+        // the reading before the end is known here, where the rest of the data is.
+        let stops_if_rejected = !self.lookahead
+            && PATH_OPERATORS.contains(&operator.0.deref())
+            && !self.rest_is_trivia();
+        Some(Instruction {
+            operands: &self.stack,
+            operator,
+            stops_if_rejected,
+        })
+    }
+
+    /// Embed build: whether only white space and comments are left.
+    pub(crate) fn rest_is_trivia(&self) -> bool {
+        let mut reader = self.reader.clone();
+        reader.skip_white_spaces_and_comments();
+        reader.at_end()
+    }
+
+    /// Embed build: `next`'s former body: read the next instruction into `stack` and `operator`.
+    fn advance(&mut self) -> Option<()> {
         self.stack.clear();
         self.operator = None;
 
@@ -164,6 +200,10 @@ impl<'a> UntypedIter<'a> {
                     None => {
                         warn!("failed to read operator in content stream");
 
+                        // Embed build: the reading stops here, before the end.
+                        if !self.lookahead {
+                            crate::resolved::content_stopped();
+                        }
                         self.reader.jump_to_end();
                         return None;
                     }
@@ -313,10 +353,7 @@ impl<'a> UntypedIter<'a> {
                 }
 
                 self.operator = Some(operator);
-                return Some(Instruction {
-                    operands: &self.stack,
-                    operator: self.operator.as_ref().unwrap(),
-                });
+                return Some(());
             }
 
             self.reader.skip_white_spaces_and_comments();
@@ -357,17 +394,12 @@ impl<'a> TypedIter<'a> {
             // However, for other operators it could be worth it to just skip it but keep attempting
             // to read other content operators.
             None => {
-                if [
-                    &b"m"[..],
-                    &b"l"[..],
-                    &b"c"[..],
-                    &b"v"[..],
-                    &b"y"[..],
-                    &b"h"[..],
-                    &b"re"[..],
-                ]
-                .contains(&op.operator.0.deref())
-                {
+                if PATH_OPERATORS.contains(&op.operator.0.deref()) {
+                    // Embed build: the reading stops at this operator, which `UntypedIter` does
+                    // not see: recorded unless nothing but white space and comments follows.
+                    if op.stops_if_rejected {
+                        crate::resolved::content_stopped();
+                    }
                     None
                 } else {
                     Some(TypedInstruction::Fallback(op.operator))
@@ -383,6 +415,9 @@ pub struct Instruction<'b, 'a> {
     pub operands: &'b Stack<'a>,
     /// The actual operator.
     pub operator: &'b Operator<'a>,
+    /// Embed build: a path operator followed by more than white space and comments, read by an
+    /// iterator that records where its reading stops (see `TypedIter::next`).
+    pub(crate) stops_if_rejected: bool,
 }
 
 impl<'b, 'a> Instruction<'b, 'a> {

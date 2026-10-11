@@ -141,7 +141,22 @@ impl<'a> Type3<'a> {
 
         let name = self.glyph_simulator.glyph_to_string(glyph.glyph_id)?;
         let program = self.char_procs.get(&name)?;
-        let decoded = program.decoded().ok()?;
+        // Embed build: the procedure's decoded content is logged, and one that cannot be decoded
+        // is recorded as a content stream not read (`hayro_syntax::resolved`).
+        let decoded = match program.decoded() {
+            Ok(decoded) => decoded,
+            Err(_) => {
+                hayro_syntax::resolved::content_stopped();
+                return None;
+            }
+        };
+        hayro_syntax::resolved::content(
+            program
+                .dict()
+                .obj_id()
+                .map(|id| (id.obj_number, id.gen_number)),
+            decoded.as_ref(),
+        );
         let iter = TypedIter::new(decoded.as_ref());
 
         let is_shape_glyph = {

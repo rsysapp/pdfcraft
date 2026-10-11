@@ -248,7 +248,22 @@ impl<'a> TilingPattern<'a> {
             self.nesting_depth,
         );
 
-        let decoded = self.stream.decoded().ok()?;
+        // Embed build: the cell's decoded content is logged, and a cell that cannot be decoded
+        // is recorded as a content stream not read (`hayro_syntax::resolved`).
+        let decoded = match self.stream.decoded() {
+            Ok(decoded) => decoded,
+            Err(_) => {
+                hayro_syntax::resolved::content_stopped();
+                return None;
+            }
+        };
+        hayro_syntax::resolved::content(
+            self.stream
+                .dict()
+                .obj_id()
+                .map(|id| (id.obj_number, id.gen_number)),
+            decoded.as_ref(),
+        );
         let resources = Resources::from_parent(
             self.stream.dict().get(RESOURCES).unwrap_or_default(),
             self.parent_resources.clone(),

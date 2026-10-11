@@ -2,6 +2,7 @@ use crate::font::Glyph;
 use crate::soft_mask::SoftMask;
 use crate::{BlendMode, ClipPath, Image};
 use crate::{GlyphDrawMode, Paint, PathDrawMode};
+use hayro_syntax::object::ObjectIdentifier;
 use kurbo::{Affine, BezPath, Rect, Shape};
 
 /// A trait for a device that can be used to process PDF drawing instructions.
@@ -61,6 +62,9 @@ pub trait Device<'a> {
     fn begin_marked_content(&mut self, _tag: &[u8], _mcid: Option<i32>) {}
     /// Called at the end of a marked content sequence (EMC).
     fn end_marked_content(&mut self) {}
+    /// Embed build: a form XObject's content is about to be interpreted: the form's object (`None`
+    /// when it has none) and its `/BBox` in device space, the clip its content is drawn under.
+    fn draw_form(&mut self, _id: Option<ObjectIdentifier>, _bbox: &BezPath) {}
 }
 
 /// A device that discards all drawing operations.
