@@ -535,6 +535,9 @@ pub(crate) struct Structure {
     /// data), each with the offset the cross-reference data names for it: in the base, the only
     /// objects an appended update may keep with such a length (see [`Tolerated`]).
     pub misdeclared: BTreeSet<(ObjRef, u64)>,
+    /// The document information (the trailer's `/Info`): each key and its value's digest (empty
+    /// when there is none), see `Reader::document_information` (R6b-42).
+    pub info: BTreeMap<Vec<u8>, Digest>,
     /// An object read for a fact holds an explicit destination that gives its page by number
     /// (`[2 /Fit]`) where no destination rule follows it: a catalog's `/OpenAction`, an action
     /// chained after another, a form field's action, a named destination with other entries, …
@@ -2089,6 +2092,30 @@ impl<'d, 'b> Reader<'d, 'b> {
         Ok(facts)
     }
 
+    /// The document information dictionary (the trailer's `/Info`), key by key, each value by
+    /// its digest (R6b-42); empty when there is none (or it is `null`). PDFium reads it only
+    /// through a reference, other readers directly too, so anything but a reference to a
+    /// dictionary (or to `null`) is refused: a stream, a dictionary written in the trailer, ….
+    fn document_information(&mut self, trailer: &Dict) -> Result<BTreeMap<Vec<u8>, Digest>, Fail> {
+        let refused = || read_error("the document information (/Info) is not a reference to a dictionary, which readers read differently");
+        let mut out = BTreeMap::new();
+        let info = match trailer.get(b"Info") {
+            None | Some(Object::Null) => return Ok(out),
+            Some(Object::Ref(r)) => self.get(*r)?,
+            Some(_) => return Err(refused()),
+        };
+        let dict = match &*info {
+            Object::Null => return Ok(out),
+            Object::Dict(dict) => dict.clone(),
+            _ => return Err(refused()),
+        };
+        for (key, value) in dict.iter() {
+            self.budget.tick()?;
+            out.insert(key.clone(), self.digest(value)?);
+        }
+        Ok(out)
+    }
+
     /// The document's default layer configuration (see [`LayerConfig`]).
     fn layer_config(&mut self, catalog: &Dict) -> Result<Option<LayerConfig>, Fail> {
         let Some(properties) = self.dict_of(catalog.get(b"OCProperties"), "/OCProperties")? else { return Ok(None) };
@@ -2907,14 +2934,8 @@ impl Known {
         read
     }
 
-    /// Whether object `num` was read here, by `pdfcraft_cos` and hayro alike (every object read
-    /// is checked to parse the same in both: see [`Known::agree_shapes`]).
-    pub fn was_checked(&self, num: u32) -> bool {
-        self.checked.contains_key(&num)
-    }
-
-    /// Whether object `num` was read for a fact (not only because hayro read it: hayro reads
-    /// the trailer's `/Info`, say, which no fact compares).
+    /// Whether object `num` was read for a fact (not only because hayro read it to open the file
+    /// or draw a page).
     pub fn was_read(&self, num: u32) -> bool {
         self.facts.contains(&num)
     }
@@ -3329,6 +3350,7 @@ pub(crate) fn read(
     let root = reader.dict_of(catalog.get(b"Outlines"), "/Outlines")?.unwrap_or_default();
     let outline_root = reader.digest_without(&root, &[b"Type", b"First", b"Last", b"Count"])?;
     let (named_destinations, name_tree_keys) = reader.named_destinations(&catalog, &page_index)?;
+    let info = reader.document_information(doc.trailer())?;
     let mut entries = BTreeMap::new();
     for (key, value) in catalog.iter() {
         if CATALOG_REPORTED.contains(&key.as_slice()) {
@@ -3377,6 +3399,7 @@ pub(crate) fn read(
             structure_tree,
             name_tree_keys,
             misdeclared: BTreeSet::new(),
+            info,
             numbered_destinations: false,
         },
         known,

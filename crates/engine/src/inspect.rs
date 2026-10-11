@@ -47,8 +47,9 @@
 //!   agree, everywhere else by their encoded bytes and encoding (see `structure`);
 //! - an appended update must chain onto the base's own cross-reference sections (its newest
 //!   section's `/Prev` chain reaching the base's newest section at exactly its offset), and every
-//!   object it writes must be one this comparison reads (bar its own cross-reference streams and
-//!   the trailer's `/Info`), so that each is compared under the appended-update rules; it must
+//!   object it writes must be one this comparison reads (bar its own cross-reference streams;
+//!   the document information is read and compared in both kinds of save), so that each is
+//!   compared under the appended-update rules; it must
 //!   leave every base page's content and resources as they were (edit mode never writes page
 //!   content there); a rewrite is accepted only as an applied redaction,
 //!   checked visually (every changed pixel lies inside a uniformly filled black rectangle), glyph
@@ -100,6 +101,8 @@ pub struct Inspection {
     pub content: ContentChanges,
     pub outlines: OutlineChanges,
     pub destinations: DestinationChanges,
+    /// The document information (title, author, …), compared in both kinds of save (R6b-42).
+    pub info: InfoChanges,
     /// Rewrites only (empty for appended updates): the applied redaction boxes that explain the
     /// changes, as (page number in the edited file, from 1; rectangle `[x0, y0, x1, y1]` in that
     /// page's user space, PDF points). Boxes that overlap (the line boxes of one mark) are one
@@ -292,6 +295,25 @@ pub struct DestinationChanges {
     /// go-to action) followed its page. Their annotation is otherwise unchanged: such a link is
     /// not counted in `annotations.changed`.
     pub links: u32,
+}
+
+/// The document information dictionary (the trailer's `/Info`: title, author, subject,
+/// keywords, creation and modification dates, creator, producer, any other key), which viewers
+/// show (a document's properties, its title in place of the file name), compared key by key in
+/// both kinds of save (R6b-42). **The host refuses any change**: the editor never edits the
+/// document information, so a save that changed it was not made by the editor alone.
+///
+/// The document information must be a reference to a dictionary in both files (PDFium reads
+/// nothing else), or be absent: anything else (a stream, a dictionary written in the trailer)
+/// fails the inspection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InfoChanges {
+    /// The keys whose value was added, removed or changed, in byte order, each written as a PDF
+    /// name without its slash (a byte that is not printable ASCII, a space, `#` or a delimiter
+    /// written `#xx`, as in a PDF file): `["Title"]`, `["ModDate", "Producer"]`. Every key of the
+    /// base's when the edited file has no document information; every key of the edited file's
+    /// when the base has none. Empty: unchanged.
+    pub changed: Vec<String>,
 }
 
 /// Why a comparison has no answer. The host refuses the edited file on every one of them.
@@ -620,6 +642,7 @@ fn compare(base: &[u8], edited: &[u8], limits: Limits) -> Result<Inspection, Ins
         return Err(InspectError::Edited("the structure tree's text or tags changed, which this comparison does not report".into()));
     }
     let mut inspection = Inspection { base_kept, ..Inspection::default() };
+    inspection.info = InfoChanges { changed: info_changed(&before.structure.info, &after.structure.info) };
     let edited_fail = |fail: Fail| fail.of(Role::Edited);
     // Outline entries pair by title, not by page: where their destinations went says, between
     // changed pages equally alike, which went where.
@@ -669,6 +692,28 @@ fn compare(base: &[u8], edited: &[u8], limits: Limits) -> Result<Inspection, Ins
     inspection.redaction_areas.sort_by(|(page_a, a), (page_b, b)| page_a.cmp(page_b).then(b[3].total_cmp(&a[3])).then(a[0].total_cmp(&b[0])));
     (inspection.annotations, inspection.destinations.links) = compare_annotations(&before, &after, &pairs, base_kept, &mut budget, &mut rasters)?;
     Ok(inspection)
+}
+
+/// The document information's keys whose value was added, removed or changed (see
+/// [`InfoChanges::changed`]).
+fn info_changed(before: &BTreeMap<Vec<u8>, structure::Digest>, after: &BTreeMap<Vec<u8>, structure::Digest>) -> Vec<String> {
+    let keys: BTreeSet<&Vec<u8>> = before.keys().chain(after.keys()).collect();
+    keys.into_iter().filter(|key| before.get(*key) != after.get(*key)).map(|key| name_text(key)).collect()
+}
+
+/// A PDF name's bytes as it is written, without its slash: printable ASCII as it is, any other
+/// byte (and a space, `#` or a delimiter) as `#xx`, so that two names never read alike.
+fn name_text(name: &[u8]) -> String {
+    let mut out = String::with_capacity(name.len());
+    for &byte in name {
+        let plain = byte.is_ascii_graphic() && !matches!(byte, b'#' | b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%');
+        if plain {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("#{byte:02X}"));
+        }
+    }
+    out
 }
 
 /// Read one file. `against` is the base (bytes, structure, whether `bytes` starts with it) when
@@ -852,13 +897,12 @@ fn read_side(bytes: &[u8], against: Option<(&[u8], &Structure, bool)>, placement
 }
 
 /// Every object an appended update writes (an in-use cross-reference entry other than the base
-/// revision's for that number) must be one this comparison read, and so compared under the
-/// appended-update rules: an object nothing reads could change what a reader shows through a path
-/// this comparison does not follow, and no fact would say so. Left out: the cross-reference
-/// streams of the update's own sections, and the trailer's `/Info` dictionary (document
-/// information, restamped by the editor on every save, which no viewer draws; like `/Metadata`,
-/// see `structure`). Freed objects are not checked: a reference to one reads null, which the
-/// facts compare.
+/// revision's for that number) must be one this comparison read for a fact, and so compared
+/// under the appended-update rules: an object nothing reads could change what a reader shows
+/// through a path this comparison does not follow, and no fact would say so. Left out: the
+/// cross-reference streams of the update's own sections. (The trailer's `/Info` is read for a
+/// fact, [`InfoChanges`], like everything else.) Freed objects are not checked: a reference to
+/// one reads null, which the facts compare.
 fn check_update_read(
     doc: &Document,
     base: &[u8],
@@ -870,26 +914,11 @@ fn check_update_read(
         Ok(Ok(base_doc)) => base_doc,
         _ => return Err(Fail::Read("the base could not be read again to check the update".into())),
     };
-    // The document information is exempt only as what it is: a dictionary of direct values,
-    // which leads to nothing else (no stream, no reference), is no catalog entry's object, and
-    // that both readers read alike (hayro reads it opening the file).
-    let catalog_objects: BTreeSet<u32> = doc
-        .root()
-        .and_then(|root| doc.try_get(root.num).ok())
-        .and_then(|catalog| catalog.as_dict().map(|catalog| catalog.iter().filter_map(|(_, value)| value.as_ref().map(|r| r.num)).collect()))
-        .unwrap_or_default();
-    let info = match doc.trailer().get(b"Info") {
-        Some(pdfcraft_cos::Object::Ref(info)) if !catalog_objects.contains(&info.num) && known.was_checked(info.num) => {
-            let plain = doc.try_get(info.num).is_ok_and(|object| matches!(&*object, pdfcraft_cos::Object::Dict(_)) && !holds_reference(&object, 0));
-            plain.then_some(info.num)
-        }
-        _ => None,
-    };
     let section_offsets: BTreeSet<u64> = sections.iter().map(|section| section.offset).collect();
     for num in doc.object_numbers() {
         budget.tick()?;
         let entry = doc.xref_entry(num);
-        if entry == base_doc.xref_entry(num) || Some(num) == info || known.was_read(num) {
+        if entry == base_doc.xref_entry(num) || known.was_read(num) {
             continue;
         }
         match entry {
@@ -901,18 +930,6 @@ fn check_update_read(
         }
     }
     Ok(())
-}
-
-/// Whether `object` holds a reference or a stream anywhere in it (deeper than eight levels counts
-/// as one).
-fn holds_reference(object: &pdfcraft_cos::Object, depth: usize) -> bool {
-    match object {
-        pdfcraft_cos::Object::Ref(_) | pdfcraft_cos::Object::Stream(_) => true,
-        _ if depth > 8 => true,
-        pdfcraft_cos::Object::Array(items) => items.iter().any(|item| holds_reference(item, depth.saturating_add(1))),
-        pdfcraft_cos::Object::Dict(dict) => dict.iter().any(|(_, value)| holds_reference(value, depth.saturating_add(1))),
-        _ => false,
-    }
 }
 
 /// Whether `bytes` hold the name `/Encrypt` (not `/EncryptMetadata`).

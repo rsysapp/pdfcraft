@@ -848,14 +848,19 @@ fn an_encrypted_base_is_the_base_s_problem() {
 #[test]
 fn a_file_that_only_mentions_encrypt_metadata_is_not_encrypted() {
     let base = fixture(1);
-    // As the document information, the one object an update may write that no fact reads.
+    // As the document information, which is reported key by key (R6b-42).
     let saved = update_with(&base, &[(7, b"<< /EncryptMetadata false /Encrypt (not a dictionary) >>".to_vec())], |_, prev| {
         format!("/Size 8 /Root 1 0 R /Prev {prev} /Info 7 0 R")
     });
     let inspection = run(&base, &saved).unwrap();
     assert_eq!(
         inspection,
-        Inspection { base_kept: true, pages: PageChanges { before: 1, after: 1, ..PageChanges::default() }, ..Inspection::default() }
+        Inspection {
+            base_kept: true,
+            pages: PageChanges { before: 1, after: 1, ..PageChanges::default() },
+            info: InfoChanges { changed: vec!["Encrypt".into(), "EncryptMetadata".into()] },
+            ..Inspection::default()
+        }
     );
 }
 

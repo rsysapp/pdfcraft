@@ -562,36 +562,11 @@ fn an_update_that_writes_an_object_nothing_compares_is_refused() {
             other => panic!("{case}: {other:?}"),
         }
     }
-    // The document information, which the editor restamps on every save: accepted.
+    // The document information, which is read for a fact (R6b-42): reported, not refused.
     let edited = update_section(&base, &[(6, b"<< /Title (Agreement) /ModDate (D:20231114221320Z) >>")], prev, "/Info 6 0 R");
     let inspection = inspect(&base, &edited, InspectLimits::default()).unwrap();
     assert_eq!((inspection.text, inspection.content), (TextChanges::default(), ContentChanges::default()), "{inspection:?}");
-}
-
-#[test]
-fn the_document_information_is_exempt_only_as_a_dictionary_of_direct_values() {
-    // The one object an update may write that nothing reads is the trailer's /Info, and only as
-    // a dictionary leading nowhere: a stream named /Info, or a dictionary holding a reference,
-    // is refused (on the first version of the audit both were exempt).
-    let mut b = Builder::new();
-    head(&mut b);
-    b.object(3, format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R {RESOURCES} >>").as_bytes());
-    b.object(4, &stream("", &text("Alpha")));
-    b.object(5, b"<< /Title (Agreement) >>");
-    let rows = b.offsets.clone();
-    let base = b.finish(6, &rows, "/Info 5 0 R");
-    let prev = Some(last_section(&base));
-    let form = stream("/Type /XObject /Subtype /Form /BBox [0 0 10 10]", b"0 g 0 0 10 10 re f");
-    for (case, objects) in [
-        ("a stream as /Info", vec![(5u32, form.as_slice())]),
-        ("a reference in /Info", vec![(5, b"<< /Title 6 0 R >>".as_slice()), (6, b"(Agreement)".as_slice())]),
-    ] {
-        let edited = update_section(&base, &objects, prev, "/Info 5 0 R");
-        match inspect(&base, &edited, InspectLimits::default()) {
-            Err(InspectError::Edited(message)) => assert!(message.contains("nothing this comparison reports reads"), "{case}: {message}"),
-            other => panic!("{case}: {other:?}"),
-        }
-    }
+    assert_eq!(inspection.info.changed, ["ModDate"], "{inspection:?}");
 }
 
 /// A one-page file showing "Alpha" and, unless `boxed`, a word at (150, 20) (with `boxed`, a
@@ -907,4 +882,93 @@ fn reordering_anything_whose_order_has_meaning_is_refused_or_reported() {
         let appended = inspect(&base, &update_section(&base, &objects, prev, ""), InspectLimits::default());
         assert!(caught(&appended), "{what}, appended: {appended:?}");
     }
+}
+
+// ── R6b-42: the document information ────────────────────────────────────────────────────────
+
+/// A one-page file showing "Alpha" and, unless `boxed`, a word at (150, 20) (with `boxed`, a
+/// black box over where it was: a rewrite redacting it), with `info` as object 6 and the
+/// trailer entries `trailer`.
+fn informed(boxed: bool, info: &[u8], trailer: &str) -> Vec<u8> {
+    let mut b = Builder::new();
+    head(&mut b);
+    b.object(3, format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R {RESOURCES} >>").as_bytes());
+    let last = if boxed { "0 g 146 14 16 18 re f" } else { "BT /F1 12 Tf 150 20 Td (X) Tj ET" };
+    b.object(4, &stream("", &[text("Alpha"), b"\n".to_vec(), last.as_bytes().to_vec()].concat()));
+    b.object(5, b"null");
+    b.object(6, info);
+    let rows = b.offsets.clone();
+    b.finish(7, &rows, trailer)
+}
+
+#[test]
+fn the_document_information_is_compared_in_both_kinds_of_save() {
+    // The reviewer's I-1: PDFium shows the title (and the portal its properties), but neither an
+    // appended update nor a rewrite compared `/Info` (aedee8c reported every one of these as
+    // unchanged, or as a redaction and nothing else). Each changed key is a fact now, which the
+    // host refuses.
+    const BASE_INFO: &[u8] = b"<< /Title (Supply Agreement 2027) /Producer (Writer) >>";
+    let base = informed(false, BASE_INFO, "/Info 6 0 R");
+    let changed = |result: Result<Inspection, InspectError>, case: &str| -> Vec<String> {
+        result.unwrap_or_else(|error| panic!("{case}: {error:?}")).info.changed
+    };
+    assert!(changed(inspect(&base, &base, InspectLimits::default()), "unchanged").is_empty());
+    let prev = Some(last_section(&base));
+    let form = stream("/Type /XObject /Subtype /Form /BBox [0 0 10 10]", b"0 g 0 0 10 10 re f");
+    // Appended updates: (case, objects written, trailer entries, the keys reported).
+    let forged: &[u8] = b"<< /Title (Settlement and Waiver) /Producer (Writer) >>";
+    for (case, objects, trailer, keys) in [
+        ("another title", vec![(6u32, forged)], "/Info 6 0 R", vec!["Title"]),
+        ("a new object with another title", vec![(7, forged)], "/Info 7 0 R", vec!["Title"]),
+        ("the newest trailer without /Info", vec![], "", vec!["Producer", "Title"]),
+        (
+            "a date added",
+            vec![(6, b"<< /Title (Supply Agreement 2027) /Producer (Writer) /ModDate (D:20271114) >>".as_slice())],
+            "/Info 6 0 R",
+            vec!["ModDate"],
+        ),
+        // A value by reference is compared as such (another encoding of the same title).
+        (
+            "a title by reference",
+            vec![(6, b"<< /Title 7 0 R /Producer (Writer) >>".as_slice()), (7, b"(Supply Agreement 2027)".as_slice())],
+            "/Info 6 0 R",
+            vec!["Title"],
+        ),
+        // A key that is not plain ASCII is written as a PDF name writes it.
+        (
+            "an odd key",
+            vec![(6, b"<< /Title (Supply Agreement 2027) /Producer (Writer) /Odd#20Key#E9 (x) >>".as_slice())],
+            "/Info 6 0 R",
+            vec!["Odd#20Key#E9"],
+        ),
+    ] {
+        let edited = update_section(&base, &objects, prev, trailer);
+        let inspection = inspect(&base, &edited, InspectLimits::default()).unwrap_or_else(|error| panic!("{case}: {error:?}"));
+        assert!(inspection.base_kept, "{case}");
+        assert_eq!(inspection.info.changed, keys, "{case}: {inspection:?}");
+    }
+    // Readers read anything but a reference to a dictionary differently: refused.
+    for (case, objects, trailer) in [
+        ("a stream", vec![(6u32, form.as_slice())], "/Info 6 0 R"),
+        ("a dictionary in the trailer", vec![], "/Info << /Title (Settlement and Waiver) >>"),
+    ] {
+        let edited = update_section(&base, &objects, prev, trailer);
+        assert!(refused_against(&base, &edited).contains("/Info"), "{case}");
+    }
+    // Rewrites: a word redacted, and the document information as given.
+    for (case, info, trailer, keys) in [
+        ("kept", BASE_INFO, "/Info 6 0 R", vec![]),
+        ("another title", forged, "/Info 6 0 R", vec!["Title"]),
+        ("removed", b"null".as_slice(), "", vec!["Producer", "Title"]),
+    ] {
+        let inspection = inspect(&base, &informed(true, info, trailer), InspectLimits::default()).unwrap_or_else(|error| panic!("{case}: {error:?}"));
+        assert!(!inspection.base_kept, "{case}");
+        assert_eq!(inspection.redaction_areas.len(), 1, "{case}: {inspection:?}");
+        assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{case}: {inspection:?}");
+        assert_eq!(inspection.info.changed, keys, "{case}: {inspection:?}");
+    }
+    assert!(refused_against(&base, &informed(true, &form, "/Info 6 0 R")).contains("/Info"), "a rewrite's /Info as a stream");
+    // A base whose document information readers read differently is the base's problem.
+    let odd = informed(false, b"null", "/Info << /Title (Supply Agreement 2027) >>");
+    assert!(matches!(inspect(&odd, &odd, InspectLimits::default()), Err(InspectError::Base(_))));
 }
