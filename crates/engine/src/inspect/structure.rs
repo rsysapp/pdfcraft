@@ -72,6 +72,8 @@ pub(crate) struct PageFacts {
     pub other: Digest,
     /// The images drawn (directly, inside form XObjects, inline), as a sorted multiset.
     pub images: Vec<Digest>,
+    /// Each image drawn and the box it covers, in user space (for a rewrite's redaction check).
+    pub image_boxes: Vec<(Digest, [f64; 4])>,
     /// The image pixels drawn, summed over every use.
     pub image_pixels: u64,
     /// Content bytes the interpreter reads for the page (forms counted per use).
@@ -82,6 +84,8 @@ pub(crate) struct PageFacts {
     /// Filled from hayro: the upright page size in points, the text, the fingerprint.
     pub size: (f32, f32),
     pub text: Vec<char>,
+    /// Where each character of `text` was drawn (user space; kept for the base of a rewrite).
+    pub centres: Vec<[f32; 2]>,
     pub fingerprint: Digest,
 }
 
@@ -164,10 +168,41 @@ struct Scan {
 
 /// What a content stream draws that the comparison follows.
 enum Item {
-    /// `/Name Do`.
-    Draw(Vec<u8>),
-    /// An inline image: its digest and pixel count.
-    Inline(Digest, u64),
+    /// `/Name Do`, under this transformation (relative to the stream's start).
+    Draw(Vec<u8>, Matrix),
+    /// An inline image: its digest, pixel count and transformation.
+    Inline(Digest, u64, Matrix),
+}
+
+/// A transformation matrix `[a b c d e f]` (ISO 32000-2 §8.3.3).
+pub(crate) type Matrix = [f64; 6];
+
+const IDENTITY: Matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+
+/// `m` then `then` (`m × then`, as `cm` concatenates onto the CTM).
+fn concat(m: &Matrix, then: &Matrix) -> Matrix {
+    [
+        m[0] * then[0] + m[1] * then[2],
+        m[0] * then[1] + m[1] * then[3],
+        m[2] * then[0] + m[3] * then[2],
+        m[2] * then[1] + m[3] * then[3],
+        m[4] * then[0] + m[5] * then[2] + then[4],
+        m[4] * then[1] + m[5] * then[3] + then[5],
+    ]
+}
+
+/// The box an image drawn under `m` covers (the unit square), in the space `m` maps into. A
+/// matrix that does not give finite numbers gives a box that contains nothing.
+fn unit_square(m: &Matrix) -> [f64; 4] {
+    let corners = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)].map(|(x, y)| (m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]));
+    let (mut x0, mut y0, mut x1, mut y1) = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for (x, y) in corners {
+        x0 = x0.min(x);
+        y0 = y0.min(y);
+        x1 = x1.max(x);
+        y1 = y1.max(y);
+    }
+    if [x0, y0, x1, y1].iter().all(|v| v.is_finite()) { [x0, y0, x1, y1] } else { [f64::NAN; 4] }
 }
 
 /// A leaf of the page tree with what it inherits.
@@ -185,6 +220,8 @@ struct PageNode {
 #[derive(Default)]
 struct Drawn {
     images: Vec<Digest>,
+    /// Each image drawn and the box it covers, in user space.
+    placements: Vec<(Digest, [f64; 4])>,
     pixels: u64,
     interpreted: usize,
 }
@@ -607,6 +644,9 @@ impl<'d, 'b> Reader<'d, 'b> {
         let unreadable = |what: &str| read_error(format!("a content stream cannot be read: {what}"));
         let mut lx = Lexer::new(data, 0);
         let mut name: Option<Vec<u8>> = None;
+        let mut numbers: Vec<f64> = Vec::new();
+        let mut ctm = IDENTITY;
+        let mut saved: Vec<Matrix> = Vec::new();
         let mut items = Vec::new();
         loop {
             self.budget.tick()?;
@@ -617,6 +657,9 @@ impl<'d, 'b> Reader<'d, 'b> {
                 let operand = lx.object().map_err(|error| unreadable(&error.to_string()))?;
                 if lx.pos <= at {
                     return Err(unreadable("no progress"));
+                }
+                if let Some(number) = operand.as_f64() {
+                    numbers.push(number);
                 }
                 name = match operand {
                     Object::Name(n) => Some(n),
@@ -632,21 +675,30 @@ impl<'d, 'b> Reader<'d, 'b> {
                 return Err(unreadable("an unknown byte"));
             }
             match keyword {
-                b"Do" => items.push(Item::Draw(name.take().ok_or_else(|| unreadable("Do without a name"))?)),
+                b"Do" => items.push(Item::Draw(name.take().ok_or_else(|| unreadable("Do without a name"))?, ctm)),
                 b"BI" => {
-                    let (item, end) = self.inline_image(data, lx.pos)?;
-                    items.push(item);
+                    let (digest, pixels, end) = self.inline_image(data, lx.pos)?;
+                    items.push(Item::Inline(digest, pixels, ctm));
                     lx.pos = end;
+                }
+                b"q" => saved.push(ctm),
+                b"Q" => ctm = saved.pop().unwrap_or(ctm),
+                b"cm" => {
+                    if let Some(m) = numbers.len().checked_sub(6).and_then(|from| numbers.get(from..)) {
+                        let m: Matrix = [m[0], m[1], m[2], m[3], m[4], m[5]];
+                        ctm = concat(&m, &ctm);
+                    }
                 }
                 _ => {}
             }
+            numbers.clear();
             name = None;
         }
         Ok(Scan { digest: sha256(&[data]), items, len: data.len() })
     }
 
     /// An inline image after `BI`: its digest and pixel count, and where it ends (after `EI`).
-    fn inline_image(&mut self, data: &[u8], pos: usize) -> Result<(Item, usize), Fail> {
+    fn inline_image(&mut self, data: &[u8], pos: usize) -> Result<(Digest, u64, usize), Fail> {
         let unreadable = || read_error("an inline image cannot be read");
         let mut lx = Lexer::new(data, pos);
         let mut dict = Dict::new();
@@ -680,7 +732,7 @@ impl<'d, 'b> Reader<'d, 'b> {
         let side =
             |a: &[u8], b: &[u8]| dict.get(a).or_else(|| dict.get(b)).and_then(Object::as_int).map_or(0, |v| u64::try_from(v.max(0)).unwrap_or(0));
         let pixels = side(b"W", b"Width").saturating_mul(side(b"H", b"Height"));
-        Ok((Item::Inline(sha256(&[b"inline", bytes]), pixels), end))
+        Ok((sha256(&[b"inline", bytes]), pixels, end))
     }
 
     /// The XObject `name` resolves to through a resource chain (nearest first), as hayro looks it
@@ -698,15 +750,18 @@ impl<'d, 'b> Reader<'d, 'b> {
     }
 
     /// Follow what a content stream draws: images (hashed once each) and forms (recursively).
-    fn draw(&mut self, items: &[Item], chain: &[Arc<Dict>], depth: usize, drawn: &mut Drawn) -> Result<(), Fail> {
+    /// `ctm` maps the stream's space to user space.
+    fn draw(&mut self, items: &[Item], chain: &[Arc<Dict>], depth: usize, ctm: &Matrix, drawn: &mut Drawn) -> Result<(), Fail> {
         for item in items {
             self.budget.uses()?;
             match item {
-                Item::Inline(digest, pixels) => {
+                Item::Inline(digest, pixels, at) => {
                     drawn.images.push(*digest);
+                    drawn.placements.push((*digest, unit_square(&concat(at, ctm))));
                     drawn.pixels = drawn.pixels.saturating_add(*pixels);
                 }
-                Item::Draw(name) => {
+                Item::Draw(name, at) => {
+                    let placed = concat(at, ctm);
                     let Some(r) = self.xobject(chain, name)? else { continue };
                     let obj = self.get(r)?;
                     let Object::Stream(stream) = &*obj else { continue };
@@ -714,6 +769,7 @@ impl<'d, 'b> Reader<'d, 'b> {
                         Some(b"Image") => {
                             let (digest, _) = self.digest_ref(r)?;
                             drawn.images.push(digest);
+                            drawn.placements.push((digest, unit_square(&placed)));
                             let width = self.int_of(stream.dict.get(b"Width"))?.unwrap_or(0).max(0);
                             let height = self.int_of(stream.dict.get(b"Height"))?.unwrap_or(0).max(0);
                             drawn.pixels = drawn.pixels.saturating_add((width as u64).saturating_mul(height as u64));
@@ -728,7 +784,12 @@ impl<'d, 'b> Reader<'d, 'b> {
                             let mut inner = Vec::with_capacity(chain.len().saturating_add(1));
                             inner.push(Arc::new(own));
                             inner.extend(chain.iter().cloned());
-                            self.draw(&scan.items, &inner, depth.saturating_add(1), drawn)?;
+                            let numbers = self.array_of(stream.dict.get(b"Matrix"), "a form's /Matrix")?;
+                            let matrix = match numbers.iter().map(Object::as_f64).collect::<Option<Vec<f64>>>().as_deref() {
+                                Some([a, b, c, d, e, f]) => [*a, *b, *c, *d, *e, *f],
+                                _ => IDENTITY,
+                            };
+                            self.draw(&scan.items, &inner, depth.saturating_add(1), &concat(&matrix, &placed), drawn)?;
                         }
                         _ => {}
                     }
@@ -772,7 +833,7 @@ impl<'d, 'b> Reader<'d, 'b> {
         let resources = sha256(&[&levels]);
         let scan = self.page_content(&node.dict)?;
         let mut drawn = Drawn { interpreted: scan.len, ..Drawn::default() };
-        self.draw(&scan.items, &chain, 0, &mut drawn)?;
+        self.draw(&scan.items, &chain, 0, &IDENTITY, &mut drawn)?;
         drawn.images.sort_unstable();
         let (annots, annots_in_array) = self.annotations(node, widgets, annotation_ids)?;
         Ok(PageFacts {
@@ -782,11 +843,13 @@ impl<'d, 'b> Reader<'d, 'b> {
             other,
             images: drawn.images,
             image_pixels: drawn.pixels,
+            image_boxes: drawn.placements,
             interpreted: drawn.interpreted,
             annots,
             annots_in_array,
             size: (0.0, 0.0),
             text: Vec::new(),
+            centres: Vec::new(),
             fingerprint: [0; 32],
         })
     }

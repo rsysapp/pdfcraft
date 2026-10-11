@@ -354,8 +354,9 @@ fn compare(base: &[u8], edited: &[u8], limits: Limits) -> Result<Inspection, Ins
     let mut budget = Budget::new(limits);
     budget.time().map_err(|fail| fail.of(Role::Base))?;
     let base_kept = edited.starts_with(base);
-    let before = read_side(base, None, &mut budget).map_err(|fail| fail.of(Role::Base))?;
-    let after = read_side(edited, Some((base, &before.structure, base_kept)), &mut budget).map_err(|fail| fail.of(Role::Edited))?;
+    // A rewrite's removals are checked against its redaction boxes by position on the base page.
+    let before = read_side(base, None, !base_kept, &mut budget).map_err(|fail| fail.of(Role::Base))?;
+    let after = read_side(edited, Some((base, &before.structure, base_kept)), false, &mut budget).map_err(|fail| fail.of(Role::Edited))?;
     if let Some(key) = structure::catalog_change(&before.structure, &after.structure) {
         return Err(InspectError::Edited(format!("the document's /{key} changed, which this comparison does not report")));
     }
@@ -372,8 +373,9 @@ fn compare(base: &[u8], edited: &[u8], limits: Limits) -> Result<Inspection, Ins
 }
 
 /// Read one file. `against` is the base (bytes, structure, whether `bytes` starts with it) when
-/// reading the edited file: its cross-reference chain is checked against the base's.
-fn read_side(bytes: &[u8], against: Option<(&[u8], &Structure, bool)>, budget: &mut Budget) -> Result<Side, Fail> {
+/// reading the edited file: its cross-reference chain is checked against the base's. `positions`
+/// keeps where each character and image was drawn.
+fn read_side(bytes: &[u8], against: Option<(&[u8], &Structure, bool)>, positions: bool, budget: &mut Budget) -> Result<Side, Fail> {
     let shared = Arc::new(bytes.to_vec());
     let doc = match catch_unwind(AssertUnwindSafe(|| Document::open(shared.clone()))) {
         Ok(Ok(doc)) => doc,
@@ -412,7 +414,13 @@ fn read_side(bytes: &[u8], against: Option<(&[u8], &Structure, bool)>, budget: &
         let before = side.hayro.work_spent();
         let text = side.hayro.text(index);
         budget.work(&side.hayro, before)?;
-        page.text = text.map_err(content_failure)?;
+        let text = text.map_err(content_failure)?;
+        page.text = text.chars;
+        if positions {
+            page.centres = text.centres;
+        } else {
+            page.image_boxes = Vec::new();
+        }
         page.fingerprint = structure::fingerprint(page);
     }
     if side.hayro.repaired() {
@@ -612,16 +620,25 @@ fn compare_pages(
         counts.content_removed += usize::from(lost_text || lost_image);
         if base_kept {
             counts.content_changed += usize::from(drawn_differently);
-        } else if drawn_differently {
-            let (base_raster, edited_raster) = rasters.get(before, after, (old, new), budget)?;
-            let verdict = visual::redaction_boxes(&base_raster, &edited_raster);
-            counts.outside_redactions += usize::from(verdict.outside);
-            let page = u32::try_from(new.saturating_add(1)).unwrap_or(u32::MAX);
-            for rect in verdict.boxes {
-                if inspection.redaction_areas.len() >= MAX_REDACTION_AREAS {
-                    return Err(InspectError::TooComplex);
+        } else if drawn_differently || lost_text || lost_image {
+            let areas = if drawn_differently {
+                let (base_raster, edited_raster) = rasters.get(before, after, (old, new), budget)?;
+                let verdict = visual::redaction_boxes(&base_raster, &edited_raster);
+                (!verdict.outside).then(|| verdict.boxes.into_iter().map(|rect| user_rect(&edited_raster, rect)).collect::<Vec<_>>())
+            } else {
+                Some(Vec::new())
+            };
+            match areas.and_then(|areas| removals_inside(b, e, areas)) {
+                None => counts.outside_redactions += 1,
+                Some(areas) => {
+                    let page = u32::try_from(new.saturating_add(1)).unwrap_or(u32::MAX);
+                    for area in areas {
+                        if inspection.redaction_areas.len() >= MAX_REDACTION_AREAS {
+                            return Err(InspectError::TooComplex);
+                        }
+                        inspection.redaction_areas.push((page, area));
+                    }
                 }
-                inspection.redaction_areas.push((page, user_rect(&edited_raster, rect)));
             }
         }
     }
@@ -634,6 +651,105 @@ fn compare_pages(
         pages_changed_outside_redactions: count(counts.outside_redactions),
     };
     Ok(())
+}
+
+/// How far (PDF points) a removed character's centre, or a removed image, may lie outside a
+/// redaction area.
+const AREA_TOLERANCE: f32 = 1.0;
+
+fn near_area(point: [f32; 2], area: &[f32; 4]) -> bool {
+    point[0] >= area[0] - AREA_TOLERANCE
+        && point[0] <= area[2] + AREA_TOLERANCE
+        && point[1] >= area[1] - AREA_TOLERANCE
+        && point[1] <= area[3] + AREA_TOLERANCE
+}
+
+fn overlaps_area(placed: &[f64; 4], area: &[f32; 4]) -> bool {
+    let tolerance = f64::from(AREA_TOLERANCE);
+    let [x0, y0, x1, y1] = area.map(f64::from);
+    placed[0] <= x1 + tolerance && placed[2] >= x0 - tolerance && placed[1] <= y1 + tolerance && placed[3] >= y0 - tolerance
+}
+
+/// The base characters the edited text leaves out (indices into `base`). Where a character could
+/// either be kept or left out (the same character again later), the one `inside` an area is the
+/// one taken as left out, as a redaction removes it.
+fn removed_chars(base: &[char], edited: &[char], inside: impl Fn(usize) -> bool) -> Vec<usize> {
+    // For each edited suffix, the latest base position it can start embedding at.
+    let mut latest = vec![0usize; edited.len()];
+    let mut end = base.len();
+    let mut embeds = true;
+    for (j, c) in edited.iter().enumerate().rev() {
+        match base.get(..end).and_then(|head| head.iter().rposition(|b| b == c)) {
+            Some(i) => {
+                if let Some(slot) = latest.get_mut(j) {
+                    *slot = i;
+                }
+                end = i;
+            }
+            None => {
+                embeds = false;
+                break;
+            }
+        }
+    }
+    let mut removed = Vec::new();
+    let mut j = 0usize;
+    for (i, c) in base.iter().enumerate() {
+        let matches = edited.get(j) == Some(c);
+        // Leave it out when it lies in an area and the rest still fits after it.
+        let skip = embeds && matches && inside(i) && latest.get(j).is_some_and(|start| *start > i);
+        if matches && !skip {
+            j = j.saturating_add(1);
+        } else {
+            removed.push(i);
+        }
+    }
+    removed
+}
+
+/// A rewritten page's removals checked against its redaction `areas` (user space): every removed
+/// character (by its centre on the base page) and every removed image (by the box it covered)
+/// must lie in an area, within [`AREA_TOLERANCE`]. `None` when one does not; otherwise the areas
+/// that removed something (an area that removes nothing is not a redaction).
+fn removals_inside(base: &PageFacts, edited: &PageFacts, areas: Vec<[f32; 4]>) -> Option<Vec<[f32; 4]>> {
+    let mut used = vec![false; areas.len()];
+    let mut mark = |hit: &dyn Fn(&[f32; 4]) -> bool| {
+        let mut any = false;
+        for (area, slot) in areas.iter().zip(used.iter_mut()) {
+            if hit(area) {
+                *slot = true;
+                any = true;
+            }
+        }
+        any
+    };
+    if base.centres.len() != base.text.len() {
+        // Positions unknown: no removal can be shown to lie in an area.
+        return (is_subsequence(&base.text, &edited.text)).then(Vec::new);
+    }
+    let centre = |i: usize| base.centres.get(i).copied();
+    let inside = |i: usize| centre(i).is_some_and(|c| areas.iter().any(|area| near_area(c, area)));
+    for i in removed_chars(&base.text, &edited.text, inside) {
+        let c = centre(i)?;
+        if !mark(&|area| near_area(c, area)) {
+            return None;
+        }
+    }
+    // Images: each one fewer in the edited page must have been under an area.
+    let mut missing: BTreeMap<&Digest, i64> = BTreeMap::new();
+    for image in &base.images {
+        *missing.entry(image).or_default() += 1;
+    }
+    for image in &edited.images {
+        *missing.entry(image).or_default() -= 1;
+    }
+    for (digest, count) in missing.into_iter().filter(|(_, count)| *count > 0) {
+        let covered = base.image_boxes.iter().filter(|(d, placed)| d == digest && mark(&|area| overlaps_area(placed, area))).count();
+        if i64::try_from(covered).unwrap_or(i64::MAX) < count {
+            return None;
+        }
+    }
+    Some(areas.into_iter().zip(used).filter(|(_, used)| *used).map(|(area, _)| area).collect())
 }
 
 /// A box of render pixels in the page's user space (PDF points), widened by its anti-aliased edge.

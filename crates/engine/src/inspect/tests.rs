@@ -245,6 +245,8 @@ fn reports_a_redaction_that_removed_only_an_image() {
     let inspection = run(&with_image, &redacted).unwrap();
     assert!(!inspection.base_kept);
     assert_eq!(inspection.text, TextChanges::default());
+    // The box that removed the image is its area.
+    assert!(!inspection.redaction_areas.is_empty());
     assert_eq!(inspection.content, ContentChanges { pages_with_images_removed: 1, pages_with_content_removed: 1, ..ContentChanges::default() });
 }
 
@@ -757,6 +759,45 @@ fn the_same_deletion_under_a_black_box_is_reported_as_a_redaction_there() {
     }
 }
 
+/// "Buyer may not terminate" drawn so that it does not show (`hide`: before the text, or after
+/// it), or the same with "not" left out; `unrelated` adds a black box elsewhere on the page.
+fn hidden_line(hide: (&str, &str), without_not: bool, unrelated: bool) -> Vec<u8> {
+    let line = if without_not {
+        format!("BT /F1 12 Tf 20 150 Td (Buyer may) Tj ET\nBT /F1 12 Tf {} 150 Td (terminate) Tj ET\n", 20.0 + width_of("Buyer may not "))
+    } else {
+        "BT /F1 12 Tf 20 150 Td (Buyer may not terminate) Tj ET\n".to_string()
+    };
+    let unrelated = if unrelated { "0 g 20 20 60 20 re f\n" } else { "" };
+    pages_pdf(&[page(&format!("{}{line}{}{unrelated}", hide.0, hide.1))], &[image(90)])
+}
+
+#[test]
+fn removed_text_that_does_not_show_must_lie_under_a_redaction_box() {
+    let cases = [
+        ("an OCR layer over a scan", ("q 200 0 0 300 0 0 cm /Im1 Do Q 3 Tr ", "0 Tr ")),
+        ("white text", ("1 g ", "0 g ")),
+        ("text under an image", ("", "q 170 0 0 20 15 145 cm /Im1 Do Q ")),
+    ];
+    for (case, hide) in cases {
+        let base = hidden_line(hide, false, false);
+        for unrelated in [false, true] {
+            let inspection = run(&base, &hidden_line(hide, true, unrelated)).unwrap();
+            assert_eq!(inspection.text, TextChanges { pages_with_text_removed: 1, pages_with_text_added: 0 }, "{case}, box elsewhere: {unrelated}");
+            assert_eq!(inspection.content.pages_changed_outside_redactions, 1, "{case}, box elsewhere: {unrelated}");
+            assert!(inspection.redaction_areas.is_empty(), "{case}");
+        }
+    }
+}
+
+#[test]
+fn a_box_that_removes_nothing_is_not_a_redaction_area() {
+    let base = pages_pdf(&[page(&text_line(20.0, 150.0, "Buyer pays Seller"))], &[]);
+    let boxed = pages_pdf(&[page(&format!("{}0 g 20 20 60 20 re f\n", text_line(20.0, 150.0, "Buyer pays Seller")))], &[]);
+    let inspection = run(&base, &boxed).unwrap();
+    assert_eq!(inspection.content.pages_changed_outside_redactions, 0);
+    assert!(inspection.redaction_areas.is_empty(), "{:?}", inspection.redaction_areas);
+}
+
 // ── 10. encryption ──────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -871,6 +912,73 @@ fn two_thousand_pages_compare_within_the_work_bounds() {
     let file = fixture(MAX_PAGES);
     let inspection = inspect_with(&file, &file, Limits { deadline: Duration::from_secs(3_600), ..Limits::default() }).unwrap();
     assert_eq!(inspection.pages.before, MAX_PAGES as u32);
+}
+
+/// A letter page drawing `content` with `resources` (a resource dictionary's entries), and
+/// `objects` numbered from 4.
+fn letter_pdf(content: &[u8], resources: &str, objects: &[Vec<u8>]) -> Vec<u8> {
+    let first = 4 + objects.len();
+    let mut bodies = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        format!("<< /Type /Pages /Kids [{first} 0 R] /Count 1 /MediaBox [0 0 612 792] >>").into_bytes(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+    ];
+    bodies.extend(objects.iter().cloned());
+    bodies.push(format!("<< /Type /Page /Parent 2 0 R /Contents {} 0 R /Resources << {resources} >> >>", first + 1).into_bytes());
+    bodies.push(stream("", content));
+    pdf(&bodies)
+}
+
+/// The reviewer's costly shading pages (fix round 2 review, F2), each as a rewrite of a blank
+/// letter page: (name, base, edited).
+pub(super) fn costly_shadings() -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
+    let blank = letter_pdf(b"", "", &[]);
+    let fills = |paint: &str, times: usize| format!("q 0 0 1 1 re W n {paint} 0 0 612 792 re f Q\n").repeat(times).into_bytes();
+    let axial = "/Pattern << /P1 << /PatternType 2 /Shading << /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 612 0] /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >> /Extend [true true] >> >> >>";
+    // A 399-operator PostScript calculator, evaluated once a pixel.
+    let program = format!("{{ add 2 div{} }}", " dup pop".repeat(198));
+    let type4 = stream("/FunctionType 4 /Domain [0 1 0 1] /Range [0 1]", program.as_bytes());
+    let function_based = "/Pattern << /P1 << /PatternType 2 /Shading << /ShadingType 1 /ColorSpace /DeviceGray /Domain [0 1 0 1] /Matrix [612 0 0 792 0 0] /Function 4 0 R >> >> >>";
+    // One triangle of a free-form mesh, `size` user units on a side.
+    let mesh = |size: u32| {
+        let vertex = |x: u16, y: u16, grey: u8| [&[0u8][..], &x.to_be_bytes(), &y.to_be_bytes(), &[grey]].concat();
+        let data = [vertex(0, 0, 0), vertex(65535, 0, 128), vertex(0, 65535, 255)].concat();
+        stream(
+            &format!(
+                "/ShadingType 4 /ColorSpace /DeviceGray /BitsPerCoordinate 16 /BitsPerComponent 8 /BitsPerFlag 8 /Decode [0 {size} 0 {size} 0 1]"
+            ),
+            &data,
+        )
+    };
+    let tiling = stream(
+        "/PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 3000 3000] /XStep 3000 /YStep 3000 /Resources << >>",
+        b"0 0 1 rg 0 0 3000 3000 re f",
+    );
+    vec![
+        ("axial shading fills, clipped", blank.clone(), letter_pdf(&fills("/Pattern cs /P1 scn", 1_000), axial, &[])),
+        ("type 4 function shading fills", blank.clone(), letter_pdf(&fills("/Pattern cs /P1 scn", 100), function_based, &[type4])),
+        ("mesh sh, clipped", blank.clone(), letter_pdf(&b"q 0 0 1 1 re W n /Sh1 sh Q\n".repeat(1_000), "/Shading << /Sh1 4 0 R >>", &[mesh(1_500)])),
+        ("3000 px tiling cells", blank.clone(), letter_pdf(&fills("/Pattern cs /T1 scn", 1_000), "/Pattern << /T1 4 0 R >>", &[tiling])),
+        ("one huge mesh triangle", blank.clone(), letter_pdf(b"/Sh1 sh\n", "/Shading << /Sh1 4 0 R >>", &[mesh(60_000)])),
+    ]
+}
+
+#[test]
+fn costly_shadings_tilings_and_meshes_stop_on_the_work_budget() {
+    let no_clock = Limits { deadline: Duration::from_secs(3_600), ..Limits::default() };
+    for (case, base, edited) in costly_shadings() {
+        let started = Instant::now();
+        let result = inspect_with(&base, &edited, no_clock);
+        let elapsed = started.elapsed();
+        // Refused, or answered: either way within a bounded time (a bounded result is a page
+        // compared visually: changed outside redactions).
+        match &result {
+            Err(InspectError::TooComplex) => {}
+            Ok(inspection) => assert_eq!(inspection.content.pages_changed_outside_redactions, 1, "{case}"),
+            other => panic!("{case}: {other:?}"),
+        }
+        assert!(elapsed < Duration::from_secs(5), "{case}: {elapsed:?} ({result:?})");
+    }
 }
 
 // ── 12. never panics, on a valid file broken in many ways ───────────────────────────────────
