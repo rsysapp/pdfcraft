@@ -199,9 +199,14 @@ pub(crate) fn draw_image_xobject<'a, 'b>(
     let width = x_object.width as f64;
     let height = x_object.height as f64;
 
-    // Embed build: an image costs the area it covers (the unit square under the CTM).
+    // Embed build: an image costs the area it covers (the unit square under the CTM), and its
+    // decoding one unit per 64 pixels; its decoded pixels (four bytes each) must fit the
+    // allocation bound.
     let area = context.get().ctm.transform_rect_bbox(Rect::new(0.0, 0.0, 1.0, 1.0));
-    if !crate::context::take_work(context, crate::context::paint_work(context, area)) {
+    let pixels = u64::from(x_object.width).saturating_mul(u64::from(x_object.height));
+    if !crate::spend_allocation(pixels.saturating_mul(4))
+        || !crate::context::take_work(context, crate::context::paint_work(context, area).saturating_add(pixels / 64))
+    {
         if has_oc {
             context.ocg_state.end_marked_content();
         }

@@ -474,7 +474,14 @@ impl Renderer {
                             self.ctx.height() as f64,
                         ));
 
-                        let encoded = s.encode();
+                        // Embed build: the texture evaluates the shading once a pixel of `bbox`:
+                        // charged before it is computed (an eighth of a unit a pixel, times the
+                        // function's cost in steps of 32 operators), and skipped past the budget.
+                        let Some(encoded) = shading_allowed(bbox, s.evaluation_cost()).then(|| s.encode_within(bbox)).flatten() else {
+                            self.ctx.set_paint_transform(Affine::IDENTITY);
+                            self.ctx.set_paint(AlphaColor::from_rgba8(0, 0, 0, 0));
+                            return clip_path;
+                        };
                         let (image, width, height, transform, may_have_transparency) =
                             render_shading_texture(bbox, &encoded);
                         let may_have_transparency =
@@ -530,6 +537,15 @@ impl Renderer {
                         let scaled_height = bbox.height() as f32 * ys;
                         let pix_width = x_step.abs().round() as u16;
                         let pix_height = y_step.abs().round() as u16;
+
+                        // Embed build: a cell pixmap is made and rendered for every fill: charged
+                        // by its area (and its allocation) before it is made, skipped past the budget.
+                        let cell = u64::from(pix_width) * u64::from(pix_height);
+                        if !hayro_interpret::spend_allocation(cell * 4) || !hayro_interpret::spend_work(3 + cell / 256) {
+                            self.ctx.set_paint_transform(Affine::IDENTITY);
+                            self.ctx.set_paint(AlphaColor::from_rgba8(0, 0, 0, 0));
+                            return clip_path;
+                        }
 
                         let mut renderer = Self {
                             ctx: RenderContext::new_with(
@@ -1041,7 +1057,18 @@ fn render_shading_texture(
     )
 }
 
+/// Embed build: whether a shading texture over `bbox` (device pixels) may be computed, charging
+/// its work and allocation (`hayro_interpret::spend_work`).
+fn shading_allowed(bbox: Rect, evaluation_cost: u64) -> bool {
+    let pixels = if bbox.is_finite() { (bbox.width().max(1.0).ceil() * bbox.height().max(1.0).ceil()).min(u64::MAX as f64) as u64 } else { u64::MAX };
+    let units = pixels.saturating_mul(1 + evaluation_cost / 32) / 8;
+    hayro_interpret::spend_allocation(pixels.saturating_mul(4)) && hayro_interpret::spend_work(units.saturating_add(3))
+}
+
 fn draw_soft_mask(mask: &SoftMask<'_>, settings: RenderSettings, width: u16, height: u16) -> Mask {
+    // Embed build: a soft mask is a canvas-sized rendering, charged by its area (its content's
+    // own work is charged as it is interpreted; past the budget it is skipped).
+    let _ = hayro_interpret::spend_work(3 + u64::from(width) * u64::from(height) / 256);
     let mut renderer = Renderer {
         ctx: RenderContext::new_with(width, height, derive_settings(&settings)),
         inside_pattern: false,

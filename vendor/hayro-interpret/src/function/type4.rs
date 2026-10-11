@@ -16,6 +16,20 @@ pub(crate) struct Type4 {
 }
 
 impl Type4 {
+    /// Embed build: the operators in the program, both branches of every conditional included.
+    pub(crate) fn cost(&self) -> u64 {
+        fn count(ops: &[PostScriptOp]) -> u64 {
+            ops.iter().fold(0u64, |n, op| {
+                n.saturating_add(match op {
+                    PostScriptOp::If(body) => count(body).saturating_add(1),
+                    PostScriptOp::IfElse(a, b) => count(a).saturating_add(count(b)).saturating_add(1),
+                    _ => 1,
+                })
+            })
+        }
+        count(&self.program)
+    }
+
     /// Create a new type 4 function.
     pub(crate) fn new(stream: &Stream<'_>) -> Option<Self> {
         let dict = stream.dict().clone();

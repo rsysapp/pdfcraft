@@ -50,6 +50,17 @@ impl Function {
         Some(Self(Arc::new(function_type)))
     }
 
+    /// Embed build: how costly one evaluation is, roughly in PostScript operators (a sampled or
+    /// exponential function is 1; a stitching function its costliest part plus 1; a PostScript
+    /// calculator its operator count).
+    pub fn cost(&self) -> u64 {
+        match self.0.as_ref() {
+            FunctionType::Type0(_) | FunctionType::Type2(_) => 1,
+            FunctionType::Type3(t3) => t3.cost(),
+            FunctionType::Type4(t4) => t4.cost(),
+        }
+    }
+
     /// Evaluate the function with the given input.
     pub fn eval(&self, input: Values) -> Option<Values> {
         match self.0.as_ref() {

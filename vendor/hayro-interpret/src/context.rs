@@ -31,10 +31,20 @@ pub(crate) const MAX_NESTED_PAINTS: u32 = 50_000;
 
 std::thread_local! {
     static NESTED_PAINTS: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
-    // Embed build: the work this interpretation did, and whether it ran out.
+    // Embed build: the work this interpretation did, whether it ran out, and its budget and
+    // warning sink (thread-local, so the renderer's paint-time work is charged to it too).
     static WORK: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
     static WORK_EXCEEDED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    static WORK_BUDGET: core::cell::Cell<u64> = const { core::cell::Cell::new(u64::MAX) };
+    static WORK_SINK: RefCell<Option<crate::WarningSinkFn>> = const { RefCell::new(None) };
+    static ALLOCATED: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
 }
+
+/// Embed build: the most bytes of buffers (decoded images, shading textures, mesh samples,
+/// tiling cells) an interpretation with a work budget may make the interpreter or renderer
+/// allocate, in all: the renderer keeps a page's paint buffers until the page is drawn. A buffer
+/// that would go past it is refused before it is allocated, as work past the budget.
+pub const MAX_ALLOCATION: u64 = 256 << 20;
 
 /// Embed build: the work done by the latest interpretation on this thread (see
 /// `InterpreterSettings::work_budget`), up to the point it stopped.
@@ -42,22 +52,45 @@ pub fn work_spent() -> u64 {
     WORK.with(|w| w.get())
 }
 
-/// Embed build: spend `units` of the interpretation's work budget; `false` once it is spent (the
-/// caller skips the work), with `WorkBudgetExceeded` sent the first time.
-pub(crate) fn take_work(context: &Context<'_>, units: u64) -> bool {
-    let budget = context.settings.work_budget;
+/// Embed build: spend `units` of the current interpretation's work budget (set by
+/// `Context::new`); `false` once it is spent (the caller skips the work), with
+/// `WorkBudgetExceeded` sent the first time. For a device doing work the interpreter cannot see
+/// (shading textures, tiling cells, soft masks), before it does it.
+pub fn spend_work(units: u64) -> bool {
     let total = WORK.with(|w| {
         let total = w.get().saturating_add(units);
         w.set(total);
         total
     });
-    if total <= budget {
+    if total <= WORK_BUDGET.with(|b| b.get()) {
         return true;
     }
     if !WORK_EXCEEDED.with(|e| e.replace(true)) {
-        (context.settings.warning_sink)(crate::InterpreterWarning::WorkBudgetExceeded);
+        let sink = WORK_SINK.with(|s| s.borrow().clone());
+        if let Some(sink) = sink {
+            sink(crate::InterpreterWarning::WorkBudgetExceeded);
+        }
     }
     false
+}
+
+/// Embed build: whether a buffer of `bytes` may be allocated. Under a work budget, one that would
+/// take the interpretation's buffers past [`MAX_ALLOCATION`] spends the whole budget instead (and
+/// is not allocated).
+pub fn spend_allocation(bytes: u64) -> bool {
+    if WORK_BUDGET.with(|b| b.get()) == u64::MAX {
+        return true;
+    }
+    let total = ALLOCATED.with(|a| {
+        let total = a.get().saturating_add(bytes);
+        a.set(total);
+        total
+    });
+    total <= MAX_ALLOCATION || spend_work(u64::MAX)
+}
+
+pub(crate) fn take_work(_context: &Context<'_>, units: u64) -> bool {
+    spend_work(units)
 }
 
 /// Embed build: the work of painting over `area` (device space, before clipping): three units,
@@ -138,9 +171,12 @@ impl<'a> Context<'a> {
         let state = State::new(initial_transform);
         // PdfCraft patch: a page (or other top-level content) starts with a fresh budget.
         NESTED_PAINTS.with(|n| n.set(0));
-        // Embed build: and with no work done.
+        // Embed build: and with no work done, under this interpretation's budget.
         WORK.with(|w| w.set(0));
         WORK_EXCEEDED.with(|e| e.set(false));
+        WORK_BUDGET.with(|b| b.set(settings.work_budget));
+        ALLOCATED.with(|a| a.set(0));
+        WORK_SINK.with(|s| *s.borrow_mut() = Some(settings.warning_sink.clone()));
 
         Self::new_with(initial_transform, bbox, cache, xref, settings, state, 0)
     }

@@ -41,6 +41,11 @@ impl Type3 {
     }
 
     /// Evaluate the function with the given input.
+    /// Embed build: the costliest part, plus the choice between parts.
+    pub(crate) fn cost(&self) -> u64 {
+        self.functions.iter().map(Function::cost).max().unwrap_or(0).saturating_add(1)
+    }
+
     pub(crate) fn eval(&self, input: f32) -> Option<Values> {
         let mut input = [input];
         self.clamper.clamp_input(&mut input);

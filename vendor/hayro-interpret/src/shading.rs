@@ -31,6 +31,14 @@ pub enum ShadingFunction {
 }
 
 impl ShadingFunction {
+    /// Embed build: how costly one evaluation is (see `Function::cost`).
+    pub fn cost(&self) -> u64 {
+        match self {
+            Self::Single(s) => s.cost(),
+            Self::Multiple(m) => m.iter().map(Function::cost).fold(0, u64::saturating_add),
+        }
+    }
+
     /// Evaluate the shading function.
     pub fn eval(&self, input: &Values) -> Option<Values> {
         match self {

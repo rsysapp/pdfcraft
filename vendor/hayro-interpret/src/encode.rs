@@ -40,9 +40,48 @@ impl EncodedShadingPattern {
     }
 }
 
+/// Embed build: the most triangles a mesh shading may be sampled from (a Coons or tensor patch
+/// is 722 triangles): more is refused before they are built.
+const MAX_MESH_TRIANGLES: u64 = 500_000;
+
 impl ShadingPattern {
     /// Encode the shading pattern.
     pub fn encode(&self) -> EncodedShadingPattern {
+        // Never `None` without an area: nothing is charged.
+        self.encode_with(None).unwrap_or_else(|| self.dummy())
+    }
+
+    /// Embed build: encode the shading for sampling inside `area` (device space) only, charging
+    /// the work and allocations of meshes (`crate::spend_work`) before doing them. `None` when
+    /// the work budget refuses them.
+    pub fn encode_within(&self, area: kurbo::Rect) -> Option<EncodedShadingPattern> {
+        self.encode_with(Some(area))
+    }
+
+    /// Embed build: the cost of one sample, in function evaluations' operators (see
+    /// `Function::cost`); 1 for a mesh without a function.
+    pub fn evaluation_cost(&self) -> u64 {
+        match self.shading.shading_type.as_ref() {
+            ShadingType::FunctionBased { function, .. } | ShadingType::RadialAxial { function, .. } => function.cost(),
+            ShadingType::TriangleMesh { function, .. }
+            | ShadingType::CoonsPatchMesh { function, .. }
+            | ShadingType::TensorProductPatchMesh { function, .. } => function.as_ref().map_or(1, ShadingFunction::cost),
+            ShadingType::Dummy => 1,
+        }
+    }
+
+    fn dummy(&self) -> EncodedShadingPattern {
+        EncodedShadingPattern {
+            color_space: self.shading.color_space.clone(),
+            background_color: AlphaColor::TRANSPARENT,
+            shading_type: EncodedShadingType::Dummy,
+            base_transform: Affine::IDENTITY,
+            opacity: self.opacity,
+            transfer_function: None,
+        }
+    }
+
+    fn encode_with(&self, area: Option<kurbo::Rect>) -> Option<EncodedShadingPattern> {
         let base_transform;
 
         let shading_type = match self.shading.shading_type.as_ref() {
@@ -73,7 +112,7 @@ impl ShadingPattern {
                 function,
             } => {
                 let full_transform = self.matrix;
-                let samples = sample_triangles(triangles, full_transform);
+                let samples = sample_triangles(triangles, full_transform, area)?;
 
                 base_transform = Affine::IDENTITY;
 
@@ -83,13 +122,17 @@ impl ShadingPattern {
                 }
             }
             ShadingType::CoonsPatchMesh { patches, function } => {
+                // Embed build: the triangles a patch mesh becomes are counted before being built.
+                if area.is_some() && !mesh_size_ok(patches.len().saturating_mul(PATCH_TRIANGLES)) {
+                    return None;
+                }
                 let mut triangles = vec![];
                 for patch in patches {
                     patch.to_triangles(&mut triangles);
                 }
 
                 let full_transform = self.matrix;
-                let samples = sample_triangles(&triangles, full_transform);
+                let samples = sample_triangles(&triangles, full_transform, area)?;
 
                 base_transform = Affine::IDENTITY;
 
@@ -99,13 +142,17 @@ impl ShadingPattern {
                 }
             }
             ShadingType::TensorProductPatchMesh { patches, function } => {
+                // Embed build: the triangles a patch mesh becomes are counted before being built.
+                if area.is_some() && !mesh_size_ok(patches.len().saturating_mul(PATCH_TRIANGLES)) {
+                    return None;
+                }
                 let mut triangles = vec![];
                 for patch in patches {
                     patch.to_triangles(&mut triangles);
                 }
 
                 let full_transform = self.matrix;
-                let samples = sample_triangles(&triangles, full_transform);
+                let samples = sample_triangles(&triangles, full_transform, area)?;
 
                 base_transform = Affine::IDENTITY;
 
@@ -130,15 +177,24 @@ impl ShadingPattern {
             .map(|b| color_space.to_rgba(b, 1.0, false))
             .unwrap_or(AlphaColor::TRANSPARENT);
 
-        EncodedShadingPattern {
+        Some(EncodedShadingPattern {
             color_space,
             background_color,
             shading_type,
             base_transform,
             opacity: self.opacity,
             transfer_function: self.transfer_function.clone(),
-        }
+        })
     }
+}
+
+/// Embed build: the triangles one patch becomes (`generate_patch_triangles`: a 20 × 20 grid).
+const PATCH_TRIANGLES: usize = 19 * 19 * 2;
+
+/// Embed build: whether a mesh of `triangles` may be built and sampled.
+fn mesh_size_ok(triangles: usize) -> bool {
+    let triangles = u64::try_from(triangles).unwrap_or(u64::MAX);
+    triangles <= MAX_MESH_TRIANGLES && crate::spend_work(triangles)
 }
 
 fn encode_axial_shading(
@@ -185,11 +241,39 @@ fn encode_axial_shading(
     )
 }
 
+/// Embed build: `area` (device space) limits the sampling to the pixels a texture of that area
+/// reads, so a triangle far larger than the page is not walked; the triangles, the pixels walked
+/// and the map's size are charged before anything is sampled. `None`: refused by the budget.
 fn sample_triangles(
     triangles: &[Triangle],
     transform: Affine,
-) -> FxHashMap<(u16, u16), ColorComponents> {
+    area: Option<kurbo::Rect>,
+) -> Option<FxHashMap<(u16, u16), ColorComponents>> {
     let mut map = FxHashMap::default();
+    // Pixel centres up to one pixel past the area are read.
+    let area = area.map(|a| a.inflate(1.0, 1.0));
+    let placed = |t: &Triangle| {
+        let p0 = transform * t.p0.point;
+        let p1 = transform * t.p1.point;
+        let p2 = transform * t.p2.point;
+        kurbo::Rect::from_points(p0, p1).union_pt(p2)
+    };
+    if let Some(area) = area {
+        if !mesh_size_ok(triangles.len()) {
+            return None;
+        }
+        let mut pixels = 0f64;
+        for t in triangles {
+            let covered = placed(t).intersect(area);
+            pixels += if covered.is_finite() { covered.area().max(0.0) } else { 0.0 };
+        }
+        // About 14 ns a pixel walked; a map entry takes up to about 128 bytes as the map grows
+        // (measured), one per pixel at most.
+        let entries = pixels.min(area.area().max(0.0));
+        if !crate::spend_allocation((entries * 128.0).min(u64::MAX as f64) as u64) || !crate::spend_work((pixels / 32.0).min(u64::MAX as f64) as u64) {
+            return None;
+        }
+    }
 
     for t in triangles {
         let t = {
@@ -207,7 +291,13 @@ fn sample_triangles(
             Triangle::new(v0, v1, v2)
         };
 
-        let bbox = t.bounding_box();
+        let bbox = match area {
+            Some(area) => t.bounding_box().intersect(area),
+            None => t.bounding_box(),
+        };
+        if !(bbox.width() > 0.0 && bbox.height() > 0.0) {
+            continue;
+        }
 
         for y in (bbox.y0.floor() as u16)..(bbox.y1.ceil() as u16) {
             for x in (bbox.x0.floor() as u16)..(bbox.x1.ceil() as u16) {
@@ -219,7 +309,7 @@ fn sample_triangles(
         }
     }
 
-    map
+    Some(map)
 }
 
 fn encode_function_shading(domain: &[f32; 4], function: &ShadingFunction) -> EncodedShadingType {
