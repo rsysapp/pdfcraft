@@ -376,6 +376,52 @@ fn an_object_the_edited_file_brings_must_declare_its_length() {
     assert!(message.contains("stream 6 0 R does not have the length it declares"), "{message}");
 }
 
+/// `base` with a cross-reference section appended that lists object `num` at `offset`, and
+/// nothing else: no object is written.
+fn repointed(base: &[u8], num: u32, offset: usize) -> Vec<u8> {
+    let at = base.windows(9).rposition(|w| w == b"startxref").unwrap();
+    let prev: usize = std::str::from_utf8(&base[at + 9..]).unwrap().split_whitespace().next().unwrap().parse().unwrap();
+    let mut out = base.to_vec();
+    let xref = out.len();
+    out.extend_from_slice(format!("xref\n0 1\n0000000000 65535 f \n{num} 1\n{offset:010} 00000 n \n").as_bytes());
+    out.extend_from_slice(format!("trailer\n<< /Size 7 /Root 1 0 R /Prev {prev} >>\nstartxref\n{xref}\n%%EOF\n").as_bytes());
+    out
+}
+
+/// Where `N 0 obj` first starts in `file`.
+fn object_offset(file: &[u8], num: u32) -> usize {
+    let header = format!("\n{num} 0 obj\n");
+    file.windows(header.len()).position(|w| w == header.as_bytes()).unwrap() + 1
+}
+
+#[test]
+fn an_update_pointing_an_object_back_at_an_older_misdeclared_copy_is_refused() {
+    // R6b-35, the reviewer's C1 (`n2_resurrected_base_bytes`). The base has two revisions: in
+    // the first, the content (object 4) declares 7 bytes though its data runs on to `endstream`
+    // through `% endobj` and a clause; the second writes it again with its exact length. The
+    // edited file appends one table, and nothing else, that points object 4 back at the first
+    // copy: still in the base's bytes, but not an object of the base revision (the base never
+    // read it). PDFium ends that data at `endobj` and drops the clause; on e91797d this was
+    // reported as unchanged.
+    let data = [text("Alpha"), b"\nBT /F1 12 Tf 150 20 Td (X) Tj ET\n% endobj\nBT /F1 12 Tf 20 100 Td (Seller is liable) Tj ET".to_vec()].concat();
+    let first = page_declaring(7, &data);
+    let mut exact = format!("<< /Length {} >>\nstream\n", data.len()).into_bytes();
+    exact.extend_from_slice(&data);
+    exact.extend_from_slice(b"\nendstream");
+    let base = appended(&first, 4, &String::from_utf8(exact).unwrap());
+    assert!(inspect(&base, &base, InspectLimits::default()).is_ok_and(|inspection| inspection.content == ContentChanges::default()));
+    let resurrected = repointed(&base, 4, object_offset(&first, 4));
+    let message = refused_against(&base, &resurrected);
+    assert!(message.contains("stream 4 0 R does not have the length it declares"), "{message}");
+    // A base whose own newest revision has the misdeclared object: an update that lists it again
+    // at the offset the base names for it keeps the base's own object, and is read as before.
+    let short = length_short_of_endstream();
+    let kept = repointed(&short, 4, object_offset(&short, 4));
+    let inspection = inspect(&short, &kept, InspectLimits::default()).unwrap();
+    assert!(inspection.base_kept, "{inspection:?}");
+    assert_eq!((inspection.text, inspection.content), (TextChanges::default(), ContentChanges::default()), "{inspection:?}");
+}
+
 #[test]
 fn the_editor_writes_every_length_exactly() {
     // A base whose content declares a short length: the editor's appended update keeps it, and

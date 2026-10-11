@@ -37,9 +37,10 @@
 //!   difference is an error; so is a content stream hayro interprets (a form, a pattern's cell, a
 //!   Type 3 glyph procedure) that it decoded to other data than `pdfcraft_cos` does; a stream
 //!   whose `/Length` is not its data's length is read only in an object of the base revision
-//!   (the base itself, or the base's bytes an appended update keeps; never an object a rewrite
-//!   or an update writes, since the editor's writer declares every length exactly) and only
-//!   where hayro read the same data;
+//!   (in the base itself; in an appended update, an object the base read, at the offset the
+//!   base revision's cross-reference data names for it; never an object a rewrite or an update
+//!   writes or points elsewhere, since the editor's writer declares every length exactly) and
+//!   only where hayro read the same data;
 //! - streams are compared by their decoded data only where hayro decoded them and the readers
 //!   agree, everywhere else by their encoded bytes and encoding (see `structure`);
 //! - an appended update must leave every base page's content and resources as they were (edit
@@ -634,14 +635,15 @@ fn read_side(bytes: &[u8], against: Option<(&[u8], &Structure, bool)>, placement
         budget.glyphs(content.glyphs.len().saturating_add(content.glyphs.chars.len()))?;
         contents.push((content, structure::sha256(&[&page_data])));
     }
-    // The bytes this file keeps of the base: a /Length that disagrees with `endstream` is
-    // tolerated only in the base's own objects (R6b-30).
-    let kept_until = match against {
-        None => usize::MAX,
-        Some((base_bytes, _, true)) => base_bytes.len(),
-        Some((_, _, false)) => 0,
+    // A /Length that disagrees with `endstream` is tolerated only in the base's own objects:
+    // those the base read, at the offsets the base revision names for them, in the bytes this
+    // file keeps of the base (R6b-30, R6b-35).
+    let tolerated = match against {
+        None => structure::Tolerated::Base,
+        Some((base_bytes, base, true)) => structure::Tolerated::Kept { kept_until: base_bytes.len(), objects: base.misdeclared.clone() },
+        Some((_, _, false)) => structure::Tolerated::Kept { kept_until: 0, objects: BTreeSet::new() },
     };
-    let (structure, mut known) = structure::read(&doc, budget, Arc::new(decoded), sections, kept_until)?;
+    let (structure, mut known) = structure::read(&doc, budget, Arc::new(decoded), sections, tolerated)?;
     if let Some((base_bytes, base, base_kept)) = against {
         structure::check_chain(&structure.sections, base_bytes.len(), &base.sections, base_kept)?;
     }
@@ -734,6 +736,7 @@ fn read_side(bytes: &[u8], against: Option<(&[u8], &Structure, bool)>, placement
     if let Some(stream) = known.unconfirmed_length() {
         return Err(Fail::Read(format!("stream {stream} does not have the length it declares")));
     }
+    side.structure.misdeclared = known.misdeclared_at(&doc);
     if placements {
         structure::retain_shared_forms(&mut side.structure.pages);
     }

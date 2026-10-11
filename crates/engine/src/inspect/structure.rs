@@ -362,6 +362,10 @@ pub(crate) struct Structure {
     pub named_destinations: BTreeMap<NamedKey, Destination>,
     /// Cross-reference sections, oldest first.
     pub sections: Vec<Section>,
+    /// The stream objects read whose `/Length` is not their data's (both readers read the same
+    /// data), each with the offset the cross-reference data names for it: in the base, the only
+    /// objects an appended update may keep with such a length (see [`Tolerated`]).
+    pub misdeclared: BTreeSet<(ObjRef, u64)>,
 }
 
 /// The fingerprint pages are matched by: content, resources, images and text.
@@ -536,12 +540,24 @@ struct Reader<'d, 'b> {
     decoded: HashMap<ObjRef, Digest>,
     /// Streams whose `/Length` is not the length of their data (`pdfcraft_cos` found their end at
     /// `endstream`): certain only where hayro read the same data (see [`Known::agree`]), and
-    /// tolerated only in objects of the base revision (see `kept_until`).
+    /// tolerated only in objects of the base revision (see [`Tolerated`]).
     misdeclared: BTreeSet<ObjRef>,
-    /// How many bytes at the start of this file are the base's own: an object that lies wholly
-    /// within them is byte for byte the base's object at the same offset (the base itself: all
-    /// of it; an appended update: the base's length; a rewrite: none).
-    kept_until: usize,
+    tolerated: Arc<Tolerated>,
+}
+
+/// Which stream objects may declare a `/Length` other than their data's (R6b-30, R6b-35).
+#[derive(Debug)]
+pub(crate) enum Tolerated {
+    /// Any: this file is the base, and every object it reads is at the offset its own
+    /// cross-reference data names for it (an object of the base revision).
+    Base,
+    /// Only the base's own objects that the base read with a misdeclared length, each at the
+    /// offset the base revision's cross-reference data names for it and lying wholly within the
+    /// first `kept_until` bytes, which are the base's (an appended update keeps them; a rewrite
+    /// keeps none). An update that points an object at any other offset (an older copy still in
+    /// the base's bytes, which the base revision never read) brings a new object, and the
+    /// editor's writer declares every length exactly.
+    Kept { kept_until: usize, objects: BTreeSet<(ObjRef, u64)> },
 }
 
 /// How far after a stream's data its `endobj` is looked for, to say where the object ends.
@@ -689,7 +705,7 @@ impl<'d, 'b> Reader<'d, 'b> {
                     // object of the base revision. Other readers end such data elsewhere (at
                     // the first `endobj`, say), and the editor's writer always writes the exact
                     // length: an object the edited file brings must declare its length (R6b-30).
-                    if !self.of_the_base(data_start.saturating_add(stream.raw.len())) {
+                    if !self.of_the_base(r, offset, data_start.saturating_add(stream.raw.len())) {
                         return Err(read_error(format!("stream {r} does not have the length it declares, and is not the base's own object")));
                     }
                     self.misdeclared.insert(r);
@@ -718,13 +734,18 @@ impl<'d, 'b> Reader<'d, 'b> {
         }
     }
 
-    /// Whether the stream object whose data ends at `data_end` lies wholly within the bytes this
-    /// file keeps of the base (see `kept_until`), through its `endobj`. An object whose end is
-    /// not found nearby is not.
-    fn of_the_base(&self, data_end: usize) -> bool {
+    /// Whether stream object `r`, read at `offset` with its data ending at `data_end`, is an
+    /// object of the base revision (see [`Tolerated`]): in the base, any; in the edited file,
+    /// only one the base read at that same offset, lying wholly (through its `endobj`) within
+    /// the bytes this file keeps of the base. An object whose end is not found nearby is not.
+    fn of_the_base(&self, r: ObjRef, offset: u64, data_end: usize) -> bool {
+        let Tolerated::Kept { kept_until, objects } = &*self.tolerated else { return true };
+        if !objects.contains(&(r, offset)) {
+            return false;
+        }
         let window = self.data.get(data_end..data_end.saturating_add(OBJECT_END_SEARCH).min(self.data.len())).unwrap_or_default();
         let Some(at) = window.windows(6).position(|w| w == b"endobj") else { return false };
-        data_end.saturating_add(at).saturating_add(6) <= self.kept_until
+        data_end.saturating_add(at).saturating_add(6) <= *kept_until
     }
 
     /// The object numbers an object stream holds, in order (decoded strictly).
@@ -2250,8 +2271,8 @@ pub(crate) struct Known {
     hayro_decoded: Arc<HashMap<ObjRef, Digest>>,
     /// Streams whose `/Length` is not their data's (see `Reader::misdeclared`).
     misdeclared: BTreeSet<ObjRef>,
-    /// See `Reader::kept_until`.
-    kept_until: usize,
+    /// See [`Tolerated`].
+    tolerated: Arc<Tolerated>,
     /// Streams whose data hayro read as the same bytes.
     agreed: BTreeSet<ObjRef>,
     /// The document's default layer configuration (`None`: no `/OCProperties`).
@@ -2388,6 +2409,18 @@ impl Known {
     /// same data (`None`: there is none): what its data is depends on the reader.
     pub fn unconfirmed_length(&self) -> Option<ObjRef> {
         self.misdeclared.difference(&self.agreed).next().copied()
+    }
+
+    /// The streams read whose `/Length` is not their data's, each with the offset it was read
+    /// from (see [`Structure::misdeclared`]).
+    pub fn misdeclared_at(&self, doc: &Document) -> BTreeSet<(ObjRef, u64)> {
+        self.misdeclared
+            .iter()
+            .filter_map(|r| match doc.xref_entry(r.num) {
+                Some(XrefEntry::InFile { offset, generation }) if generation == r.generation => Some((*r, offset)),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Check that `pdfcraft_cos` decodes every content stream hayro decoded to interpret it (see
@@ -2592,7 +2625,7 @@ impl Known {
             hayro_decoded: self.hayro_decoded.clone(),
             decoded: std::mem::take(&mut self.decoded),
             misdeclared: std::mem::take(&mut self.misdeclared),
-            kept_until: self.kept_until,
+            tolerated: self.tolerated.clone(),
         }
     }
 
@@ -2726,8 +2759,9 @@ pub(crate) fn read(
     budget: &mut Budget,
     hayro_decoded: Arc<HashMap<ObjRef, Digest>>,
     sections: Vec<Section>,
-    kept_until: usize,
+    tolerated: Tolerated,
 ) -> Result<(Structure, Known), Fail> {
+    let tolerated = Arc::new(tolerated);
     let data = doc.bytes().as_slice();
     let mut reader = Reader {
         doc,
@@ -2746,7 +2780,7 @@ pub(crate) fn read(
         hayro_decoded: hayro_decoded.clone(),
         decoded: HashMap::new(),
         misdeclared: BTreeSet::new(),
-        kept_until,
+        tolerated: tolerated.clone(),
     };
     let Some(root) = doc.root() else { return Err(read_error("the trailer's /Root is not a reference")) };
     let catalog = reader.get(root)?.as_dict().cloned().ok_or_else(|| read_error("the catalog is not a dictionary"))?;
@@ -2790,10 +2824,24 @@ pub(crate) fn read(
         decoded: reader.decoded,
         hayro_decoded,
         misdeclared: reader.misdeclared,
-        kept_until,
+        tolerated,
         agreed: BTreeSet::new(),
         layer_config,
         marks: HashMap::new(),
     };
-    Ok((Structure { pages, fields, form, catalog: entries, layers, outline, outline_root, named_destinations, sections }, known))
+    Ok((
+        Structure {
+            pages,
+            fields,
+            form,
+            catalog: entries,
+            layers,
+            outline,
+            outline_root,
+            named_destinations,
+            sections,
+            misdeclared: BTreeSet::new(),
+        },
+        known,
+    ))
 }

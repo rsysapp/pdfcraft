@@ -589,7 +589,7 @@ fn every_object_read_parses_alike_in_both_readers() {
     let doc = pdfcraft_cos::Document::open(Arc::new(edited.clone())).unwrap();
     let mut budget = Budget::new(Limits::default());
     let sections = structure::sections(&doc).unwrap();
-    let (_, known) = structure::read(&doc, &mut budget, Arc::new(std::collections::HashMap::new()), sections, usize::MAX).unwrap();
+    let (_, known) = structure::read(&doc, &mut budget, Arc::new(std::collections::HashMap::new()), sections, structure::Tolerated::Base).unwrap();
     let hayro = pdfcraft_render::content::ContentDocument::open(Arc::new(edited), u64::MAX).unwrap();
     let read = known.objects_read(&doc);
     let mut shapes = hayro.object_shapes(&read);
