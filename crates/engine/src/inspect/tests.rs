@@ -1319,3 +1319,92 @@ fn a_jpeg_re_encoded_by_the_redactor_is_accepted_within_bounds() {
     let inspection = run(&base, &redact((80, 160), (160, 240), 80, Some((304, 456)))).unwrap();
     assert_eq!(inspection.content.pages_changed_outside_redactions, 1, "{inspection:?}");
 }
+
+// ── encryption, in any revision and any variant, is refused ──────────────────────────────────
+
+/// The fixture encrypted with `algorithm`, `user` as the user password, metadata encrypted or not.
+fn encrypted_as(algorithm: pdfcraft_cos::Algorithm, user: &str, encrypt_metadata: bool) -> Vec<u8> {
+    let mut document = pdfcraft_cos::Document::open(Arc::new(fixture(1))).unwrap();
+    document
+        .set_encryption(&pdfcraft_cos::NewEncryption {
+            algorithm,
+            user_password: user,
+            owner_password: "owner",
+            permissions: -1,
+            encrypt_metadata,
+            seed: [7; 32],
+        })
+        .unwrap();
+    pdfcraft_cos::write_full(&document, &Default::default()).unwrap()
+}
+
+/// `file` with its trailer's `/Encrypt` value replaced by `encrypt` (a direct dictionary).
+fn with_encrypt(file: &[u8], encrypt: &str) -> Vec<u8> {
+    let text = String::from_utf8_lossy(file).into_owned();
+    let at = text.rfind("trailer").unwrap();
+    let (head, tail) = text.split_at(at);
+    let tail = tail.replacen("/Root 1 0 R", &format!("/Root 1 0 R /Encrypt {encrypt}"), 1);
+    format!("{head}{tail}").into_bytes()
+}
+
+#[test]
+fn every_kind_of_encryption_is_refused_in_either_file() {
+    use pdfcraft_cos::Algorithm::{Aes128, Aes256, Rc4_40, Rc4_128};
+    let plain = fixture(1);
+    let mut cases: Vec<(String, Vec<u8>)> = Vec::new();
+    for algorithm in [Rc4_40, Rc4_128, Aes128, Aes256] {
+        for (user, metadata) in [("", true), ("", false), ("pw", true)] {
+            cases.push((format!("{algorithm:?}, user password {user:?}, metadata encrypted {metadata}"), encrypted_as(algorithm, user, metadata)));
+        }
+    }
+    // Crypt filters other readers apply differently, declared on a file whose objects are not
+    // encrypted: streams and strings by the identity filter, or one by the other.
+    let standard = "/Filter /Standard /V 4 /R 4 /Length 128 /P -4 /O <00> /U <00> /CF << /StdCF << /CFM /AESV2 /AuthEvent /DocOpen >> >>";
+    for (case, filters) in [
+        ("/StmF and /StrF /Identity", "/StmF /Identity /StrF /Identity"),
+        ("streams encrypted, strings /Identity", "/StmF /StdCF /StrF /Identity"),
+        ("strings encrypted, streams /Identity", "/StmF /Identity /StrF /StdCF"),
+        ("metadata not encrypted", "/StmF /StdCF /StrF /StdCF /EncryptMetadata false"),
+    ] {
+        cases.push((case.into(), with_encrypt(&plain, &format!("<< {standard} {filters} >>"))));
+    }
+    // Encryption only in an earlier revision: an update whose trailer drops /Encrypt leaves the
+    // older objects encrypted to a reader that looks, and not to one that reads the newest trailer.
+    let older = encrypted_as(Aes128, "", true);
+    let dropped = {
+        let prev = startxref(&older);
+        // Opened with the empty user password, for the trailer's /Size and /Root.
+        let opened = pdfcraft_cos::Document::open(Arc::new(older.clone())).unwrap();
+        let size = opened.trailer().int(b"Size").unwrap();
+        let root = opened.root().unwrap();
+        let root = format!("{} {}", root.num, root.generation);
+        update_with(&older, &[], |_, _| format!("/Size {size} /Root {root} R /Prev {prev}"))
+    };
+    cases.push(("encryption only in an earlier revision".into(), dropped));
+    // The same with objects that are not encrypted, so that the newest trailer reads them: only
+    // the earlier revision's trailer says /Encrypt.
+    let declared =
+        update_with(&plain, &[], |_, prev| format!("/Size 6 /Root 1 0 R /Prev {prev} /Encrypt << {standard} /StmF /Identity /StrF /Identity >>"));
+    let undeclared = update_with(&declared, &[], |_, prev| format!("/Size 6 /Root 1 0 R /Prev {prev}"));
+    assert!(pdfcraft_cos::Document::open(Arc::new(undeclared.clone())).is_ok_and(|doc| doc.security().is_none()));
+    cases.push(("/Encrypt in an earlier trailer only".into(), undeclared));
+    for (case, file) in cases {
+        assert_eq!(run(&plain, &file), Err(InspectError::Encrypted), "{case}");
+        assert!(matches!(run(&file, &plain), Err(InspectError::Base(_))), "{case}, as the base");
+    }
+}
+
+#[test]
+fn a_crypt_filter_on_a_stream_of_a_file_without_encryption_is_refused() {
+    // `/Crypt` with the identity filter: nothing to apply without encryption, and readers apply
+    // it (or refuse it) differently.
+    let base = pages_pdf(&[page(&text_line(20.0, 150.0, "Alpha"))], &[]);
+    let crypted = pdf(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [4 0 R] /Count 1 /MediaBox [0 0 200 300] >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /Contents 5 0 R /Resources << /Font << /F1 3 0 R >> >> >>".to_vec(),
+        stream("/Filter /Crypt /DecodeParms << /Type /CryptFilterDecodeParms /Name /Identity >>", text_line(20.0, 150.0, "Alpha").as_bytes()),
+    ]);
+    assert!(matches!(run(&base, &crypted), Err(InspectError::Edited(_))), "{:?}", run(&base, &crypted));
+}

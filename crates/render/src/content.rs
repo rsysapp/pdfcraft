@@ -28,7 +28,7 @@ use hayro::hayro_interpret::{
     SoftMask, TransformExt, interpret_page, work_spent,
 };
 use hayro::hayro_syntax::budget::{decode_budget_exceeded, decode_spent, set_decode_budget};
-use hayro::hayro_syntax::object::{Array, Dict, ObjectIdentifier};
+use hayro::hayro_syntax::object::{Array, Dict, Object, ObjectIdentifier};
 use hayro::hayro_syntax::resolved;
 use hayro::hayro_syntax::{LoadPdfError, Pdf};
 use hayro::vello_cpu::color::palette::css::WHITE;
@@ -466,6 +466,8 @@ impl ContentDocument {
             render_annotations: false,
             // Every layer: content a viewer hides by default is still content.
             all_layers_visible: true,
+            // Text that only clips is text too: other readers extract it.
+            report_clip_glyphs: true,
             work_budget,
             warning_sink: Arc::new(move |warning| {
                 let counter = if matches!(warning, InterpreterWarning::WorkBudgetExceeded) { &budget_counter } else { &counter };
@@ -480,6 +482,31 @@ impl ContentDocument {
     /// [`Resolved`]).
     pub fn opened(&self) -> &Resolved {
         &self.opened
+    }
+
+    /// Read each of `objects` (number, generation) through hayro's cross-reference data, as it
+    /// reads an object a reference names, logging where it found each (see [`Resolved`]): for a
+    /// caller that checks every object another reader read is one hayro reads at the same place,
+    /// with the same data. Also returns the objects hayro does not read at all.
+    pub fn read_objects(&self, objects: &[(u32, u16)]) -> (Resolved, Vec<(u32, u16)>) {
+        resolved::open_log();
+        let unread = catch_unwind(AssertUnwindSafe(|| {
+            let xref = self.pdf.xref();
+            objects
+                .iter()
+                .copied()
+                .filter(|(num, generation)| match i32::try_from(*num) {
+                    Ok(num) => xref.get::<Object<'_>>(ObjectIdentifier::new(num, i32::from(*generation))).is_none(),
+                    Err(_) => true,
+                })
+                .collect::<Vec<_>>()
+        }));
+        let read = Resolved::from_log(resolved::close_log());
+        match unread {
+            Ok(unread) => (read, unread),
+            // A panic reads nothing for certain.
+            Err(_) => (Resolved { conflicts: 1, ..read }, objects.to_vec()),
+        }
     }
 
     pub fn page_count(&self) -> usize {

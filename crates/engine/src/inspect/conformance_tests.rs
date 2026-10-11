@@ -867,3 +867,101 @@ fn outline_titles_entries_and_other_changes() {
     );
     assert!(edited_error(run(&base, &added_link)).contains("added outline entry"));
 }
+
+// ── follow-up: what other viewers may show otherwise than hayro ─────────────────────────────
+
+#[test]
+fn text_that_only_clips_is_text() {
+    // Rendering mode 7 draws nothing and adds the glyphs to the clip; other readers extract the
+    // text all the same.
+    let clipped = |word: &str| format!("BT 7 Tr /F1 12 Tf 20 200 Td ({word}) Tj ET");
+    let base = page_file("", "", &format!("{}\n{WORD}", text(20, 150, "Alpha")), "", &[]);
+    let added = page_file("", "", &format!("{}\n{WORD_BOX}\n{}", text(20, 150, "Alpha"), clipped("Secret")), "", &[]);
+    let inspection = run(&base, &added).unwrap();
+    assert_eq!(inspection.text.pages_with_text_added, 1, "{inspection:?}");
+    // Removed where no box is: a change outside the redactions, though no pixel changed.
+    let base = page_file("", "", &format!("{}\n{}\n{WORD}", text(20, 150, "Alpha"), clipped("Hidden")), "", &[]);
+    let removed = page_file("", "", &format!("{}\n{WORD_BOX}", text(20, 150, "Alpha")), "", &[]);
+    let inspection = run(&base, &removed).unwrap();
+    assert_eq!(inspection.text.pages_with_text_removed, 1, "{inspection:?}");
+    assert_eq!(inspection.content.pages_changed_outside_redactions, 1, "{inspection:?}");
+    assert_eq!(run(&base, &base).unwrap().text, TextChanges::default());
+}
+
+#[test]
+fn a_redaction_on_a_page_drawn_with_what_viewers_render_differently_is_outside_the_redactions() {
+    let redacted = |state: &str, objects: &[Vec<u8>], word: &str| {
+        page_file(
+            "",
+            "",
+            &format!("q /GS1 gs 0.5 g 20 200 50 50 re f Q\n{}\n{word}", text(20, 150, "Alpha")),
+            &format!("/ExtGState << /GS1 {state} >>"),
+            objects,
+        )
+    };
+    let function = b"<< /FunctionType 2 /Domain [0 1] /C0 [1] /C1 [1] /N 1 >>".to_vec();
+    for (case, state, objects) in [
+        ("a blend mode", "<< /BM /Multiply >>", vec![]),
+        ("a blend mode in an array", "<< /BM [/Screen /Normal] >>", vec![]),
+        ("a transfer function", "<< /TR 5 0 R >>", vec![function.clone()]),
+        ("a transfer function, TR2", "<< /TR2 5 0 R >>", vec![function.clone()]),
+    ] {
+        let base = redacted(state, &objects, WORD);
+        assert_eq!(run(&base, &base).unwrap().content, ContentChanges::default(), "{case}");
+        let inspection = run(&base, &redacted(state, &objects, WORD_BOX)).unwrap();
+        assert_eq!(inspection.content.pages_changed_outside_redactions, 1, "{case}: {inspection:?}");
+    }
+    // What every viewer draws alike is no risk: the same redaction is accepted.
+    for (case, state) in [("/Normal", "<< /BM /Normal >>"), ("/Compatible", "<< /BM /Compatible >>"), ("identity transfer", "<< /TR /Identity >>")] {
+        let base = redacted(state, &[], WORD);
+        let inspection = run(&base, &redacted(state, &[], WORD_BOX)).unwrap();
+        assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{case}: {inspection:?}");
+        assert_eq!(inspection.redaction_areas.len(), 1, "{case}");
+    }
+    // A knockout group, drawn by a form.
+    let knockout = |word: &str| {
+        page_file(
+            "",
+            "",
+            &format!("/Fm Do\n{}\n{word}", text(20, 150, "Alpha")),
+            "/XObject << /Fm 5 0 R >>",
+            &[stream("/Type /XObject /Subtype /Form /BBox [0 0 200 300] /Group << /S /Transparency /K true >>", b"0.5 g 20 200 50 50 re f")],
+        )
+    };
+    let inspection = run(&knockout(WORD), &knockout(WORD_BOX)).unwrap();
+    assert_eq!(inspection.content.pages_changed_outside_redactions, 1, "a knockout group: {inspection:?}");
+}
+
+#[test]
+fn annotation_flags_states_and_layers_are_reported() {
+    let annotated = |extra: &str| {
+        page_file(
+            "/OCProperties << /OCGs [7 0 R] /D << >> >>",
+            "/Annots [5 0 R]",
+            &text(20, 150, "Alpha"),
+            "",
+            &[
+                format!("<< /Type /Annot /Subtype /Square /Rect [20 200 80 260] /AP << /N 6 0 R {extra} >> >>").into_bytes(),
+                appearance_stream("", SQUARE.as_bytes()),
+                b"<< /Type /OCG /Name (Layer) >>".to_vec(),
+            ],
+        )
+    };
+    let base = annotated("");
+    let square = |entries: &str| format!("<< /Type /Annot /Subtype /Square /Rect [20 200 80 260] /AP << /N 6 0 R >> {entries} >>").into_bytes();
+    for (case, entries) in [("hidden", "/F 2"), ("not viewed", "/F 32"), ("not printed", "/F 0"), ("in a layer", "/OC 7 0 R")] {
+        let edited = update_objects(&base, &[(5, square(entries))], 8);
+        assert_eq!(run(&base, &edited).unwrap().annotations.changed, 1, "{case}");
+    }
+    for (case, states) in [("a down appearance", "/D 6 0 R"), ("a rollover appearance", "/R 6 0 R")] {
+        let edited = update_objects(
+            &base,
+            &[(5, format!("<< /Type /Annot /Subtype /Square /Rect [20 200 80 260] /AP << /N 6 0 R {states} >> >>").into_bytes())],
+            8,
+        );
+        assert_eq!(run(&base, &edited).unwrap().annotations.changed, 1, "{case}");
+    }
+    // In a rewrite, the annotation with an appearance state added is another annotation.
+    let inspection = run(&base, &annotated("/D 6 0 R")).unwrap();
+    assert_eq!((inspection.annotations.removed, inspection.annotations.drawings), (1, 1), "{inspection:?}");
+}

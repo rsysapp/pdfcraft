@@ -193,7 +193,10 @@ pub struct ContentChanges {
     /// - an annotation whose appearance alone changed (by its encoded data: no second reader
     ///   decodes it), unless its `/Rect`, before and after, lies wholly under the boxes;
     /// - every page, when the document's layer configuration (`/OCProperties`) changed: which
-    ///   layers a viewer shows by default is not a redaction.
+    ///   layers a viewer shows by default is not a redaction;
+    /// - a page drawn with something hayro may render otherwise than other viewers (a blend mode
+    ///   other than `/Normal`, a transfer function, a knockout group), so that a change hayro's
+    ///   pixels do not show may show in another viewer.
     pub pages_changed_outside_redactions: u32,
 }
 
@@ -512,6 +515,9 @@ fn read_side(bytes: &[u8], against: Option<(&[u8], &Structure, bool)>, placement
     let doc = match catch_unwind(AssertUnwindSafe(|| Document::open(shared.clone()))) {
         Ok(Ok(doc)) => doc,
         Ok(Err(CosError::NeedsPassword | CosError::WrongPassword | CosError::Security(_))) => return Err(Fail::Encrypted),
+        // A file that names an encryption dictionary anywhere (an earlier revision's, which the
+        // newest trailer dropped) is refused as encrypted: that is likely why it cannot be read.
+        Ok(Err(_)) | Err(_) if names_encryption(bytes) => return Err(Fail::Encrypted),
         Ok(Err(error)) => return Err(Fail::Read(error.to_string())),
         Err(_) => return Err(Fail::Read("the file could not be parsed".into())),
     };
@@ -520,6 +526,14 @@ fn read_side(bytes: &[u8], against: Option<(&[u8], &Structure, bool)>, placement
     }
     if let Some(repair) = doc.repair_log().first() {
         return Err(Fail::Read(format!("the file is damaged: {repair}")));
+    }
+    // Encryption in any revision, whatever the newest trailer says: the readers apply security
+    // handlers, crypt filters (`/StmF`, `/StrF`, `/Identity`), `/EncryptMetadata` and the empty
+    // password each their own way, and an update dropping `/Encrypt` leaves the older objects
+    // encrypted for one reader and not for the other. No encrypted file is compared.
+    let sections = structure::sections(&doc)?;
+    if sections.iter().any(|section| section.encrypted) {
+        return Err(Fail::Encrypted);
     }
     let hayro = match ContentDocument::open(shared.clone(), budget.limits.page_work) {
         Ok(hayro) => hayro,
@@ -552,7 +566,7 @@ fn read_side(bytes: &[u8], against: Option<(&[u8], &Structure, bool)>, placement
         budget.glyphs(content.glyphs.len().saturating_add(content.glyphs.chars.len()))?;
         contents.push((content, structure::sha256(&[&page_data])));
     }
-    let (structure, mut known) = structure::read(&doc, budget, Arc::new(decoded))?;
+    let (structure, mut known) = structure::read(&doc, budget, Arc::new(decoded), sections)?;
     if let Some((base_bytes, base, base_kept)) = against {
         structure::check_chain(&structure.sections, base_bytes.len(), &base.sections, base_kept)?;
     }
@@ -596,6 +610,20 @@ fn read_side(bytes: &[u8], against: Option<(&[u8], &Structure, bool)>, placement
         page.glyphs = Glyphs { page: content.glyphs, unnamed };
         page.fingerprint = structure::fingerprint(page);
     }
+    // Every object `pdfcraft_cos` read (pages, resources, annotations, form fields, the outline,
+    // the catalog's entries, …) is one hayro reads at the same place, with the same data: no
+    // object any fact rests on is identified by one reader alone.
+    let read = known.objects_read(&doc);
+    for _ in &read {
+        budget.object()?;
+    }
+    let (resolved, unread) = side.hayro.read_objects(&read);
+    if let Some((num, generation)) =
+        unread.into_iter().find(|(num, _)| doc.try_get(*num).is_ok_and(|object| !matches!(*object, pdfcraft_cos::Object::Null)))
+    {
+        return Err(Fail::Read(format!("readers disagree: hayro cannot read object {num} {generation} R")));
+    }
+    known.agree(&doc, budget, &resolved)?;
     // Every content stream hayro decoded is one `pdfcraft_cos` decodes alike, and every stream
     // whose /Length is wrong one hayro read as the same data.
     known.agree_decoded(&doc, budget)?;
@@ -610,6 +638,15 @@ fn read_side(bytes: &[u8], against: Option<(&[u8], &Structure, bool)>, placement
         return Err(Fail::Read("the file's cross-reference data is damaged".into()));
     }
     Ok(side)
+}
+
+/// Whether `bytes` hold the name `/Encrypt` (not `/EncryptMetadata`).
+fn names_encryption(bytes: &[u8]) -> bool {
+    let name = b"/Encrypt";
+    bytes
+        .windows(name.len())
+        .enumerate()
+        .any(|(at, window)| window == name && bytes.get(at.saturating_add(name.len())).is_none_or(|next| !next.is_ascii_alphanumeric()))
 }
 
 fn content_failure(error: ContentError) -> Fail {
@@ -846,7 +883,10 @@ fn compare_pages(
                 || b.type3 != e.type3
                 || !appearances_under(b, e, &mut areas, budget).map_err(|fail| fail.of(Role::Edited))?
                 // Which layers show by default changed: not a redaction, whatever the boxes.
-                || layers_changed;
+                || layers_changed
+                // Changed, and drawn with something other viewers may show otherwise than
+                // hayro's pixels.
+                || (drawn_differently && e.render_risk.is_some());
             if outside {
                 counts.outside_redactions += 1;
             } else {

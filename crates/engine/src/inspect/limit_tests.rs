@@ -171,3 +171,68 @@ fn two_thousand_small_pages_with_an_image_each_are_compared_within_the_bounds() 
     assert_eq!(inspection.content, ContentChanges::default());
     assert!(took < Duration::from_secs(60), "{took:?}");
 }
+
+/// A page drawing form `/Fm` (object 3) whose dictionary has `coding` and whose data is `data`,
+/// with `objects` from 4.
+fn coded_form(coding: &str, data: &[u8], objects: &[Vec<u8>]) -> Vec<u8> {
+    let mut all = vec![stream(&format!("/Type /XObject /Subtype /Form /BBox [0 0 200 300] {coding}"), data)];
+    all.extend(objects.iter().cloned());
+    file(&["/Fm Do"], "/XObject << /Fm 3 0 R >>", &all)
+}
+
+/// `data` under `layers` ASCIIHex layers, and the filter array that decodes it.
+fn hex_layers(data: &[u8], layers: usize) -> (Vec<u8>, String) {
+    let mut out = data.to_vec();
+    for _ in 0..layers {
+        let mut hex: Vec<u8> = out.iter().flat_map(|byte| format!("{byte:02X}").into_bytes()).collect();
+        hex.push(b'>');
+        out = hex;
+    }
+    (out, format!("[{}]", vec!["/ASCIIHexDecode"; layers].join(" ")))
+}
+
+#[test]
+fn a_filter_chain_longer_than_eight_is_too_complex() {
+    let content = b"0 g 10 10 20 20 re f";
+    let (data, chain) = hex_layers(content, 8);
+    let (result, _) = against_blank(&coded_form(&format!("/Filter {chain}"), &data, &[]));
+    assert!(result.is_ok(), "{result:?}");
+    let (data, chain) = hex_layers(content, 9);
+    let (result, took) = against_blank(&coded_form(&format!("/Filter {chain}"), &data, &[]));
+    assert_eq!(result, Err(InspectError::TooComplex));
+    assert!(took < Duration::from_secs(5), "{took:?}");
+    // The same chain given indirectly.
+    let (result, _) = against_blank(&coded_form("/Filter 4 0 R", &data, &[chain.into_bytes()]));
+    assert_eq!(result, Err(InspectError::TooComplex));
+}
+
+#[test]
+fn coding_entries_that_refer_back_are_refused_quickly() {
+    let content = b"0 g 10 10 20 20 re f";
+    for (case, coding, extra) in [
+        ("the stream itself", "/Filter 3 0 R", b"null".to_vec()),
+        ("an array naming itself", "/Filter 4 0 R", b"[4 0 R]".to_vec()),
+        ("parameters naming themselves", "/Filter /FlateDecode /DecodeParms 4 0 R", b"[4 0 R]".to_vec()),
+    ] {
+        let (result, took) = against_blank(&coded_form(coding, content, &[extra]));
+        assert!(matches!(result, Err(InspectError::Edited(_))), "{case}: {result:?}");
+        assert!(took < Duration::from_secs(5), "{case}: {took:?}");
+    }
+}
+
+#[test]
+fn a_chain_expanding_past_the_content_bound_is_too_complex() {
+    // 2 MiB of white space (content that draws nothing), compressed twice to a few kilobytes,
+    // under a 1 MiB bound for decoded content: every step of the chain counts.
+    let spaces = vec![b' '; 2 << 20];
+    let once = pdfcraft_cos::Stream::flate(pdfcraft_cos::Dict::new(), &spaces).raw;
+    let twice = pdfcraft_cos::Stream::flate(pdfcraft_cos::Dict::new(), &once).raw;
+    let edited = coded_form("/Filter [/FlateDecode /FlateDecode]", &twice, &[]);
+    let blank = file(&["0 g"], "", &[]);
+    let started = Instant::now();
+    let limits = Limits { deadline: Duration::from_secs(3_600), content_bytes: 1 << 20, ..Limits::default() };
+    assert_eq!(inspect_with(&blank, &edited, limits), Err(InspectError::TooComplex));
+    assert!(started.elapsed() < Duration::from_secs(5));
+    // Within the default bound it is read.
+    assert!(against_blank(&edited).0.is_ok());
+}

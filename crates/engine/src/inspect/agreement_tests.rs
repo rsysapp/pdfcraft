@@ -264,16 +264,17 @@ fn two_objects_with_one_number_in_one_revision_are_refused() {
     assert!(message.contains("readers disagree"), "{message}");
 }
 
-/// Like [`length_short_of_endstream`], with the short stream an annotation's appearance, which
-/// hayro does not read (annotations are compared, not drawn).
-fn appearance_short_of_endstream() -> Vec<u8> {
+/// A page with an annotation whose appearance (object 6) is `length` and `data`, then `endstream`:
+/// a stream hayro does not draw (annotations are compared, not drawn), but reads as it reads any
+/// object a reference names.
+fn appearance_with(length: usize, data: &[u8]) -> Vec<u8> {
     let mut b = Builder::new();
     head(&mut b);
     b.object(3, format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Annots [5 0 R] {RESOURCES} >>").as_bytes());
     b.object(4, &stream("", &text("Alpha")));
     b.object(5, b"<< /Type /Annot /Subtype /Square /Rect [20 200 80 260] /AP << /N 6 0 R >> >>");
-    let mut body = b"<< /Type /XObject /Subtype /Form /BBox [0 0 60 60] /Length 10 >>\nstream\n".to_vec();
-    body.extend_from_slice(b"0 0 1 RG 2 2 56 56 re S");
+    let mut body = format!("<< /Type /XObject /Subtype /Form /BBox [0 0 60 60] /Length {length} >>\nstream\n").into_bytes();
+    body.extend_from_slice(data);
     body.extend_from_slice(b"\nendstream");
     b.object(6, &body);
     let rows = b.offsets.clone();
@@ -295,10 +296,16 @@ fn a_stream_whose_length_disagrees_with_its_endstream_is_read_only_where_both_re
     assert_eq!(inspection.text, TextChanges::default(), "{inspection:?}");
     assert_eq!(inspection.content, ContentChanges::default(), "{inspection:?}");
     assert!(inspect(&length_short_of_endstream(), &length_short_of_endstream(), InspectLimits::default()).is_ok());
-    // A stream hayro does not read (an annotation's appearance) has no second reading to agree
-    // with: its data is what each reader makes of it.
-    let message = refused(&appearance_short_of_endstream());
-    assert!(message.contains("stream 6 0 R does not have the length it declares"), "{message}");
+    // An annotation's appearance, which hayro does not draw: it reads it all the same (every
+    // object `pdfcraft_cos` reads is one hayro reads), and finds the same data.
+    let square = b"0 0 1 RG 2 2 56 56 re S";
+    assert!(inspect(&sound(), &appearance_with(10, square), InspectLimits::default()).is_ok());
+    // The exact length and a comment before `endstream`: `pdfcraft_cos` takes the declared
+    // bytes, hayro everything up to `endstream`. They disagree, on a stream nothing draws.
+    let mut commented = square.to_vec();
+    commented.extend_from_slice(b"\n% 0 g 0 0 60 60 re f");
+    let message = refused(&appearance_with(square.len(), &commented));
+    assert!(message.contains("readers disagree: hayro read other data for stream 6 0 R"), "{message}");
 }
 
 #[test]

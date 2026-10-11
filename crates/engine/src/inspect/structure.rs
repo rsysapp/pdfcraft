@@ -112,6 +112,11 @@ pub(crate) struct PageFacts {
     /// form's, pattern's and mask group's own), each keyed with everything its glyph procedures
     /// draw (see `Reader::type3_key`).
     pub type3: BTreeSet<Digest>,
+    /// Something the content draws with that hayro renders otherwise than other viewers, or
+    /// that viewers may ignore (see `Reader::render_risk`), described: in a rewrite, a page
+    /// drawn differently from its base that draws with one counts outside the redactions, since
+    /// a change hidden in hayro's pixels may show in another viewer.
+    pub render_risk: Option<String>,
     /// The image pixels drawn, summed over every use.
     pub image_pixels: u64,
     /// Content bytes the interpreter reads for the page (forms counted per use).
@@ -249,6 +254,8 @@ pub(crate) struct Section {
     pub offset: u64,
     pub prev: Option<u64>,
     pub hybrid: bool,
+    /// Its trailer names an encryption dictionary (`/Encrypt`).
+    pub encrypted: bool,
 }
 
 pub(crate) struct Structure {
@@ -381,6 +388,7 @@ struct Drawn {
     required: Required,
     forms: Vec<FormUse>,
     type3: BTreeSet<Digest>,
+    render_risk: Option<String>,
     /// Tiling patterns and soft masks' groups already followed on this page, each with whether it
     /// was in a tiling pattern's cell and in a soft mask's group there (what it draws is required
     /// differently in each).
@@ -614,8 +622,8 @@ impl<'d, 'b> Reader<'d, 'b> {
             return Err(read_error(format!("object {num} is not an object stream")));
         }
         let count = stream.dict.int(b"N").unwrap_or(0).clamp(0, 1_000_000);
-        let data = stream.decoded_strict_within(self.budget.content_room()).map_err(|error| decode_error(&error))?;
-        self.budget.content(data.len())?;
+        let (data, made) = stream.decoded_strict_counted(self.budget.content_room()).map_err(|error| decode_error(&error))?;
+        self.budget.content(made)?;
         let mut lx = Lexer::new(&data, 0);
         let mut numbers = Vec::new();
         for _ in 0..count {
@@ -869,9 +877,11 @@ impl<'d, 'b> Reader<'d, 'b> {
 
     // ── content ─────────────────────────────────────────────────────────────────────────────
 
+    /// A stream's data, decoded strictly. Every filter of its chain may make only what the
+    /// budget has left, all of them together, and what they made is charged.
     fn decode(&mut self, stream: &Stream) -> Result<Vec<u8>, Fail> {
-        let data = stream.decoded_strict_within(self.budget.content_room()).map_err(|error| decode_error(&error))?;
-        self.budget.content(data.len())?;
+        let (data, made) = stream.decoded_strict_counted(self.budget.content_room()).map_err(|error| decode_error(&error))?;
+        self.budget.content(made)?;
         Ok(data)
     }
 
@@ -1130,6 +1140,7 @@ impl<'d, 'b> Reader<'d, 'b> {
                             }
                             let scan = self.form_content(r, stream)?;
                             let key = self.form_key(r, stream)?;
+                            self.group_risk(&stream.dict, drawn)?;
                             let placed = !at.patterned && !at.masked;
                             drawn.forms.push(FormUse { obj: r, key, placed });
                             if placed {
@@ -1146,7 +1157,13 @@ impl<'d, 'b> Reader<'d, 'b> {
                 Item::Pattern(name) => {
                     let Some(r) = self.resource(chain, b"Pattern", name)? else { continue };
                     let obj = self.get(r)?;
-                    // Shading patterns (dictionaries) draw no images; a tiling pattern is a stream.
+                    // Shading patterns (dictionaries) draw no images, but may set a graphics
+                    // state; a tiling pattern is a stream.
+                    if let Object::Dict(pattern) = &*obj
+                        && let Some(state) = self.dict_of(pattern.get(b"ExtGState"), "a pattern's /ExtGState")?
+                    {
+                        self.state_risk(&state, drawn)?;
+                    }
                     let Object::Stream(stream) = &*obj else { continue };
                     if stream.dict.int(b"PatternType") != Some(1) || !drawn.patterns.insert((r, at.patterned, at.masked)) {
                         continue;
@@ -1161,6 +1178,11 @@ impl<'d, 'b> Reader<'d, 'b> {
                     self.draw(&scan.items, &inner, Context { depth: at.depth.saturating_add(1), patterned: true, chain: key, ..at }, drawn)?;
                 }
                 Item::State(name) => {
+                    if let Some(entry) = self.resource_entry(chain, b"ExtGState", name)?
+                        && let Some(state) = self.dict_of(Some(&entry), "a graphics state")?
+                    {
+                        self.state_risk(&state, drawn)?;
+                    }
                     let Some(group) = self.soft_mask_group(chain, name)? else { continue };
                     if !drawn.masks.insert((group, at.patterned, at.masked)) {
                         continue;
@@ -1172,6 +1194,7 @@ impl<'d, 'b> Reader<'d, 'b> {
                     }
                     let scan = self.form_content(group, stream)?;
                     let key = self.form_key(group, stream)?;
+                    self.group_risk(&stream.dict, drawn)?;
                     drawn.forms.push(FormUse { obj: group, key, placed: false });
                     drawn.interpreted = drawn.interpreted.saturating_add(scan.len);
                     let (inner, key) = self.inner_chain(stream.dict.get(b"Resources"), "a soft mask's /Resources", chain, &at.chain)?;
@@ -1179,6 +1202,50 @@ impl<'d, 'b> Reader<'d, 'b> {
                     self.draw(&scan.items, &inner, Context { depth: at.depth.saturating_add(1), masked: true, chain: key, ..at }, drawn)?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Note a graphics state hayro may render otherwise than other viewers: a blend mode other
+    /// than `/Normal` (hayro composes every group as isolated, and does not knock out), or a
+    /// transfer function (`/TR`, `/TR2`; PDF 2.0 deprecates them, and viewers may ignore them).
+    fn state_risk(&mut self, state: &Dict, drawn: &mut Drawn) -> Result<(), Fail> {
+        if drawn.render_risk.is_some() {
+            return Ok(());
+        }
+        let normal = |name: &[u8]| matches!(name, b"Normal" | b"Compatible");
+        if let Some(mode) = state.get(b"BM") {
+            let plain = match &*self.resolve(mode)? {
+                Object::Name(name) => normal(name),
+                Object::Array(names) => names.iter().all(|name| name.as_name().is_some_and(normal)),
+                _ => false,
+            };
+            if !plain {
+                drawn.render_risk = Some("a blend mode other than /Normal".into());
+                return Ok(());
+            }
+        }
+        for key in [b"TR".as_slice(), b"TR2".as_slice()] {
+            if let Some(transfer) = state.get(key) {
+                let identity = matches!(&*self.resolve(transfer)?, Object::Name(name) if matches!(name.as_slice(), b"Identity" | b"Default"));
+                if !identity {
+                    drawn.render_risk = Some("a transfer function".into());
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Note a knockout transparency group (`/Group << /K true >>`), which hayro draws as an
+    /// ordinary group.
+    fn group_risk(&mut self, dict: &Dict, drawn: &mut Drawn) -> Result<(), Fail> {
+        if drawn.render_risk.is_none()
+            && let Some(group) = self.dict_of(dict.get(b"Group"), "a /Group")?
+            && let Some(knockout) = group.get(b"K")
+            && matches!(&*self.resolve(knockout)?, Object::Bool(true))
+        {
+            drawn.render_risk = Some("a knockout group".into());
         }
         Ok(())
     }
@@ -1396,6 +1463,7 @@ impl<'d, 'b> Reader<'d, 'b> {
         let resources = sha256(&[&levels]);
         let scan = self.page_content(&node.dict)?;
         let mut drawn = Drawn { interpreted: scan.len, ..Drawn::default() };
+        self.group_risk(&node.dict, &mut drawn)?;
         self.type3_fonts(&chain, &resources, &mut drawn)?;
         self.draw(&scan.items, &chain, Context { depth: 0, patterned: false, masked: false, chain: resources }, &mut drawn)?;
         drawn.images.sort_unstable();
@@ -1408,6 +1476,7 @@ impl<'d, 'b> Reader<'d, 'b> {
             other,
             images: drawn.images,
             image_pixels: drawn.pixels,
+            render_risk: drawn.render_risk,
             image_uses: Vec::new(),
             required: drawn.required,
             forms: drawn.forms,
@@ -1660,6 +1729,16 @@ fn with_inherited(node: &Dict, inherited: &PageNode) -> PageNode {
     }
 }
 
+/// The file's cross-reference sections, oldest first (see [`Section`]).
+pub(crate) fn sections(doc: &Document) -> Result<Vec<Section>, Fail> {
+    let data = doc.bytes().as_slice();
+    let sections = doc.revisions().iter().map(|revision| section(data, revision.xref_offset, revision.is_stream)).collect::<Result<Vec<_>, _>>()?;
+    if sections.is_empty() {
+        return Err(read_error("the file has no cross-reference data"));
+    }
+    Ok(sections)
+}
+
 /// The trailer of the cross-reference section at `offset`.
 fn section(data: &[u8], offset: u64, is_stream: bool) -> Result<Section, Fail> {
     let unreadable = || read_error(format!("the cross-reference section at {offset} cannot be read"));
@@ -1681,7 +1760,7 @@ fn section(data: &[u8], offset: u64, is_stream: bool) -> Result<Section, Fail> {
     if trailer.get(b"Root").is_some_and(|root| !matches!(root, Object::Ref(_))) {
         return Err(read_error("a trailer's /Root is not a reference"));
     }
-    Ok(Section { offset, prev, hybrid: trailer.contains(b"XRefStm") })
+    Ok(Section { offset, prev, hybrid: trailer.contains(b"XRefStm"), encrypted: trailer.contains(b"Encrypt") })
 }
 
 /// What [`read`] established about objects, kept for identifying the images hayro draws: which
@@ -1724,6 +1803,19 @@ impl Known {
         let digest = reader.digest_ref(font).map(|(digest, _)| digest);
         self.keep(reader);
         digest
+    }
+
+    /// Every object read here that the cross-reference data places in the file or in an object
+    /// stream (the others read as null), in order.
+    pub fn objects_read(&self, doc: &Document) -> Vec<(u32, u16)> {
+        let mut read: Vec<(u32, u16)> = self
+            .checked
+            .iter()
+            .filter(|(num, _)| matches!(doc.xref_entry(**num), Some(XrefEntry::InFile { .. } | XrefEntry::InStream { .. })))
+            .map(|(num, generation)| (*num, *generation))
+            .collect();
+        read.sort_unstable();
+        read
     }
 
     /// The first stream whose `/Length` is not its data's length that hayro did not read as the
@@ -1995,12 +2087,13 @@ fn describe(key: &ImageKey) -> String {
 /// Read one file's structure. Fails on anything not read for certain. `hayro_decoded`: the
 /// content streams hayro decoded to interpret the file's pages, each with its decoded data's
 /// digest (see `Reader::hayro_decoded`).
-pub(crate) fn read(doc: &Document, budget: &mut Budget, hayro_decoded: Arc<HashMap<ObjRef, Digest>>) -> Result<(Structure, Known), Fail> {
+pub(crate) fn read(
+    doc: &Document,
+    budget: &mut Budget,
+    hayro_decoded: Arc<HashMap<ObjRef, Digest>>,
+    sections: Vec<Section>,
+) -> Result<(Structure, Known), Fail> {
     let data = doc.bytes().as_slice();
-    let sections = doc.revisions().iter().map(|revision| section(data, revision.xref_offset, revision.is_stream)).collect::<Result<Vec<_>, _>>()?;
-    if sections.is_empty() {
-        return Err(read_error("the file has no cross-reference data"));
-    }
     let mut reader = Reader {
         doc,
         data,

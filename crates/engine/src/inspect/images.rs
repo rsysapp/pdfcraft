@@ -370,9 +370,10 @@ impl Grid {
 /// Decode a stream's samples for the comparison, within the budget.
 fn decode(stream: &Stream, budget: &mut Budget) -> Result<Option<Vec<u8>>, Fail> {
     let room = budget.image_room();
-    match stream.decoded_strict_within(room) {
-        Ok(data) => {
-            budget.image_bytes(data.len())?;
+    // Every filter of the chain together within the room, all of it charged.
+    match stream.decoded_strict_counted(room) {
+        Ok((data, made)) => {
+            budget.image_bytes(made)?;
             Ok(Some(data))
         }
         Err(error) if error.to_string().contains("exceeds the limit") => Err(Fail::TooComplex),
