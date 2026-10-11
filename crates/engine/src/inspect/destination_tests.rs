@@ -477,6 +477,19 @@ fn a_redaction_and_a_page_delete_on_a_file_with_named_destinations_are_accepted(
     let all = "(p1) [null /XYZ 0 300 0] (p2) [11 0 R /XYZ 0 300 0] (p3) [12 0 R /XYZ 0 300 0] (p4) [13 0 R /XYZ 0 300 0]";
     let edited = update_objects(&base, &[(40, &format!("<< /Names [{all}] /Limits [(p1) (p4)] >>"))], 43);
     assert!(refused(run(&base, &edited)).contains("named destination"));
+    // Only a destination whose base page was deleted may become a null page: one that went
+    // nowhere already (a page reference naming no page) may not become one, nor the reverse.
+    let leaf = |first: &str| {
+        format!(
+            "<< /Names [(p1) [{first} /XYZ 0 300 0] (p2) [11 0 R /XYZ 0 300 0] (p3) [12 0 R /XYZ 0 300 0] (p4) [13 0 R /XYZ 0 300 0]] /Limits [(p1) (p4)] >>"
+        )
+    };
+    let nowhere = update_objects(&base, &[(40, &leaf("99 0 R"))], 43);
+    let null = update_objects(&base, &[(40, &leaf("null"))], 43);
+    assert!(refused(run(&nowhere, &update_objects(&nowhere, &[(40, &leaf("null"))], 43))).contains("named destination"));
+    assert!(refused(run(&null, &update_objects(&null, &[(40, &leaf("99 0 R"))], 43))).contains("named destination"));
+    // Each as it was is no change.
+    assert_eq!(run(&null, &null).map(|inspection| inspection.destinations), Ok(DestinationChanges::default()));
 }
 
 /// Four pages; page 1 links to page 3 (object 43) by `/Dest`, or by a go-to action.

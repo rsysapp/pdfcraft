@@ -580,8 +580,19 @@ fn compare(base: &[u8], edited: &[u8], limits: Limits) -> Result<Inspection, Ins
     // A rewrite's image placements are compared against its redaction boxes.
     let before = read_side(base, None, !base_kept, &mut budget).map_err(|fail| fail.of(Role::Base))?;
     let after = read_side(edited, Some((base, &before.structure, base_kept)), !base_kept, &mut budget).map_err(|fail| fail.of(Role::Edited))?;
-    if let Some(key) = structure::catalog_change(&before.structure, &after.structure) {
+    if let Some(key) = structure::catalog_change(&before.structure, &after.structure, base_kept) {
         return Err(InspectError::Edited(format!("the document's /{key} changed, which this comparison does not report")));
+    }
+    // The structure tree: an appended update leaves it as it was; a rewrite may only take text
+    // away from it (a redaction cleans the tags of what it removed), never add or change any.
+    let (tags_before, tags_after) = (&before.structure.structure_tree, &after.structure.structure_tree);
+    let tags_changed = if base_kept {
+        tags_before != tags_after
+    } else {
+        tags_after.text.iter().any(|(entry, count)| tags_before.text.get(entry).is_none_or(|was| count > was))
+    };
+    if tags_changed {
+        return Err(InspectError::Edited("the structure tree's text or tags changed, which this comparison does not report".into()));
     }
     let mut inspection = Inspection { base_kept, ..Inspection::default() };
     let edited_fail = |fail: Fail| fail.of(Role::Edited);
@@ -811,8 +822,19 @@ fn check_update_read(
         Ok(Ok(base_doc)) => base_doc,
         _ => return Err(Fail::Read("the base could not be read again to check the update".into())),
     };
+    // The document information is exempt only as what it is: a dictionary of direct values,
+    // which leads to nothing else (no stream, no reference), is no catalog entry's object, and
+    // that both readers read alike (hayro reads it opening the file).
+    let catalog_objects: BTreeSet<u32> = doc
+        .root()
+        .and_then(|root| doc.try_get(root.num).ok())
+        .and_then(|catalog| catalog.as_dict().map(|catalog| catalog.iter().filter_map(|(_, value)| value.as_ref().map(|r| r.num)).collect()))
+        .unwrap_or_default();
     let info = match doc.trailer().get(b"Info") {
-        Some(pdfcraft_cos::Object::Ref(info)) => Some(info.num),
+        Some(pdfcraft_cos::Object::Ref(info)) if !catalog_objects.contains(&info.num) && known.was_checked(info.num) => {
+            let plain = doc.try_get(info.num).is_ok_and(|object| matches!(&*object, pdfcraft_cos::Object::Dict(_)) && !holds_reference(&object, 0));
+            plain.then_some(info.num)
+        }
         _ => None,
     };
     let section_offsets: BTreeSet<u64> = sections.iter().map(|section| section.offset).collect();
@@ -831,6 +853,18 @@ fn check_update_read(
         }
     }
     Ok(())
+}
+
+/// Whether `object` holds a reference or a stream anywhere in it (deeper than eight levels counts
+/// as one).
+fn holds_reference(object: &pdfcraft_cos::Object, depth: usize) -> bool {
+    match object {
+        pdfcraft_cos::Object::Ref(_) | pdfcraft_cos::Object::Stream(_) => true,
+        _ if depth > 8 => true,
+        pdfcraft_cos::Object::Array(items) => items.iter().any(|item| holds_reference(item, depth.saturating_add(1))),
+        pdfcraft_cos::Object::Dict(dict) => dict.iter().any(|(_, value)| holds_reference(value, depth.saturating_add(1))),
+        _ => false,
+    }
 }
 
 /// Whether `bytes` hold the name `/Encrypt` (not `/EncryptMetadata`).
@@ -1053,7 +1087,7 @@ impl Votes {
         let Destination::Page(page, _) = before else { return };
         let slot = match after {
             Destination::Page(other, _) => self.pairs.entry((*page, other)).or_default(),
-            Destination::None | Destination::Unpaged(_) => self.deleted.entry(*page).or_default(),
+            Destination::None | Destination::Unpaged(_) | Destination::NullPage(_) => self.deleted.entry(*page).or_default(),
             _ => return,
         };
         *slot = slot.saturating_add(1);

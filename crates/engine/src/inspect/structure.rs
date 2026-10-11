@@ -43,14 +43,14 @@ const PAGE_OWN_KEYS: [&[u8]; 7] = [b"Parent", b"Annots", b"Rotate", b"Contents",
 ///   form fields, the layers, which count every page as changed, the outline entry by entry, and
 ///   named destinations name by name; `/Names` is compared whole but for its `/Dests` tree, which
 ///   is compared name by name too);
-/// - `/Metadata` (the XMP packet), `/StructTreeRoot` and `/MarkInfo` (tags), `/Version` (the PDF
-///   version): nothing a viewer draws, and editors update them on ordinary saves (a redaction
-///   cleans tags; a save may restamp metadata). Left out deliberately, so in a rewrite a changed
-///   `/Metadata` can carry different document information with no trace in the result. (An
-///   appended update may write only objects the comparison reads: one that writes the metadata
-///   or the structure tree fails, see `inspect::check_update_read`.)
-const CATALOG_REPORTED: [&[u8]; 9] =
-    [b"Pages", b"AcroForm", b"OCProperties", b"Outlines", b"Dests", b"Metadata", b"StructTreeRoot", b"MarkInfo", b"Version"];
+/// - `/StructTreeRoot` (tags): compared on its own (see [`StructFacts`]): a redaction cleans
+///   the tags of what it removed.
+///
+/// `/Metadata` (the XMP packet), `/MarkInfo` and `/Version` are compared like any other entry:
+/// the document information a viewer or assistive technology reads, and what the file says it
+/// uses. `/Metadata` may be removed by a rewrite (an editor's sanitising removes it), never
+/// changed (see [`catalog_change`]).
+const CATALOG_REPORTED: [&[u8]; 6] = [b"Pages", b"AcroForm", b"OCProperties", b"Outlines", b"Dests", b"StructTreeRoot"];
 
 /// Stream-dictionary entries that say how the data is encoded, not what it is.
 const CODING_KEYS: [&[u8]; 4] = [b"Filter", b"DecodeParms", b"Length", b"DL"];
@@ -255,10 +255,14 @@ pub(crate) enum Destination {
     /// An explicit destination to one of this file's pages: the page's index and the view (the
     /// rest of the array: the fit, position and zoom).
     Page(usize, Digest),
-    /// An explicit destination whose page is `null` or a reference that names no page of this
-    /// file (a page deleted and freed, or an object outside the page tree): it goes nowhere. The
-    /// view, as for `Page`.
+    /// An explicit destination whose page is a reference that names no page of this file (a page
+    /// deleted and freed, or an object outside the page tree): it goes nowhere. The view, as for
+    /// `Page`.
     Unpaged(Digest),
+    /// An explicit destination whose page is `null` (R6b-37: an editor writes a deleted page's
+    /// named destination so): it goes nowhere. The view, as for `Page`. Kept apart from
+    /// `Unpaged`: only a destination whose base page was deleted may become one.
+    NullPage(Digest),
     /// A named destination (a name or a string), by its digest: what it names is the catalog's
     /// `/Dests` or the `/Names /Dests` tree, compared name by name (see
     /// [`Structure::named_destinations`]).
@@ -360,6 +364,8 @@ pub(crate) struct Structure {
     pub named_destinations: BTreeMap<NamedKey, Destination>,
     /// Cross-reference sections, oldest first.
     pub sections: Vec<Section>,
+    /// The structure tree (see [`StructFacts`]).
+    pub structure_tree: StructFacts,
     /// The stream objects read whose `/Length` is not their data's (both readers read the same
     /// data), each with the offset the cross-reference data names for it: in the base, the only
     /// objects an appended update may keep with such a length (see [`Tolerated`]).
@@ -378,11 +384,33 @@ pub(crate) fn fingerprint(page: &PageFacts) -> Digest {
     sha256(&[&page.content, &page.resources, &images, text.as_bytes(), &unnamed])
 }
 
-/// The first catalog entry (not reported otherwise) that differs between the files.
-pub(crate) fn catalog_change(before: &Structure, after: &Structure) -> Option<String> {
+/// The first catalog entry (not reported otherwise) that differs between the files: in a rewrite
+/// (`base_kept` false), `/Metadata` gone is no difference (an editor's sanitising removes it).
+pub(crate) fn catalog_change(before: &Structure, after: &Structure, base_kept: bool) -> Option<String> {
     let keys: BTreeSet<&Vec<u8>> = before.catalog.keys().chain(after.catalog.keys()).collect();
-    keys.into_iter().find(|key| before.catalog.get(*key) != after.catalog.get(*key)).map(|key| String::from_utf8_lossy(key).into_owned())
+    keys.into_iter()
+        .find(|key| {
+            let (was, is) = (before.catalog.get(*key), after.catalog.get(*key));
+            was != is && !(!base_kept && key.as_slice() == b"Metadata" && is.is_none())
+        })
+        .map(|key| String::from_utf8_lossy(key).into_owned())
 }
+
+/// The document's structure tree (tags), as far as the comparison goes: the text it gives
+/// assistive technology and copying (each element's `/ActualText`, `/Alt`, `/E`, `/Lang` and
+/// `/T`, as a multiset of (key, value)), and a digest of everything else in it (each element's
+/// entries but its kids, parent and page, in the tree's order, with its marked-content kids; the
+/// root's but for its parent tree and ID tree).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StructFacts {
+    pub text: BTreeMap<(Vec<u8>, Vec<u8>), u32>,
+    pub digest: Digest,
+}
+
+/// The entries of a structure element that hold text for assistive technology and copying.
+const STRUCT_TEXT_KEYS: [&[u8]; 5] = [b"ActualText", b"Alt", b"E", b"Lang", b"T"];
+/// The most structure elements read.
+const MAX_STRUCT_ELEMENTS: usize = 1_000_000;
 
 /// The edited file's cross-reference chain: an appended update must chain onto the base's
 /// sections exactly, every section it adds pointing backwards; a rewrite's sections all point
@@ -515,6 +543,10 @@ struct Reader<'d, 'b> {
     budget: &'b mut Budget,
     /// Objects whose location was checked: number → generation.
     checked: HashMap<u32, u16>,
+    /// Objects read for a fact (not only to check that hayro read them as `pdfcraft_cos` does).
+    facts: HashSet<u32>,
+    /// Reading only to check what hayro read (see [`Known::agree`]): nothing read is a fact's.
+    agreeing: bool,
     checking: HashSet<u32>,
     /// Object streams: the object numbers they hold, in order.
     object_streams: HashMap<u32, Arc<Vec<u32>>>,
@@ -591,6 +623,9 @@ impl<'d, 'b> Reader<'d, 'b> {
     fn get(&mut self, r: ObjRef) -> Result<Arc<Object>, Fail> {
         self.budget.object()?;
         self.check(r)?;
+        if !self.agreeing {
+            self.facts.insert(r.num);
+        }
         self.doc.try_get(r.num).map_err(|error| read_error(format!("object {r} cannot be read: {error}")))
     }
 
@@ -1715,6 +1750,58 @@ impl<'d, 'b> Reader<'d, 'b> {
         Ok((annots, in_array))
     }
 
+    /// The structure tree's facts (see [`StructFacts`]), read through `/K` from the root, every
+    /// element once (a tree that loops is refused).
+    fn structure_tree(&mut self, catalog: &Dict) -> Result<StructFacts, Fail> {
+        let Some(root) = self.dict_of(catalog.get(b"StructTreeRoot"), "/StructTreeRoot")? else { return Ok(StructFacts::default()) };
+        let mut facts = StructFacts::default();
+        let mut parts: Vec<u8> = Vec::new();
+        parts.extend_from_slice(&self.digest_without(&root, &[b"K", b"ParentTree", b"ParentTreeNextKey", b"IDTree"])?);
+        let mut seen: BTreeSet<ObjRef> = BTreeSet::new();
+        // (kid, depth), depth first in the tree's order.
+        let mut todo: Vec<(Object, usize)> = root.get(b"K").cloned().map(|kid| (kid, 0)).into_iter().collect();
+        while let Some((kid, depth)) = todo.pop() {
+            self.budget.tick()?;
+            if depth > MAX_REFERENCE_DEPTH || seen.len() > MAX_STRUCT_ELEMENTS {
+                return Err(Fail::TooComplex);
+            }
+            if let Object::Ref(r) = &kid
+                && !seen.insert(*r)
+            {
+                return Err(read_error("the structure tree loops"));
+            }
+            match &*self.resolve(&kid)? {
+                Object::Array(items) => {
+                    parts.push(b'[');
+                    todo.extend(items.iter().rev().map(|item| (item.clone(), depth.saturating_add(1))));
+                }
+                Object::Int(mcid) => {
+                    parts.push(b'm');
+                    parts.extend_from_slice(&mcid.to_le_bytes());
+                }
+                Object::Dict(element) => {
+                    for key in STRUCT_TEXT_KEYS {
+                        if let Some(value) = element.get(key)
+                            && let Object::String(text) = &*self.resolve(value)?
+                        {
+                            let slot = facts.text.entry((key.to_vec(), text.bytes.clone())).or_default();
+                            *slot = slot.saturating_add(1);
+                        }
+                    }
+                    parts.push(b'{');
+                    parts.extend_from_slice(&self.digest_without(element, &[b"K", b"P", b"Pg", b"Obj"])?);
+                    if let Some(kids) = element.get(b"K") {
+                        todo.push((kids.clone(), depth.saturating_add(1)));
+                    }
+                }
+                Object::Null => {}
+                _ => return Err(read_error("a structure element is not a dictionary")),
+            }
+        }
+        facts.digest = sha256(&[b"structure", &parts]);
+        Ok(facts)
+    }
+
     /// The document's default layer configuration (see [`LayerConfig`]).
     fn layer_config(&mut self, catalog: &Dict) -> Result<Option<LayerConfig>, Fail> {
         let Some(properties) = self.dict_of(catalog.get(b"OCProperties"), "/OCProperties")? else { return Ok(None) };
@@ -2200,22 +2287,20 @@ impl Reader<'_, '_> {
     }
 
     /// An explicit destination by its page's index and its view; anything else by its digest.
-    /// A page that is `null`, or a reference that names no page of this file (a missing object
-    /// among them), goes nowhere: `Unpaged` (R6b-37; an editor writes a deleted page's named
-    /// destination so).
+    /// A reference that names no page of this file (a missing object among them) goes nowhere:
+    /// `Unpaged`; a page that is `null` too: `NullPage` (R6b-37).
     fn destination(&mut self, dest: &Object, pages: &HashMap<ObjRef, usize>) -> Result<Destination, Fail> {
         let resolved = self.resolve(dest)?;
         if let Object::Array(items) = &*resolved
             && let Some(page @ (Object::Ref(_) | Object::Null)) = items.first()
         {
             let view = self.digest(&Object::Array(items.iter().skip(1).cloned().collect()))?;
-            let index = match page {
-                Object::Ref(page) => pages.get(page),
-                _ => None,
-            };
-            return Ok(match index {
-                Some(index) => Destination::Page(*index, view),
-                None => Destination::Unpaged(view),
+            return Ok(match page {
+                Object::Ref(page) => match pages.get(page) {
+                    Some(index) => Destination::Page(*index, view),
+                    None => Destination::Unpaged(view),
+                },
+                _ => Destination::NullPage(view),
             });
         }
         Ok(match &*resolved {
@@ -2279,6 +2364,8 @@ fn section(data: &[u8], offset: u64, is_stream: bool) -> Result<Section, Fail> {
 /// image XObjects read.
 pub(crate) struct Known {
     checked: HashMap<u32, u16>,
+    /// See `Reader::facts`.
+    facts: HashSet<u32>,
     object_streams: HashMap<u32, Arc<Vec<u32>>>,
     digests: HashMap<ObjRef, Digest>,
     images: HashMap<ObjRef, Arc<ImageInfo>>,
@@ -2505,9 +2592,16 @@ impl Known {
         read
     }
 
-    /// Whether object `num` was read here (see [`Known::objects_read`]).
-    pub fn was_read(&self, num: u32) -> bool {
+    /// Whether object `num` was read here, by `pdfcraft_cos` and hayro alike (every object read
+    /// is checked to parse the same in both: see [`Known::agree_shapes`]).
+    pub fn was_checked(&self, num: u32) -> bool {
         self.checked.contains_key(&num)
+    }
+
+    /// Whether object `num` was read for a fact (not only because hayro read it: hayro reads
+    /// the trailer's `/Info`, say, which no fact compares).
+    pub fn was_read(&self, num: u32) -> bool {
+        self.facts.contains(&num)
     }
 
     /// The first stream whose `/Length` is not its data's length that hayro did not read as the
@@ -2534,6 +2628,7 @@ impl Known {
     pub fn agree_decoded(&mut self, doc: &Document, budget: &mut Budget) -> Result<(), Fail> {
         let hayro_decoded = self.hayro_decoded.clone();
         let mut reader = self.reader(doc, budget);
+        reader.agreeing = true;
         let mut result = Ok(());
         for (r, theirs) in hayro_decoded.iter() {
             let ours = match reader.decoded.get(r) {
@@ -2638,6 +2733,7 @@ impl Known {
         }
         let data = doc.bytes().as_slice();
         let mut reader = self.reader(doc, budget);
+        reader.agreeing = true;
         let mut result = Ok(());
         for ((num, generation), place) in &resolved.objects {
             let r = ObjRef::new(*num, *generation);
@@ -2718,6 +2814,8 @@ impl Known {
             data: doc.bytes().as_slice(),
             budget,
             checked: std::mem::take(&mut self.checked),
+            facts: std::mem::take(&mut self.facts),
+            agreeing: false,
             checking: HashSet::new(),
             object_streams: std::mem::take(&mut self.object_streams),
             digests: std::mem::take(&mut self.digests),
@@ -2736,6 +2834,7 @@ impl Known {
 
     fn keep(&mut self, reader: Reader<'_, '_>) {
         self.checked = reader.checked;
+        self.facts = reader.facts;
         self.object_streams = reader.object_streams;
         self.digests = reader.digests;
         self.images = reader.images;
@@ -2873,6 +2972,8 @@ pub(crate) fn read(
         data,
         budget,
         checked: HashMap::new(),
+        facts: HashSet::new(),
+        agreeing: false,
         checking: HashSet::new(),
         object_streams: HashMap::new(),
         digests: HashMap::new(),
@@ -2897,6 +2998,7 @@ pub(crate) fn read(
         None => (BTreeMap::new(), None),
     };
     let layers = catalog.get(b"OCProperties").map(|layers| reader.digest(layers)).transpose()?;
+    let structure_tree = reader.structure_tree(&catalog)?;
     let layer_config = reader.layer_config(&catalog)?;
     let page_index: HashMap<ObjRef, usize> = nodes.iter().enumerate().map(|(index, node)| (node.obj, index)).collect();
     let outline = reader.outline(&catalog, &page_index)?;
@@ -2923,6 +3025,7 @@ pub(crate) fn read(
     }
     let known = Known {
         checked: reader.checked,
+        facts: reader.facts,
         object_streams: reader.object_streams,
         digests: reader.digests,
         images: reader.images,
@@ -2945,6 +3048,7 @@ pub(crate) fn read(
             outline_root,
             named_destinations,
             sections,
+            structure_tree,
             misdeclared: BTreeSet::new(),
         },
         known,

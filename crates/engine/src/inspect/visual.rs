@@ -301,7 +301,9 @@ pub(crate) fn area_filled(base: &UprightRaster, edited: &UprightRaster, area: [f
 
 /// A comparison render reduced to blocks of [`BLOCK`] × [`BLOCK`] pixels, for pairing changed
 /// pages that share no glyph or image (R6b-38): each block's mean luminance, in quarters of a
-/// level, and whether it holds a pixel of a redaction fill.
+/// level, and whether it holds a pixel of what could be a redaction box: a pixel of the fill
+/// colour that a [`FILL`] × [`FILL`] square of that colour covers (the fills
+/// [`redaction_boxes`] accepts are made of such pixels; glyph strokes and thin lines are not).
 pub(crate) struct Thumb {
     width: u32,
     height: u32,
@@ -348,6 +350,10 @@ pub(crate) fn thumb(raster: &UprightRaster) -> Thumb {
     let mut sums = vec![0u64; blocks];
     let mut counts = vec![0u64; blocks];
     let mut filled = vec![false; blocks];
+    let total = width.saturating_mul(height);
+    let painted: Vec<bool> = (0..total).map(|index| colour(raster, index).is_some_and(|c| REDACTION_FILLS.contains(&c))).collect();
+    let radius = FILL / 2;
+    let boxed = dilate(&erode(&painted, width, height, radius), width, height, radius);
     for y in 0..height {
         for x in 0..width {
             let index = y.saturating_mul(width).saturating_add(x);
@@ -360,7 +366,7 @@ pub(crate) fn thumb(raster: &UprightRaster) -> Thumb {
                 *sum = sum.saturating_add(luminance);
                 *count = count.saturating_add(1);
             }
-            if colour(raster, index).is_some_and(|c| REDACTION_FILLS.contains(&c))
+            if boxed.get(index).copied().unwrap_or(false)
                 && let Some(slot) = filled.get_mut(block)
             {
                 *slot = true;
@@ -373,11 +379,12 @@ pub(crate) fn thumb(raster: &UprightRaster) -> Thumb {
 }
 
 /// How many blocks of `base` and `edited` certainly differ (their mean luminance by more than
-/// [`NOISE`]) with no redaction fill of the edited render in them or beside them; `None` when the
+/// [`NOISE`]) with no box of the redaction fill in the edited render in them or beside them; `None` when the
 /// renders' sizes differ. Zero is necessary for [`redaction_boxes`] to find nothing outside the
 /// boxes: a mean differing by more than `NOISE` means a pixel whose luminance, so one of whose
 /// channels, differs by more than `NOISE`, and every such pixel lies within [`EDGE`] pixels of a
-/// box made of the fill's pixels, in its block or a neighbouring one. So an edited page could be
+/// box, made of fill pixels a [`FILL`]-pixel square covers, in its block or a neighbouring one.
+/// Black text of the edited page is no box: content that differs beside it is not explained. So an edited page could be
 /// a redaction of a base page only where this is zero.
 pub(crate) fn unexplained(base: &Thumb, edited: &Thumb) -> Option<usize> {
     if base.width != edited.width || base.height != edited.height || base.mean.len() != edited.mean.len() {
@@ -402,4 +409,42 @@ pub(crate) fn unexplained(base: &Thumb, edited: &Thumb) -> Option<usize> {
         }
     }
     Some(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A white 130 × 130 render with black `rects` (x0, y0, x1, y1 in pixels, ends excluded).
+    fn raster(rects: &[(usize, usize, usize, usize)]) -> UprightRaster {
+        let side = 130usize;
+        let mut rgba = vec![255u8; side * side * 4];
+        for &(x0, y0, x1, y1) in rects {
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    rgba[(y * side + x) * 4..(y * side + x) * 4 + 3].copy_from_slice(&[0, 0, 0]);
+                }
+            }
+        }
+        UprightRaster { width: side as u32, height: side as u32, rgba, scale: 1.0, crop: [0.0, 0.0, 130.0, 130.0], height_pt: 130.0 }
+    }
+
+    #[test]
+    fn content_that_differs_beside_black_text_is_not_explained() {
+        // Thin black strokes (text): the base page has two in each block of a row, the edited
+        // page one. They differ, and no redaction box explains it, though black pixels of the
+        // edited page lie in every one of those blocks (which explained them before: the
+        // edited page could pair with a base page it is not a redaction of).
+        let strokes = |offsets: &[usize]| {
+            (0..8).flat_map(|i| offsets.iter().map(move |offset| (13 + i * 13 + offset, 20, 15 + i * 13 + offset, 60))).collect::<Vec<_>>()
+        };
+        let (base, edited) = (raster(&strokes(&[0, 6])), raster(&strokes(&[0])));
+        assert!(unexplained(&thumb(&base), &thumb(&edited)).is_some_and(|count| count > 0));
+        assert!(redaction_boxes(&base, &edited).outside);
+        // A box drawn over where they differ explains it.
+        let mut boxed = strokes(&[0]);
+        boxed.push((10, 15, 120, 65));
+        assert_eq!(unexplained(&thumb(&base), &thumb(&raster(&boxed))), Some(0));
+        assert!(!redaction_boxes(&base, &raster(&boxed)).outside);
+    }
 }

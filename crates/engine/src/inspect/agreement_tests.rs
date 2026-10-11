@@ -551,8 +551,14 @@ fn an_update_that_writes_an_object_nothing_compares_is_refused() {
     ];
     for (case, objects) in cases {
         let edited = update_section(&base, &objects, prev, "/Info 6 0 R");
+        // (The metadata and the structure tree are read and compared now: refused as changed.)
+        let expected = match case {
+            "the XMP metadata" => "/Metadata changed",
+            "the structure tree" => "structure tree",
+            _ => "nothing this comparison reports reads",
+        };
         match inspect(&base, &edited, InspectLimits::default()) {
-            Err(InspectError::Edited(message)) => assert!(message.contains("nothing this comparison reports reads"), "{case}: {message}"),
+            Err(InspectError::Edited(message)) => assert!(message.contains(expected), "{case}: {message}"),
             other => panic!("{case}: {other:?}"),
         }
     }
@@ -560,4 +566,125 @@ fn an_update_that_writes_an_object_nothing_compares_is_refused() {
     let edited = update_section(&base, &[(6, b"<< /Title (Agreement) /ModDate (D:20231114221320Z) >>")], prev, "/Info 6 0 R");
     let inspection = inspect(&base, &edited, InspectLimits::default()).unwrap();
     assert_eq!((inspection.text, inspection.content), (TextChanges::default(), ContentChanges::default()), "{inspection:?}");
+}
+
+#[test]
+fn the_document_information_is_exempt_only_as_a_dictionary_of_direct_values() {
+    // The one object an update may write that nothing reads is the trailer's /Info, and only as
+    // a dictionary leading nowhere: a stream named /Info, or a dictionary holding a reference,
+    // is refused (on the first version of the audit both were exempt).
+    let mut b = Builder::new();
+    head(&mut b);
+    b.object(3, format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R {RESOURCES} >>").as_bytes());
+    b.object(4, &stream("", &text("Alpha")));
+    b.object(5, b"<< /Title (Agreement) >>");
+    let rows = b.offsets.clone();
+    let base = b.finish(6, &rows, "/Info 5 0 R");
+    let prev = Some(last_section(&base));
+    let form = stream("/Type /XObject /Subtype /Form /BBox [0 0 10 10]", b"0 g 0 0 10 10 re f");
+    for (case, objects) in [
+        ("a stream as /Info", vec![(5u32, form.as_slice())]),
+        ("a reference in /Info", vec![(5, b"<< /Title 6 0 R >>".as_slice()), (6, b"(Agreement)".as_slice())]),
+    ] {
+        let edited = update_section(&base, &objects, prev, "/Info 5 0 R");
+        match inspect(&base, &edited, InspectLimits::default()) {
+            Err(InspectError::Edited(message)) => assert!(message.contains("nothing this comparison reports reads"), "{case}: {message}"),
+            other => panic!("{case}: {other:?}"),
+        }
+    }
+}
+
+/// A one-page file showing "Alpha" and, unless `boxed`, a word at (150, 20) (with `boxed`, a
+/// black box over where it was), whose catalog has `catalog` entries and the objects `extra`
+/// (6 onwards).
+fn tagged(boxed: bool, catalog: &str, extra: &[&[u8]]) -> Vec<u8> {
+    let mut b = Builder::new();
+    b.object(1, format!("<< /Type /Catalog /Pages 2 0 R {catalog} >>").as_bytes());
+    b.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 300] >>");
+    b.object(3, format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R {RESOURCES} >>").as_bytes());
+    let last = if boxed { "0 g 146 14 16 18 re f" } else { "BT /F1 12 Tf 150 20 Td (X) Tj ET" };
+    b.object(4, &stream("", &[text("Alpha"), b"\n".to_vec(), last.as_bytes().to_vec()].concat()));
+    b.object(5, b"null");
+    for (i, body) in extra.iter().enumerate() {
+        b.object(6 + i as u32, body);
+    }
+    let rows = b.offsets.clone();
+    b.finish(6 + extra.len() as u32, &rows, "")
+}
+
+#[test]
+fn the_structure_tree_s_text_may_only_be_taken_away_by_a_rewrite() {
+    // The tags' text is what assistive technology reads and what copying gives: a rewrite (a
+    // redaction) may take some away, as the redactor cleans the tags of what it removed, but
+    // never add or change any; an appended update may not change the tree at all. On e91797d
+    // the structure tree was not compared at all.
+    let tree = |alt: &str| -> Vec<Vec<u8>> {
+        vec![b"<< /Type /StructTreeRoot /K 7 0 R >>".to_vec(), format!("<< /S /Figure /P 6 0 R /Pg 3 0 R {alt} /K 0 >>").into_bytes()]
+    };
+    let file = |boxed: bool, alt: &str| {
+        let objects = tree(alt);
+        tagged(boxed, "/StructTreeRoot 6 0 R /MarkInfo << /Marked true >>", &objects.iter().map(Vec::as_slice).collect::<Vec<_>>())
+    };
+    let base = file(false, "/Alt (A signature)");
+    assert!(inspect(&base, &base, InspectLimits::default()).is_ok());
+    // (case, the element's text entries in the rewrite, accepted)
+    for (case, alt, accepted) in [
+        ("as it was", "/Alt (A signature)", true),
+        ("taken away", "", true),
+        ("changed", "/Alt (No signature)", false),
+        ("added", "/Alt (A signature) /ActualText (Paid)", false),
+        ("a language added", "/Alt (A signature) /Lang (en)", false),
+    ] {
+        let result = inspect(&base, &file(true, alt), InspectLimits::default());
+        if accepted {
+            let inspection = result.unwrap_or_else(|error| panic!("{case}: {error:?}"));
+            assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{case}: {inspection:?}");
+        } else {
+            match result {
+                Err(InspectError::Edited(message)) => assert!(message.contains("structure tree"), "{case}: {message}"),
+                other => panic!("{case}: {other:?}"),
+            }
+        }
+    }
+    // An appended update may not change the tree, its text or anything else in it.
+    let prev = Some(last_section(&base));
+    for (case, element) in [
+        ("text taken away", "<< /S /Figure /P 6 0 R /Pg 3 0 R /K 0 >>"),
+        ("another role", "<< /S /Span /P 6 0 R /Pg 3 0 R /Alt (A signature) /K 0 >>"),
+    ] {
+        let edited = update_section(&base, &[(7, element.as_bytes())], prev, "");
+        match inspect(&base, &edited, InspectLimits::default()) {
+            Err(InspectError::Edited(message)) => assert!(message.contains("structure tree"), "{case}: {message}"),
+            other => panic!("{case}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn the_version_mark_info_and_metadata_are_compared() {
+    // `/Version` and `/MarkInfo` may not change, nor `/Metadata`, which a rewrite may remove
+    // (an editor's sanitising does) but not change. On e91797d all three were left out.
+    let xmp = |title: &str| stream("/Type /Metadata /Subtype /XML", format!("<x:xmpmeta xmlns:x='adobe:ns:meta/'>{title}</x:xmpmeta>").as_bytes());
+    let file = |boxed: bool, catalog: &str, title: &str| tagged(boxed, catalog, &[&xmp(title)]);
+    let base = file(false, "/Version /1.7 /MarkInfo << /Marked true >> /Metadata 6 0 R", "Agreement");
+    // (case, catalog, title, accepted)
+    for (case, catalog, title, accepted) in [
+        ("as it was", "/Version /1.7 /MarkInfo << /Marked true >> /Metadata 6 0 R", "Agreement", true),
+        ("the metadata removed", "/Version /1.7 /MarkInfo << /Marked true >>", "Agreement", true),
+        ("the metadata changed", "/Version /1.7 /MarkInfo << /Marked true >> /Metadata 6 0 R", "Another", false),
+        ("another version", "/Version /2.0 /MarkInfo << /Marked true >> /Metadata 6 0 R", "Agreement", false),
+        ("marked otherwise", "/Version /1.7 /MarkInfo << /Marked true /Suspects true >> /Metadata 6 0 R", "Agreement", false),
+    ] {
+        let result = inspect(&base, &file(true, catalog, title), InspectLimits::default());
+        match (accepted, result) {
+            (true, Ok(inspection)) => assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{case}"),
+            (false, Err(InspectError::Edited(message))) => assert!(message.contains("changed"), "{case}: {message}"),
+            (_, other) => panic!("{case}: {other:?}"),
+        }
+    }
+    // In an appended update, the metadata removed is a change.
+    let prev = Some(last_section(&base));
+    let catalog = "<< /Type /Catalog /Pages 2 0 R /Version /1.7 /MarkInfo << /Marked true >> >>".to_string();
+    let edited = update_section(&base, &[(1, catalog.as_bytes())], prev, "");
+    assert!(matches!(inspect(&base, &edited, InspectLimits::default()), Err(InspectError::Edited(_))));
 }

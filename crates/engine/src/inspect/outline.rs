@@ -87,7 +87,7 @@ pub(crate) fn compare(
         if !paired && entry.acts {
             return Err(Fail::Read("an added outline entry has an action other than going to a destination".into()));
         }
-        if !paired && matches!(entry.destination, Destination::Other(_) | Destination::Unpaged(_)) {
+        if !paired && matches!(entry.destination, Destination::Other(_) | Destination::Unpaged(_) | Destination::NullPage(_)) {
             return Err(Fail::Read("an added outline entry goes somewhere other than one of the file's pages".into()));
         }
     }
@@ -104,9 +104,13 @@ pub(crate) fn followed(before: &Destination, after: &Destination, pages: &BTreeM
     match (before, after) {
         (Destination::Page(page, view), Destination::Page(now, same)) if pages.get(page) == Some(now) && view == same => Ok(page != now),
         (Destination::Page(page, _), Destination::None) if !pages.contains_key(page) => Ok(true),
-        (Destination::Page(page, view), Destination::Unpaged(same)) if !pages.contains_key(page) && view == same => Ok(true),
+        (Destination::Page(page, view), Destination::Unpaged(same) | Destination::NullPage(same)) if !pages.contains_key(page) && view == same => {
+            Ok(true)
+        }
         (Destination::None, Destination::None) => Ok(false),
-        (Destination::Unpaged(view), Destination::Unpaged(same)) if view == same => Ok(false),
+        (Destination::Unpaged(view), Destination::Unpaged(same)) | (Destination::NullPage(view), Destination::NullPage(same)) if view == same => {
+            Ok(false)
+        }
         (Destination::Named(name), Destination::Named(same)) if name == same => Ok(false),
         (Destination::Other(other), Destination::Other(same)) if other == same => Ok(false),
         _ => Err(Fail::Read("a destination changed other than by following its page".into())),
