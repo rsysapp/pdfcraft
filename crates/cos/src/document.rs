@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use crate::CosError;
-use crate::object::{Dict, ObjRef, Object};
+use crate::object::{Dict, ObjRef, Object, Stream};
 use crate::parser::{Lexer, is_whitespace, parse_indirect};
 
 thread_local! {
@@ -487,7 +487,12 @@ impl Document {
         // cycles such as `6 0 obj << /Length 6 0 R >>`. Bound the nesting on every path.
         let _guard =
             LoadGuard::enter(num).ok_or_else(|| CosError::Syntax { offset: 0, detail: format!("reference cycle while loading object {num}") })?;
-        let obj = self.load(num, 0)?;
+        let mut obj = self.load(num, 0)?;
+        // Embed build: a stream's indirect /Filter or /DecodeParms applies like a direct one (it
+        // was ignored, and the data taken as decoded); hayro, PDFium and pdf.js resolve it.
+        if let Object::Stream(stream) = &mut obj {
+            Stream::resolve_coding(&mut stream.dict, |r| self.try_get(r.num).ok().map(|o| (*o).clone()));
+        }
         let obj = Arc::new(obj);
         self.cache.lock().map_err(|_| CosError::Poisoned)?.insert(num, obj.clone());
         Ok(obj)

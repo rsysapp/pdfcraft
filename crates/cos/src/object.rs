@@ -179,6 +179,44 @@ impl Stream {
         Self { dict, raw: Arc::new(pdfcraft_filters::encode_flate(data)) }
     }
 
+    /// Embed build: replace an indirect `/Filter` or `/DecodeParms` (or an indirect entry of
+    /// either's array) with the object it refers to, as readers apply them (ISO 32000-2 §7.3.8.2
+    /// lets any value be indirect). `get` loads a reference (`None`: it cannot be loaded, and the
+    /// reference stays). Only that one level is resolved: a reference to a reference stays, and
+    /// [`Stream::decoded_strict`] refuses it.
+    pub fn resolve_coding(dict: &mut Dict, mut get: impl FnMut(ObjRef) -> Option<Object>) {
+        for key in [b"Filter".as_slice(), b"DecodeParms".as_slice()] {
+            let resolved = match dict.get(key) {
+                Some(Object::Ref(r)) => get(*r),
+                Some(Object::Array(items)) if items.iter().any(|item| matches!(item, Object::Ref(_))) => Some(Object::Array(
+                    items.iter().map(|item| if let Object::Ref(r) = item { get(*r).unwrap_or_else(|| item.clone()) } else { item.clone() }).collect(),
+                )),
+                _ => None,
+            };
+            if let Some(resolved) = resolved {
+                dict.set(key.to_vec(), resolved);
+            }
+        }
+    }
+
+    /// Embed build: the coding entries' shape, for strict decoding: `/Filter` a name or an array
+    /// of names, `/DecodeParms` a dictionary or an array of dictionaries and nulls (either may be
+    /// absent or null). [`Stream::filters`] skips anything else, which would take the data for
+    /// something it is not.
+    fn coding_is_well_formed(&self) -> bool {
+        let filter = match self.dict.get(b"Filter") {
+            None | Some(Object::Null | Object::Name(_)) => true,
+            Some(Object::Array(items)) => items.iter().all(|item| matches!(item, Object::Name(_))),
+            _ => false,
+        };
+        let parms = match self.dict.get(b"DecodeParms") {
+            None | Some(Object::Null | Object::Dict(_)) => true,
+            Some(Object::Array(items)) => items.iter().all(|item| matches!(item, Object::Null | Object::Dict(_))),
+            _ => false,
+        };
+        filter && parms
+    }
+
     /// The filter chain declared in the dictionary.
     pub fn filters(&self) -> Vec<(Filter, Params)> {
         let names: Vec<&[u8]> = match self.dict.get(b"Filter") {
@@ -236,6 +274,9 @@ impl Stream {
     /// Embed build: like [`Stream::decoded_strict`], and decoding past `max` bytes is an error too
     /// (a caller with a work budget, such as a save inspector).
     pub fn decoded_strict_within(&self, max: usize) -> Result<Vec<u8>, CosError> {
+        if !self.coding_is_well_formed() {
+            return Err(CosError::Filter("the stream's /Filter or /DecodeParms is not a name, a dictionary or an array of them".into()));
+        }
         let chain = self.filters();
         if chain.is_empty() {
             if self.raw.len() > max {
