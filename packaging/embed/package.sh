@@ -94,6 +94,11 @@ cargo build --release --locked --target wasm32-unknown-unknown -p pdfcraft-embed
 
 "$WASM_BINDGEN" --target web --typescript --out-dir "$WORK/bindgen" --out-name pdfcraft_embed \
   "$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/pdfcraft_embed.wasm"
+# The bundle is a flat list of files: JavaScript snippets from a dependency would need a new layout.
+if [ -e "$WORK/bindgen/snippets" ]; then
+  echo "error: wasm-bindgen wrote JavaScript snippets ($WORK/bindgen/snippets); the bundle's file list must change first" >&2
+  exit 1
+fi
 # As trunk's data-wasm-opt="z" for the web app: wasm-opt reads the module's own feature list.
 "$WASM_OPT" -Oz -o "$OUT/pdfcraft_embed_bg.wasm" "$WORK/bindgen/pdfcraft_embed_bg.wasm"
 cp "$WORK/bindgen/pdfcraft_embed.js" "$WORK/bindgen/pdfcraft_embed.d.ts" "$OUT/"
