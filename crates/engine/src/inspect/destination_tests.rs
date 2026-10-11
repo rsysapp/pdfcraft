@@ -803,3 +803,116 @@ fn a_page_number_no_destination_rule_follows_is_refused_once_pages_move() {
         }
     }
 }
+
+// ── R6b-46: page labels follow their pages ──────────────────────────────────────────────────
+
+/// Five pages labelled i, ii, then 1, 2, 3 (catalog entry `labels`, a number tree).
+fn labelled(labels: &str) -> Vec<u8> {
+    pages(5, &format!("/PageLabels {labels}"), false, |_| String::new(), &[])
+}
+
+const ROMAN_THEN_DECIMAL: &str = "<< /Nums [0 << /S /r >> 2 << /S /D >>] >>";
+
+/// `base` with its catalog's labels replaced by `labels` (`""`: none) and, when `kids` is given,
+/// its page tree's kids (page objects 10…) replaced by them: an update another editor could write.
+fn relabelled(base: &[u8], labels: &str, kids: Option<&[u32]>) -> Vec<u8> {
+    let catalog = format!("<< /Type /Catalog /Pages 2 0 R {} >>", if labels.is_empty() { String::new() } else { format!("/PageLabels {labels}") });
+    let mut objects = vec![(1, catalog)];
+    if let Some(kids) = kids {
+        let list: Vec<String> = kids.iter().map(|kid| format!("{kid} 0 R")).collect();
+        objects.push((2, format!("<< /Type /Pages /Kids [{}] /Count {} /MediaBox [0 0 200 300] >>", list.join(" "), kids.len())));
+    }
+    let objects: Vec<(u32, &str)> = objects.iter().map(|(num, body)| (*num, body.as_str())).collect();
+    update_objects(base, &objects, 25)
+}
+
+#[test]
+fn page_labels_follow_their_pages_through_deletes_and_moves() {
+    let base = labelled(ROMAN_THEN_DECIMAL);
+    // Unchanged, rotated, annotated and the last page deleted: every label stays where it was.
+    assert_eq!(run(&base, &base).unwrap().labels, PageLabelChanges::default());
+    for edits in [vec![Edit::RotatePages { pages: vec![1], degrees: 90 }], vec![sticky_note(0)], vec![Edit::DeletePages { pages: vec![4] }]] {
+        let inspection = run(&base, &session(&base, edits)).unwrap();
+        assert_eq!((inspection.labels, inspection.info.changed.len()), (PageLabelChanges::default(), 1), "{inspection:?}");
+    }
+    // The first page deleted: the labels follow (ii, 1, 2, 3) when rewritten so…
+    let deleted = relabelled(&base, "<< /Nums [0 << /S /r /St 2 >> 1 << /S /D >>] >>", Some(&[11, 12, 13, 14]));
+    let inspection = run(&base, &deleted).unwrap();
+    assert_eq!(inspection.pages, PageChanges { before: 5, after: 4, deleted: 1, ..PageChanges::default() });
+    assert_eq!(inspection.labels, PageLabelChanges { followed: 4 });
+    // … written otherwise but showing the same (a range per page, the prefix-less style kept).
+    let deleted = relabelled(
+        &base,
+        "<< /Nums [0 << /Type /PageLabel /S /r /St 2 >> 1 << /S /D /St 1 >> 2 << /S /D /St 2 /P () >> 3 << /S /D /St 3 >>] >>",
+        Some(&[11, 12, 13, 14]),
+    );
+    assert_eq!(run(&base, &deleted).unwrap().labels, PageLabelChanges { followed: 4 });
+    // … and a number tree with kids.
+    let deleted = relabelled(
+        &base,
+        "<< /Kids [<< /Limits [0 0] /Nums [0 << /S /r /St 2 >>] >> << /Limits [1 1] /Nums [1 << /S /D >>] >>] >>",
+        Some(&[11, 12, 13, 14]),
+    );
+    assert_eq!(run(&base, &deleted).unwrap().labels, PageLabelChanges { followed: 4 });
+    // Left as they were, the labels shift onto other pages (page 2 would show "i"): refused,
+    // whether the editor or an update deleted the page.
+    let message = refused(run(&base, &session(&base, vec![Edit::DeletePages { pages: vec![0] }])));
+    assert!(message.contains("page 1's label changed"), "{message}");
+    refused(run(&base, &relabelled(&base, ROMAN_THEN_DECIMAL, Some(&[11, 12, 13, 14]))));
+    // The last page moved first: 3, i, ii, 1, 2.
+    let moved = relabelled(&base, "<< /Nums [0 << /S /D /St 3 >> 1 << /S /r >> 3 << /S /D >>] >>", Some(&[14, 10, 11, 12, 13]));
+    let inspection = run(&base, &moved).unwrap();
+    assert_eq!((inspection.pages.moved, inspection.labels), (1, PageLabelChanges { followed: 5 }), "{inspection:?}");
+    let message = refused(run(&base, &session(&base, vec![Edit::MovePages { pages: vec![4], to: 0 }])));
+    assert!(message.contains("label changed"), "{message}");
+    // A page inserted may show any label; the others keep theirs.
+    let inserted = session(&base, vec![Edit::InsertBlankPage { at: 5, width: 200.0, height: 300.0 }]);
+    let inspection = run(&base, &inserted).unwrap();
+    assert_eq!((inspection.pages.inserted, inspection.labels), (1, PageLabelChanges::default()), "{inspection:?}");
+}
+
+#[test]
+fn a_forged_relabel_is_refused() {
+    let base = labelled(ROMAN_THEN_DECIMAL);
+    for (case, labels) in [
+        ("upper-case roman numerals", "<< /Nums [0 << /S /R >> 2 << /S /D >>] >>"),
+        ("a prefix", "<< /Nums [0 << /S /r >> 2 << /S /D /P (A-) >>] >>"),
+        ("another start", "<< /Nums [0 << /S /r >> 2 << /S /D /St 7 >>] >>"),
+        ("the decimals one page later", "<< /Nums [0 << /S /r >> 3 << /S /D >>] >>"),
+        ("a prefix alone", "<< /Nums [0 << /S /r >> 2 << /P (Annex) >>] >>"),
+        ("no labels", ""),
+    ] {
+        let message = refused(run(&base, &relabelled(&base, labels, None)));
+        assert!(message.contains("label changed"), "{case}: {message}");
+    }
+    // Labels added to a file without them, even ones showing the page numbers.
+    let plain = pages(5, "", false, |_| String::new(), &[]);
+    refused(run(&plain, &relabelled(&plain, "<< /Nums [0 << /S /D >>] >>", None)));
+    // Written otherwise, showing the same on every page: not a change.
+    let same = relabelled(&base, "<< /Nums [0 << /S /r /St 1 >> 2 << /S /D >> 9 << /S /A >>] >>", None);
+    assert_eq!(run(&base, &same).unwrap().labels, PageLabelChanges::default());
+}
+
+#[test]
+fn labels_readers_could_read_differently_are_compared_whole() {
+    for (case, labels) in [
+        ("keys out of order", "<< /Nums [2 << /S /D >> 0 << /S /r >>] >>"),
+        ("a key twice", "<< /Nums [0 << /S /r >> 0 << /S /D >>] >>"),
+        ("an unknown style", "<< /Nums [0 << /S /Q >>] >>"),
+        ("a start of 0", "<< /Nums [0 << /S /D /St 0 >>] >>"),
+        ("a real start", "<< /Nums [0 << /S /D /St 2.0 >>] >>"),
+        ("an unknown entry", "<< /Nums [0 << /S /D /X 1 >>] >>"),
+        ("limits that do not bound", "<< /Kids [<< /Limits [0 1] /Nums [0 << /S /r >>] >>] >>"),
+        ("a real key", "<< /Nums [0.0 << /S /D >>] >>"),
+    ] {
+        let base = labelled(labels);
+        // Unchanged and rotated: accepted, nothing to follow.
+        assert_eq!(run(&base, &base).unwrap().labels, PageLabelChanges::default(), "{case}");
+        let rotated = session(&base, vec![Edit::RotatePages { pages: vec![0], degrees: 90 }]);
+        assert_eq!(run(&base, &rotated).unwrap().labels, PageLabelChanges::default(), "{case}");
+        // Any page deleted or moved: refused, whatever the labels then say.
+        let message = refused(run(&base, &session(&base, vec![Edit::DeletePages { pages: vec![4] }])));
+        assert!(message.contains("cannot be compared page by page"), "{case}: {message}");
+        refused(run(&base, &relabelled(&base, labels, Some(&[14, 10, 11, 12, 13]))));
+    }
+}

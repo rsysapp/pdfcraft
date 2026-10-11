@@ -206,13 +206,15 @@ fn spans_kept(base: &[Span], edited: &[Span]) -> Option<usize> {
 ///   named destinations name by name; `/Names` is compared whole but for its `/Dests` tree, which
 ///   is compared name by name too);
 /// - `/StructTreeRoot` (tags): compared on its own (see [`StructFacts`]): a redaction cleans
-///   the tags of what it removed.
+///   the tags of what it removed;
+/// - `/PageLabels`: compared page by page (see [`PageLabels`]): each page's label must follow
+///   its page (R6b-46).
 ///
 /// `/Metadata` (the XMP packet), `/MarkInfo` and `/Version` are compared like any other entry:
 /// the document information a viewer or assistive technology reads, and what the file says it
 /// uses. `/Metadata` may be removed by a rewrite (an editor's sanitising removes it), never
 /// changed (see [`catalog_change`]).
-const CATALOG_REPORTED: [&[u8]; 6] = [b"Pages", b"AcroForm", b"OCProperties", b"Outlines", b"Dests", b"StructTreeRoot"];
+const CATALOG_REPORTED: [&[u8]; 7] = [b"Pages", b"AcroForm", b"OCProperties", b"Outlines", b"Dests", b"StructTreeRoot", b"PageLabels"];
 
 /// Stream-dictionary entries that say how the data is encoded, not what it is.
 const CODING_KEYS: [&[u8]; 4] = [b"Filter", b"DecodeParms", b"Length", b"DL"];
@@ -466,6 +468,32 @@ type NamedDestinations = (BTreeMap<NamedKey, Destination>, Vec<(Vec<u8>, Digest)
 /// The most nodes and entries a name tree may have.
 const MAX_NAME_TREE_ENTRIES: usize = 100_000;
 
+/// The page labels (the catalog's `/PageLabels`: what a viewer shows for a page, "iii", "A-2"),
+/// page by page (R6b-46).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PageLabels {
+    /// Each page's label, in page order: `None` where no range covers the page (and for every
+    /// page of a file without labels: a viewer shows its number).
+    Read(Vec<Option<PageLabel>>),
+    /// A tree or a label dictionary readers could read differently (keys out of order, `/Limits`
+    /// that do not bound a node, a style no reader shares, a start below 1, an entry no label
+    /// has, …): compared whole, by the catalog entry's digest.
+    Unreadable(Digest),
+}
+
+/// One page's label as every viewer forms it: the range's numbering style, its prefix and the
+/// page's number in the range (its `/St` plus the page's place in the range). Equal labels show
+/// alike in any viewer, however the ranges that give them are written.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PageLabel {
+    /// `/S`: `D`, `R`, `r`, `A` or `a`; 0 for a prefix alone.
+    pub style: u8,
+    /// `/P`'s bytes (`None`: no prefix, or an empty one).
+    pub prefix: Option<Digest>,
+    /// The number shown (0 for a prefix alone, which shows none).
+    pub number: u64,
+}
+
 /// One use of an image on a page, as hayro's interpreter drew it.
 #[derive(Clone, Debug)]
 pub(crate) struct ImageUse {
@@ -565,6 +593,10 @@ pub(crate) struct Structure {
     /// Compared by digest, it would go to another page, unseen, once pages are deleted, moved or
     /// inserted (R6b-43). Filled in after reading (see `inspect::read_side`).
     pub numbered_destinations: bool,
+    /// The page labels, page by page (R6b-46).
+    pub page_labels: PageLabels,
+    /// The catalog's `/PageLabels` entry's digest (`None`: there is none).
+    pub page_labels_digest: Option<Digest>,
 }
 
 /// The fingerprint pages are matched by: content, resources, images and text.
@@ -2694,6 +2726,145 @@ impl Reader<'_, '_> {
         Ok(())
     }
 
+    /// The page labels, page by page (see [`PageLabels`], R6b-46): the catalog's `/PageLabels`
+    /// number tree (ISO 32000-2 §7.9.7, §12.4.2) read strictly, since viewers search it each
+    /// their own way: keys whole numbers (written directly) in increasing order, `/Limits` that
+    /// bound each node, no node with both `/Kids` and `/Nums` (or neither, but for an empty
+    /// root), no entry other than those; each label dictionary only `/Type /PageLabel`, `/S` one
+    /// of the five styles, `/P` a string and `/St` a whole number from 1. Anything else is
+    /// [`PageLabels::Unreadable`], compared whole (`digest`, the catalog entry's).
+    fn page_labels(&mut self, catalog: &Dict, pages: usize, digest: Option<Digest>) -> Result<PageLabels, Fail> {
+        let (Some(tree), Some(digest)) = (catalog.get(b"PageLabels"), digest) else { return Ok(PageLabels::Read(vec![None; pages])) };
+        let mut entries = Vec::new();
+        if !self.number_node(tree, 0, true, &mut BTreeSet::new(), &mut entries)? {
+            return Ok(PageLabels::Unreadable(digest));
+        }
+        if entries.windows(2).any(|pair| pair.first().map(|entry| entry.0) >= pair.get(1).map(|entry| entry.0)) {
+            return Ok(PageLabels::Unreadable(digest));
+        }
+        // Each range's label dictionary, read once.
+        let mut ranges: Vec<(u64, PageLabel)> = Vec::with_capacity(entries.len());
+        for (start, value) in entries {
+            self.budget.tick()?;
+            match self.label_spec(&value)? {
+                Some(label) => ranges.push((start, label)),
+                None => return Ok(PageLabels::Unreadable(digest)),
+            }
+        }
+        let mut labels = Vec::with_capacity(pages);
+        let mut range = 0usize;
+        for page in 0..pages {
+            self.budget.tick()?;
+            let page = page as u64;
+            while ranges.get(range.saturating_add(1)).is_some_and(|(start, _)| *start <= page) {
+                range = range.saturating_add(1);
+            }
+            let label = match ranges.get(range) {
+                Some((start, spec)) if *start <= page => {
+                    let number = if spec.style == 0 {
+                        0
+                    } else {
+                        // A start below 2^63 plus a page index cannot overflow; refused, not
+                        // wrapped, all the same.
+                        match spec.number.checked_add(page.saturating_sub(*start)) {
+                            Some(number) => number,
+                            None => return Ok(PageLabels::Unreadable(digest)),
+                        }
+                    };
+                    Some(PageLabel { number, ..spec.clone() })
+                }
+                _ => None,
+            };
+            labels.push(label);
+        }
+        Ok(PageLabels::Read(labels))
+    }
+
+    /// One node of a number tree and everything under it, its entries appended to `out` in
+    /// order. `Ok(false)`: a tree readers could read differently (see [`Reader::page_labels`]).
+    fn number_node(
+        &mut self,
+        node: &Object,
+        depth: usize,
+        root: bool,
+        seen: &mut BTreeSet<ObjRef>,
+        out: &mut Vec<(u64, Object)>,
+    ) -> Result<bool, Fail> {
+        self.budget.tick()?;
+        if depth > MAX_TREE_DEPTH {
+            return Ok(false);
+        }
+        if let Object::Ref(r) = node
+            && !seen.insert(*r)
+        {
+            return Ok(false);
+        }
+        let Object::Dict(dict) = &*self.resolve(node)? else { return Ok(false) };
+        if dict.iter().any(|(key, _)| !matches!(key.as_slice(), b"Kids" | b"Nums" | b"Limits")) {
+            return Ok(false);
+        }
+        let start = out.len();
+        match (dict.get(b"Kids"), dict.get(b"Nums")) {
+            (Some(_), Some(_)) => return Ok(false),
+            (Some(kids), None) => {
+                let Object::Array(kids) = &*self.resolve(kids)? else { return Ok(false) };
+                for kid in kids {
+                    if !self.number_node(kid, depth.saturating_add(1), false, seen, out)? {
+                        return Ok(false);
+                    }
+                }
+            }
+            (None, Some(nums)) => {
+                let Object::Array(items) = &*self.resolve(nums)? else { return Ok(false) };
+                if items.len() % 2 != 0 {
+                    return Ok(false);
+                }
+                for pair in items.chunks(2) {
+                    let (Some(Object::Int(key)), Some(value)) = (pair.first(), pair.get(1)) else { return Ok(false) };
+                    let Ok(key) = u64::try_from(*key) else { return Ok(false) };
+                    if out.len() >= MAX_NAME_TREE_ENTRIES {
+                        return Err(Fail::TooComplex);
+                    }
+                    out.push((key, value.clone()));
+                }
+            }
+            (None, None) if root => {}
+            (None, None) => return Ok(false),
+        }
+        if let Some(limits) = dict.get(b"Limits") {
+            let Object::Array(limits) = &*self.resolve(limits)? else { return Ok(false) };
+            let held = out.get(start..).unwrap_or_default();
+            let (Some(first), Some(last)) = (held.first(), held.last()) else { return Ok(false) };
+            let bounds: Vec<Option<u64>> =
+                limits.iter().map(|limit| if let Object::Int(limit) = limit { u64::try_from(*limit).ok() } else { None }).collect();
+            if bounds.as_slice() != [Some(first.0), Some(last.0)] {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// A label dictionary as the label of its range's first page (`number` its `/St`); `None`
+    /// where readers could form it differently (see [`Reader::page_labels`]).
+    fn label_spec(&mut self, value: &Object) -> Result<Option<PageLabel>, Fail> {
+        let Object::Dict(dict) = &*self.resolve(value)? else { return Ok(None) };
+        let mut label = PageLabel { style: 0, prefix: None, number: 1 };
+        for (key, value) in dict.iter() {
+            let value = self.resolve(value)?;
+            match (key.as_slice(), &*value) {
+                (b"Type", Object::Name(name)) if name.as_slice() == b"PageLabel" => {}
+                (b"S", Object::Name(name)) => match name.as_slice() {
+                    [style @ (b'D' | b'R' | b'r' | b'A' | b'a')] => label.style = *style,
+                    _ => return Ok(None),
+                },
+                (b"P", Object::String(prefix)) => label.prefix = (!prefix.bytes.is_empty()).then(|| sha256(&[b"prefix", &prefix.bytes])),
+                (b"St", Object::Int(first)) if *first >= 1 => label.number = u64::try_from(*first).unwrap_or(1),
+                _ => return Ok(None),
+            }
+        }
+        Ok(Some(label))
+    }
+
     /// A named destination's value: an explicit destination, or a dictionary whose `/D` is one
     /// (a dictionary with other entries is compared whole).
     fn named_value(&mut self, value: &Object, pages: &HashMap<ObjRef, usize>) -> Result<Destination, Fail> {
@@ -3445,6 +3616,8 @@ pub(crate) fn read(
     let outline_root = reader.digest_without(&root, &[b"Type", b"First", b"Last", b"Count"])?;
     let (named_destinations, name_tree_keys) = reader.named_destinations(&catalog, &page_index)?;
     let info = reader.document_information(doc.trailer())?;
+    let page_labels_digest = catalog.get(b"PageLabels").map(|labels| reader.digest(labels)).transpose()?;
+    let page_labels = reader.page_labels(&catalog, nodes.len(), page_labels_digest)?;
     let mut entries = BTreeMap::new();
     for (key, value) in catalog.iter() {
         if CATALOG_REPORTED.contains(&key.as_slice()) {
@@ -3495,6 +3668,8 @@ pub(crate) fn read(
             misdeclared: BTreeSet::new(),
             info,
             numbered_destinations: false,
+            page_labels,
+            page_labels_digest,
         },
         known,
     ))

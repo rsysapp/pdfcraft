@@ -101,6 +101,8 @@ pub struct Inspection {
     pub content: ContentChanges,
     pub outlines: OutlineChanges,
     pub destinations: DestinationChanges,
+    /// The page labels, page by page (R6b-46).
+    pub labels: PageLabelChanges,
     /// The document information (title, author, …), compared in both kinds of save (R6b-42).
     pub info: InfoChanges,
     /// What a rewrite took away that no viewer draws on a page (R6b-41).
@@ -299,6 +301,28 @@ pub struct DestinationChanges {
     /// go-to action) followed its page. Their annotation is otherwise unchanged: such a link is
     /// not counted in `annotations.changed`.
     pub links: u32,
+}
+
+/// The page labels (the catalog's `/PageLabels`: what a viewer shows for a page in place of its
+/// number, "iii", "7", "A-2"), page by page (R6b-46). Each page present in both files must show
+/// the label it showed: its numbering style, prefix and number. A page deleted takes its label
+/// with it; a page inserted may show any label (it is reported inserted). So a label follows its
+/// page through deletes, moves and inserts, reported here; any other label change (a page
+/// relabelled, a label left behind on the page that took another's place when pages were
+/// deleted, moved or inserted, labels added or removed) fails the inspection. A page no range
+/// covers (or every page of a file without labels) shows its number: one moved shows its new
+/// number, as without labels.
+///
+/// Labels readers could read differently (a number tree with keys out of order or `/Limits`
+/// that do not bound a node, a style no reader shares, a start below 1, an entry no label has,
+/// …) are compared whole: unchanged, they are accepted only while no page is deleted, moved or
+/// inserted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PageLabelChanges {
+    /// Pages present in both files, now at another page number, whose label went with them
+    /// (the edited file's labels give them the label the base's gave them). A host may accept
+    /// these as part of a page delete, move or insert.
+    pub followed: u32,
 }
 
 /// The document information dictionary (the trailer's `/Info`: title, author, subject,
@@ -703,6 +727,7 @@ fn compare(base: &[u8], edited: &[u8], limits: Limits) -> Result<Inspection, Ins
             "a destination gives its page by number where this comparison cannot follow it (an action, a named destination with other entries, …), and pages were deleted, moved or inserted".into(),
         ));
     }
+    inspection.labels = labels_followed(&before.structure, &after.structure, &pairs, renumbered)?;
     if before.structure.outline_root != after.structure.outline_root {
         return Err(InspectError::Edited("the outline's root dictionary changed, which this comparison does not report".into()));
     }
@@ -730,6 +755,35 @@ fn compare(base: &[u8], edited: &[u8], limits: Limits) -> Result<Inspection, Ins
     inspection.redaction_areas.sort_by(|(page_a, a), (page_b, b)| page_a.cmp(page_b).then(b[3].total_cmp(&a[3])).then(a[0].total_cmp(&b[0])));
     (inspection.annotations, inspection.destinations.links) = compare_annotations(&before, &after, &pairs, base_kept, &mut budget, &mut rasters)?;
     Ok(inspection)
+}
+
+/// Whether each page present in both files kept its label (see [`PageLabelChanges`]), and how
+/// many of them at another page number. `renumbered`: a page was deleted, moved or inserted.
+fn labels_followed(before: &Structure, after: &Structure, pairs: &Pairs, renumbered: bool) -> Result<PageLabelChanges, InspectError> {
+    use structure::PageLabels;
+    match (&before.page_labels, &after.page_labels) {
+        (PageLabels::Read(base), PageLabels::Read(edited)) => {
+            let mut followed = 0usize;
+            for &(old, new) in pairs {
+                let (Some(was), Some(is)) = (base.get(old), edited.get(new)) else {
+                    return Err(InspectError::Edited("a page went missing".into()));
+                };
+                if was != is {
+                    return Err(InspectError::Edited(format!(
+                        "page {}'s label changed (its page labels did not follow it), which this comparison does not report",
+                        new.saturating_add(1)
+                    )));
+                }
+                followed += usize::from(old != new && was.is_some());
+            }
+            Ok(PageLabelChanges { followed: count(followed) })
+        }
+        // Compared whole: unchanged, and every page where it was.
+        _ if !renumbered && before.page_labels_digest == after.page_labels_digest => Ok(PageLabelChanges::default()),
+        _ => {
+            Err(InspectError::Edited("the page labels changed, or cannot be compared page by page and pages were deleted, moved or inserted".into()))
+        }
+    }
 }
 
 /// The document information's keys whose value was added, removed or changed (see
