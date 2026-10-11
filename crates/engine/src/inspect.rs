@@ -78,6 +78,7 @@ use pdfcraft_render::content::{ContentDocument, ContentError, ContentOpenError, 
 mod glyphs;
 mod images;
 mod jpeg;
+mod layout;
 mod outline;
 mod structure;
 mod visual;
@@ -1017,7 +1018,7 @@ fn read_side(bytes: &[u8], against: Option<(&[u8], &Structure, bool)>, placement
     }
     // R6b-48: a rewrite carries nothing that is neither drawn nor referenced.
     if let Some((_, _, false)) = against {
-        side.unreached = match check_rewrite_reachable(&doc, &side.structure.sections, budget) {
+        side.unreached = match check_rewrite_reachable(&doc, &side.structure.sections, &known, budget) {
             Ok(()) => None,
             Err(Fail::Read(message)) => Some(message),
             Err(other) => return Err(other),
@@ -1075,7 +1076,7 @@ fn check_update_read(
 /// section's objects are carried, superseded, beside the ones read. Anything else could hold
 /// what the rewrite took away (the unredacted original as an object nothing reaches), which no
 /// fact would report. Each object visited counts toward the objects bound.
-fn check_rewrite_reachable(doc: &Document, sections: &[structure::Section], budget: &mut Budget) -> Result<(), Fail> {
+fn check_rewrite_reachable(doc: &Document, sections: &[structure::Section], known: &structure::Known, budget: &mut Budget) -> Result<(), Fail> {
     if sections.len() != 1 {
         return Err(Fail::Read(format!(
             "the rewrite has {} cross-reference sections, so it carries objects of an earlier one nothing reaches",
@@ -1083,6 +1084,24 @@ fn check_rewrite_reachable(doc: &Document, sections: &[structure::Section], budg
         )));
     }
     let section_offsets: BTreeSet<u64> = sections.iter().map(|section| section.offset).collect();
+    // Follow-up 7 audit (item 4): no bytes but what the cross-reference data lists.
+    let mut listed = Vec::new();
+    for num in doc.object_numbers() {
+        budget.tick()?;
+        if let Some(pdfcraft_cos::XrefEntry::InFile { offset, .. }) = doc.xref_entry(num) {
+            let offset = usize::try_from(offset).map_err(|_| Fail::Read(format!("object {num} lies past the file")))?;
+            let found = doc.try_get(num).map_err(|_| Fail::Read(format!("the rewrite holds object {num}, which cannot be read")))?;
+            let stream_length = match &*found {
+                pdfcraft_cos::Object::Stream(stream) => Some(stream.raw.len()),
+                _ => None,
+            };
+            listed.push(layout::ListedObject { offset, stream_length });
+        }
+    }
+    let section = sections.first().map(|section| section.offset).unwrap_or_default();
+    let section = usize::try_from(section).map_err(|_| Fail::Read("the cross-reference section lies past the file".into()))?;
+    let is_stream = doc.revisions().first().is_some_and(|revision| revision.is_stream);
+    layout::check(doc.bytes().as_slice(), &listed, (section, is_stream), budget)?;
     let mut reached: BTreeSet<u32> = BTreeSet::new();
     let mut todo: Vec<pdfcraft_cos::Object> = [&b"Root"[..], b"Info"].iter().filter_map(|key| doc.trailer().get(key).cloned()).collect();
     while let Some(object) = todo.pop() {
@@ -1093,10 +1112,16 @@ fn check_rewrite_reachable(doc: &Document, sections: &[structure::Section], budg
                     continue;
                 }
                 budget.object()?;
-                // An object that cannot be read is read as null by every fact; nothing to follow.
-                if let Ok(found) = doc.try_get(r.num) {
-                    todo.push((*found).clone());
+                // Follow-up 7 audit (item 5): an object reached that cannot be read is not
+                // passed over: what it holds is each reader's guess.
+                let found = doc.try_get(r.num).map_err(|_| Fail::Read(format!("the rewrite holds object {}, which cannot be read", r.num)))?;
+                // Follow-up 7 audit (item 4): reached is not compared. An object reached that no
+                // fact read (only through an entry no comparison reads) may hold nothing but
+                // references, or it could carry what the rewrite took away.
+                if !known.was_read(r.num) && carries_data(&found, budget)? {
+                    return Err(Fail::Read(format!("the rewrite holds object {}, which no comparison reads and which holds text or data", r.num)));
                 }
+                todo.push((*found).clone());
             }
             pdfcraft_cos::Object::Array(items) => todo.extend(items),
             pdfcraft_cos::Object::Dict(dict) => todo.extend(dict.iter().map(|(_, value)| value.clone())),
@@ -1133,6 +1158,22 @@ fn check_rewrite_reachable(doc: &Document, sections: &[structure::Section], budg
         }
     }
     Ok(())
+}
+
+/// Whether `object` (not following references) holds anything but references and nulls in
+/// arrays: a string, a stream, a dictionary (its keys are names), a name, a number or a
+/// boolean can each spell out text.
+fn carries_data(object: &pdfcraft_cos::Object, budget: &mut Budget) -> Result<bool, Fail> {
+    let mut todo = vec![object];
+    while let Some(object) = todo.pop() {
+        budget.tick()?;
+        match object {
+            pdfcraft_cos::Object::Array(items) => todo.extend(items),
+            pdfcraft_cos::Object::Ref(_) | pdfcraft_cos::Object::Null => {}
+            _ => return Ok(true),
+        }
+    }
+    Ok(false)
 }
 
 /// Whether `bytes` hold the name `/Encrypt` (not `/EncryptMetadata`).

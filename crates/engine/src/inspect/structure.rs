@@ -31,7 +31,7 @@ pub(crate) fn sha256(parts: &[&[u8]]) -> Digest {
 }
 
 /// Entries that point back up a tree (page → page tree, widget → field, pop-up → its markup,
-/// annotation → page): never followed when digesting, at any depth.
+/// annotation → page): never followed when digesting, at any depth (while they are references).
 const BACK_REFERENCES: [&[u8]; 3] = [b"Parent", b"P", b"Popup"];
 
 /// Page-dictionary entries compared on their own (or resolved through inheritance).
@@ -302,7 +302,7 @@ pub(crate) struct PageFacts {
     pub levels_agree: bool,
     /// A level closed that its content stream did not open, or left open at its end.
     pub levels_unbalanced: bool,
-    /// The page dictionary's own entries (not in [`PAGE_OWN_KEYS`] or [`PAGE_IGNORED`]), by
+    /// The page dictionary's own entries (not in [`PAGE_OWN_KEYS`], nor `/Type`), by
     /// their values' digests: in a rewrite they must be the same, but for [`PAGE_REMOVABLE`]
     /// ones removed.
     pub entries: BTreeMap<Vec<u8>, Digest>,
@@ -1194,6 +1194,19 @@ impl<'d, 'b> Reader<'d, 'b> {
     }
 
     /// The digest of a dictionary without some of its entries.
+    /// Embed build (follow-up 7 audit, item 4): [`Reader::digest_without`] for entries that
+    /// link (to a parent, a page, a tree, a count): each left out only while it is a reference
+    /// or a plain value (a number, name, boolean or null). Written as anything else (a dictionary,
+    /// array or string in place of a link) it is digested like any entry: no value can sit
+    /// uncompared under a key the comparison takes for a link.
+    fn digest_without_links(&mut self, d: &Dict, links: &[&[u8]]) -> Result<Digest, Fail> {
+        let plain =
+            |value: &Object| matches!(value, Object::Ref(_) | Object::Int(_) | Object::Real(_) | Object::Name(_) | Object::Bool(_) | Object::Null);
+        let kept: Dict =
+            d.iter().filter(|(key, value)| !(links.contains(&key.as_slice()) && plain(value))).map(|(k, v)| (k.clone(), v.clone())).collect();
+        self.digest(&Object::Dict(kept))
+    }
+
     fn digest_without(&mut self, d: &Dict, without: &[&[u8]]) -> Result<Digest, Fail> {
         let kept: Dict = d.iter().filter(|(key, _)| !without.contains(&key.as_slice())).map(|(k, v)| (k.clone(), v.clone())).collect();
         self.digest(&Object::Dict(kept))
@@ -1362,7 +1375,14 @@ impl<'d, 'b> Reader<'d, 'b> {
     }
 
     fn encode_dict(&mut self, d: &Dict, depth: usize, out: &mut Vec<u8>) -> Result<usize, Fail> {
-        let mut entries: Vec<(&Vec<u8>, &Object)> = d.iter().filter(|(key, _)| !BACK_REFERENCES.contains(&key.as_slice())).collect();
+        // Embed build (follow-up 7 audit, item 4): a back reference is left out only while it is
+        // one (a reference, or a plain value); written as a dictionary, array or string it is
+        // digested like any entry, so nothing can sit uncompared under its key.
+        let back_reference = |key: &[u8], value: &Object| {
+            BACK_REFERENCES.contains(&key)
+                && matches!(value, Object::Ref(_) | Object::Int(_) | Object::Real(_) | Object::Name(_) | Object::Bool(_) | Object::Null)
+        };
+        let mut entries: Vec<(&Vec<u8>, &Object)> = d.iter().filter(|(key, value)| !back_reference(key, value)).collect();
         entries.sort_by(|a, b| a.0.cmp(b.0));
         out.push(b'<');
         out.extend_from_slice(&(entries.len() as u64).to_le_bytes());
@@ -2146,7 +2166,10 @@ impl<'d, 'b> Reader<'d, 'b> {
         let other = self.digest(&Object::Dict(other))?;
         let mut entries = BTreeMap::new();
         for (key, value) in node.dict.iter() {
-            if PAGE_OWN_KEYS.contains(&key.as_slice()) || PAGE_IGNORED.contains(&key.as_slice()) {
+            // Embed build (follow-up 7 audit, item 4): the entries no viewer draws are kept here
+            // too, so a rewrite may only keep or remove them, never add or change one (a page's
+            // `/PieceInfo` or `/Metadata` could carry what the rewrite took away).
+            if PAGE_OWN_KEYS.contains(&key.as_slice()) || key.as_slice() == b"Type" {
                 continue;
             }
             entries.insert(key.clone(), self.digest(value)?);
@@ -2286,7 +2309,10 @@ impl<'d, 'b> Reader<'d, 'b> {
         let mut links = StructLinks::default();
         let mut parts: Vec<u8> = Vec::new();
         let mut shape: Vec<u8> = Vec::new();
-        let root_digest = self.digest_without(&root, &[b"K", b"ParentTree", b"ParentTreeNextKey", b"IDTree"])?;
+        // `/K` is walked below; the parent tree and the ID tree, indexes into the elements, are
+        // compared after it, each element they name by its place (follow-up 7 audit, item 4).
+        let root_digest = self.digest_without(&root, &[b"K", b"ParentTree", b"IDTree"])?;
+        let mut element_places: HashMap<ObjRef, u32> = HashMap::new();
         parts.extend_from_slice(&root_digest);
         shape.extend_from_slice(&root_digest);
         let mut seen: BTreeSet<ObjRef> = BTreeSet::new();
@@ -2307,6 +2333,7 @@ impl<'d, 'b> Reader<'d, 'b> {
             {
                 return Err(read_error("the structure tree loops"));
             }
+            let kid_ref = if let Object::Ref(r) = &kid { Some(*r) } else { None };
             match &*self.resolve(&kid)? {
                 Object::Array(items) => {
                     parts.push(b'[');
@@ -2326,6 +2353,9 @@ impl<'d, 'b> Reader<'d, 'b> {
                     let index = elements;
                     elements = elements.checked_add(1).filter(|count| *count as usize <= MAX_STRUCT_ELEMENTS).ok_or(Fail::TooComplex)?;
                     links.parents.push(owner);
+                    if let Some(r) = kid_ref {
+                        element_places.insert(r, index);
+                    }
                     let page = match element.get(b"Pg") {
                         Some(Object::Ref(own)) => Some(*own),
                         _ => page,
@@ -2358,12 +2388,14 @@ impl<'d, 'b> Reader<'d, 'b> {
                     }
                     parts.push(b'{');
                     parts.extend_from_slice(&owner.to_le_bytes());
-                    parts.extend_from_slice(&self.digest_without(element, &[b"K", b"P", b"Pg", b"Obj"])?);
+                    // `/K` is walked (the kids); `/P`, `/Pg` and `/Obj` are links.
+                    let unkidded: Dict = element.iter().filter(|(key, _)| key.as_slice() != b"K").map(|(k, v)| (k.clone(), v.clone())).collect();
+                    parts.extend_from_slice(&self.digest_without_links(&unkidded, &[b"P", b"Pg", b"Obj"])?);
                     shape.push(b'{');
                     shape.extend_from_slice(&owner.to_le_bytes());
-                    let mut left_out: Vec<&[u8]> = vec![b"K", b"P", b"Pg", b"Obj"];
-                    left_out.extend(STRUCT_TEXT_KEYS);
-                    shape.extend_from_slice(&self.digest_without(element, &left_out)?);
+                    let untexted: Dict =
+                        unkidded.iter().filter(|(key, _)| !STRUCT_TEXT_KEYS.contains(&key.as_slice())).map(|(k, v)| (k.clone(), v.clone())).collect();
+                    shape.extend_from_slice(&self.digest_without_links(&untexted, &[b"P", b"Pg", b"Obj"])?);
                     if let Some(kids) = element.get(b"K") {
                         todo.push((kids.clone(), depth.saturating_add(1), index, page));
                     }
@@ -2372,9 +2404,77 @@ impl<'d, 'b> Reader<'d, 'b> {
                 _ => return Err(read_error("a structure element is not a dictionary")),
             }
         }
+        for key in [b"ParentTree".as_slice(), b"IDTree"] {
+            if let Some(index) = root.get(key) {
+                let mut encoded = Vec::new();
+                self.index_encode(index, &element_places, 0, &mut BTreeSet::new(), &mut encoded)?;
+                let digest = sha256(&[key, &encoded]);
+                parts.extend_from_slice(&digest);
+                shape.extend_from_slice(&digest);
+            }
+        }
         facts.digest = sha256(&[b"structure", &parts]);
         facts.shape = sha256(&[b"structure shape", &shape]);
         Ok((facts, links))
+    }
+
+    /// Embed build (follow-up 7 audit, item 4): the structure tree's parent tree or ID tree as
+    /// compared: every value as written, but a reference to a structure element by its place
+    /// in the tree (see [`StructFacts`]), so the index of a rewrite that kept the tree's shape
+    /// encodes alike; any other reference is followed (read for this fact). A stream, or a loop,
+    /// is refused.
+    fn index_encode(
+        &mut self,
+        value: &Object,
+        places: &HashMap<ObjRef, u32>,
+        depth: usize,
+        seen: &mut BTreeSet<ObjRef>,
+        out: &mut Vec<u8>,
+    ) -> Result<(), Fail> {
+        self.budget.tick()?;
+        if depth > MAX_REFERENCE_DEPTH {
+            return Err(Fail::TooComplex);
+        }
+        match value {
+            Object::Ref(r) => match places.get(r) {
+                Some(place) => {
+                    out.push(b'E');
+                    out.extend_from_slice(&place.to_le_bytes());
+                }
+                None => {
+                    if !seen.insert(*r) {
+                        return Err(read_error("the structure tree's index loops"));
+                    }
+                    let found = self.get(*r)?;
+                    out.push(b'R');
+                    self.index_encode(&found, places, depth.saturating_add(1), seen, out)?;
+                }
+            },
+            Object::Array(items) => {
+                out.push(b'[');
+                out.extend_from_slice(&(items.len() as u64).to_le_bytes());
+                for item in items {
+                    self.index_encode(item, places, depth.saturating_add(1), seen, out)?;
+                }
+            }
+            Object::Dict(dict) => {
+                out.push(b'<');
+                out.extend_from_slice(&(dict.len() as u64).to_le_bytes());
+                let mut entries: Vec<(&Vec<u8>, &Object)> = dict.iter().collect();
+                entries.sort_by(|a, b| a.0.cmp(b.0));
+                for (key, value) in entries {
+                    out.extend_from_slice(&(key.len() as u64).to_le_bytes());
+                    out.extend_from_slice(key);
+                    self.index_encode(value, places, depth.saturating_add(1), seen, out)?;
+                }
+            }
+            Object::Stream(_) => return Err(read_error("the structure tree's index holds a stream")),
+            scalar => {
+                out.push(b'v');
+                out.extend_from_slice(&self.digest(scalar)?);
+            }
+        }
+        Ok(())
     }
 
     /// The document information dictionary (the trailer's `/Info`), key by key, each value by
@@ -2755,7 +2855,14 @@ impl Reader<'_, '_> {
             None => None,
         };
         const TREE: [&[u8]; 9] = [b"Title", b"Parent", b"Prev", b"Next", b"First", b"Last", b"Count", b"Dest", b"A"];
-        let mut rest: Dict = dict.iter().filter(|(key, _)| !TREE.contains(&key.as_slice())).map(|(k, v)| (k.clone(), v.clone())).collect();
+        // Embed build (follow-up 7 audit, item 4): a link of the tree written as anything but a
+        // reference or a plain value is compared with the rest.
+        let link = |key: &[u8], value: &Object| {
+            matches!(key, b"Parent" | b"Prev" | b"Next" | b"First" | b"Last" | b"Count")
+                && !matches!(value, Object::Ref(_) | Object::Int(_) | Object::Real(_) | Object::Name(_) | Object::Bool(_) | Object::Null)
+        };
+        let mut rest: Dict =
+            dict.iter().filter(|(key, value)| !TREE.contains(&key.as_slice()) || link(key, value)).map(|(k, v)| (k.clone(), v.clone())).collect();
         let mut destination = match dict.get(b"Dest") {
             Some(dest) => self.destination(dest, pages)?,
             None => Destination::None,
@@ -3772,7 +3879,7 @@ pub(crate) fn read(
     let page_index: HashMap<ObjRef, usize> = nodes.iter().enumerate().map(|(index, node)| (node.obj, index)).collect();
     let outline = reader.outline(&catalog, &page_index)?;
     let root = reader.dict_of(catalog.get(b"Outlines"), "/Outlines")?.unwrap_or_default();
-    let outline_root = reader.digest_without(&root, &[b"Type", b"First", b"Last", b"Count"])?;
+    let outline_root = reader.digest_without_links(&root, &[b"Type", b"First", b"Last", b"Count"])?;
     let (named_destinations, name_tree_keys) = reader.named_destinations(&catalog, &page_index)?;
     let info = reader.document_information(doc.trailer())?;
     let page_labels_digest = catalog.get(b"PageLabels").map(|labels| reader.digest(labels)).transpose()?;
@@ -3853,7 +3960,7 @@ pub(crate) fn page_removals(base: &PageFacts, edited: &PageFacts) -> Option<Page
     let text = spans_kept(&base.text, &edited.text)?;
     let kept = base.entries.iter().all(|(key, value)| match edited.entries.get(key) {
         Some(now) => now == value,
-        None => PAGE_REMOVABLE.contains(&key.as_slice()),
+        None => PAGE_REMOVABLE.contains(&key.as_slice()) || PAGE_IGNORED.contains(&key.as_slice()),
     });
     if !kept || edited.entries.keys().any(|key| !base.entries.contains_key(key)) {
         return None;

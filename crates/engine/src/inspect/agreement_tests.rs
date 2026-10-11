@@ -458,12 +458,14 @@ fn refused_against(base: &[u8], file: &[u8]) -> String {
 fn files_both_readers_read_alike_are_not_refused() {
     // A second definition of object 4 that the table does not list; a hybrid file whose table
     // lists page 3 (stale or not) where its cross-reference stream also does, or marks it free.
-    // The readers agree on each; as rewrites, the hybrid files are refused only for carrying the
-    // stale page and its content, which nothing reaches (R6b-48).
-    assert!(inspect(&sound(), &one_number_twice(), InspectLimits::default()).is_ok());
+    // The readers agree on each; as rewrites, each is refused only for what it carries beside
+    // what it lists: the second definition, or a stale page listed free, no cross-reference data
+    // lists (follow-up 7 audit); the stale page and its content, which nothing reaches (R6b-48).
+    let message = refused(&one_number_twice());
+    assert!(message.contains("bytes no cross-reference data lists"), "{message}");
     for (case, file) in [("hybrid, table first", stale_offset_beside_an_object_stream()), ("hybrid, free in table", stale_page_free_in_table())] {
         let message = refused(&file);
-        assert!(message.contains("nothing reaches"), "{case}: {message}");
+        assert!(message.contains("nothing reaches") || message.contains("no cross-reference data lists"), "{case}: {message}");
     }
 }
 
@@ -1675,4 +1677,144 @@ fn the_session_s_redaction_reaches_everything_it_writes() {
     assert!(!inspection.base_kept, "{inspection:?}");
     assert_eq!(inspection.text.pages_with_text_removed, 1, "{inspection:?}");
     assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{inspection:?}");
+}
+
+// ── follow-up 7 audit: nothing hides what a rewrite took away ────────────────────────────────
+
+/// What [`hiding`] writes beside a tagged page.
+#[derive(Default)]
+struct Hiding<'a> {
+    catalog: &'a str,
+    page: &'a str,
+    /// The paragraph's own entries.
+    element: &'a str,
+    /// Objects 7… as given.
+    extra: Vec<(u32, Vec<u8>)>,
+    /// Objects written but listed free.
+    free: Vec<(u32, Vec<u8>)>,
+    /// Bytes written before the page tree (object 2).
+    comment: &'a [u8],
+    /// Appended after `%%EOF`.
+    tail: &'a [u8],
+    /// Trailer entries.
+    trailer: &'a str,
+    /// The structure tree root's `/ParentTree` (default: a direct number tree).
+    parent_tree: &'a str,
+}
+
+/// A tagged one-page file: "Alpha" in marked content 0 (the paragraph, object 6), and "X" at
+/// (150, 20) or, with `boxed`, a black box there; with what `hiding` adds.
+fn hiding(boxed: bool, hiding: &Hiding<'_>) -> Vec<u8> {
+    let mut b = Builder::new();
+    b.object(1, format!("<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 5 0 R /MarkInfo << /Marked true >> {} >>", hiding.catalog).as_bytes());
+    b.out.extend_from_slice(hiding.comment);
+    b.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 300] >>");
+    b.object(3, format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R {RESOURCES} /StructParents 0 {} >>", hiding.page).as_bytes());
+    let last = if boxed { "0 g 146 14 16 18 re f" } else { "BT /F1 12 Tf 150 20 Td (X) Tj ET" };
+    let content = format!("/P << /MCID 0 >> BDC\n{}\nEMC\n{last}", String::from_utf8(text("Alpha")).unwrap());
+    b.object(4, &stream("", content.as_bytes()));
+    let parent_tree = if hiding.parent_tree.is_empty() { "<< /Nums [0 [6 0 R]] >>" } else { hiding.parent_tree };
+    b.object(5, format!("<< /Type /StructTreeRoot /K 6 0 R /ParentTree {parent_tree} >>").as_bytes());
+    b.object(6, format!("<< /S /P /P 5 0 R /Pg 3 0 R /K 0 {} >>", hiding.element).as_bytes());
+    for (num, body) in &hiding.extra {
+        b.object(*num, body);
+    }
+    let mut rows = b.offsets.clone();
+    for (num, body) in &hiding.free {
+        b.object(*num, body);
+        rows.remove(num);
+    }
+    let size = rows.keys().chain(hiding.free.iter().map(|(num, _)| num)).max().copied().unwrap_or(6) + 1;
+    let mut out = b.finish(size, &rows, hiding.trailer);
+    out.extend_from_slice(hiding.tail);
+    out
+}
+
+#[test]
+fn a_rewrite_cannot_hide_what_it_took_away() {
+    // Each route the follow-up 7 audit tried for the unredacted "X" to stay in a rewrite:
+    // refused, or reported where the host refuses it.
+    let base = hiding(false, &Hiding::default());
+    let edited = |what: Hiding<'_>| hiding(true, &what);
+    let inspection = inspect(&base, &edited(Hiding::default()), InspectLimits::default()).unwrap();
+    assert_eq!((inspection.content.pages_changed_outside_redactions, inspection.text.pages_with_text_removed), (0, 1), "{inspection:?}");
+    let secret = || stream("", b"BT /F1 12 Tf 150 20 Td (X) Tj ET");
+    let refused_for = |case: &str, file: &[u8], why: &str| match inspect(&base, file, InspectLimits::default()) {
+        Err(InspectError::Edited(message)) => assert!(message.contains(why), "{case}: {message}"),
+        other => panic!("{case}: expected Err(Edited), got {other:?}"),
+    };
+    let outside = |case: &str, file: &[u8]| {
+        let inspection = inspect(&base, file, InspectLimits::default()).unwrap_or_else(|error| panic!("{case}: {error:?}"));
+        assert_eq!(inspection.content.pages_changed_outside_redactions, 1, "{case}: {inspection:?}");
+    };
+    // Bytes no cross-reference data lists: a definition listed free (the free-entry chain), one
+    // after `%%EOF`, a comment between objects.
+    let lists = "bytes no cross-reference data lists";
+    refused_for("listed free", &edited(Hiding { free: vec![(7, secret())], ..Hiding::default() }), lists);
+    refused_for("after %%EOF", &edited(Hiding { tail: b"7 0 obj\n(X)\nendobj\n", ..Hiding::default() }), lists);
+    refused_for("a comment", &edited(Hiding { comment: b"% BT /F1 12 Tf 150 20 Td (X) Tj ET\n", ..Hiding::default() }), lists);
+    // Reached only through a link no comparison reads (an element's /Obj).
+    refused_for(
+        "through a link",
+        &edited(Hiding { element: "/Obj 7 0 R", extra: vec![(7, b"<< /X (X) >>".to_vec())], ..Hiding::default() }),
+        "no comparison reads",
+    );
+    // The structure tree's parent tree is compared, each element by its place.
+    let indexed = Hiding { parent_tree: "7 0 R", extra: vec![(7, b"<< /Nums [0 [6 0 R]] /X 8 0 R >>".to_vec()), (8, secret())], ..Hiding::default() };
+    refused_for("in the parent tree", &edited(indexed), "structure tree");
+    let kept = Hiding { parent_tree: "7 0 R", extra: vec![(7, b"<< /Nums [0 [6 0 R]] >>".to_vec())], ..Hiding::default() };
+    assert!(inspect(&hiding(false, &kept), &edited(kept), InspectLimits::default()).is_ok(), "a parent tree kept, as an object");
+    // A page's entries no viewer draws: kept or removed only.
+    outside("page /PieceInfo, written in the page", &edited(Hiding { page: "/PieceInfo << /App << /Private (X) >> >>", ..Hiding::default() }));
+    outside(
+        "page /PieceInfo, an object",
+        &edited(Hiding { page: "/PieceInfo << /App << /Private 7 0 R >> >>", extra: vec![(7, secret())], ..Hiding::default() }),
+    );
+    outside("page /Metadata", &edited(Hiding { page: "/Metadata 7 0 R", extra: vec![(7, secret())], ..Hiding::default() }));
+    // The catalog's entries are compared whole: /PieceInfo, /AF, embedded files.
+    for (case, catalog) in [
+        ("catalog /PieceInfo", "/PieceInfo << /App << /Private 7 0 R >> >>"),
+        ("catalog /AF", "/AF [7 0 R]"),
+        ("embedded file", "/Names << /EmbeddedFiles << /Names [(x) 7 0 R] >> >>"),
+    ] {
+        refused_for(case, &edited(Hiding { catalog, extra: vec![(7, secret())], ..Hiding::default() }), "changed");
+    }
+    // Links written as a value in place of a reference are compared: an element's /Obj or /P.
+    refused_for("an element's /Obj", &edited(Hiding { element: "/Obj << /X (X) >>", ..Hiding::default() }), "structure tree");
+    // The document information: reported (the host refuses any change, R6b-42).
+    let informed = edited(Hiding { trailer: "/Info 7 0 R", extra: vec![(7, b"<< /Title (X) >>".to_vec())], ..Hiding::default() });
+    assert_eq!(inspect(&base, &informed, InspectLimits::default()).unwrap().info.changed, ["Title"]);
+}
+
+#[test]
+fn a_back_reference_written_as_a_value_is_compared() {
+    // An annotation's /P (its page) is left out of digests as a back reference; written as a
+    // string it carried text no fact compared, in an appended update as in a rewrite.
+    let mut b = Builder::new();
+    head(&mut b);
+    b.object(3, format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Annots [5 0 R] {RESOURCES} >>").as_bytes());
+    b.object(4, &stream("", &text("Alpha")));
+    b.object(5, b"<< /Type /Annot /Subtype /Square /Rect [20 200 80 260] /P 3 0 R >>");
+    let rows = b.offsets.clone();
+    let base = b.finish(6, &rows, "");
+    let prev = Some(last_section(&base));
+    let edited = update_section(&base, &[(5, b"<< /Type /Annot /Subtype /Square /Rect [20 200 80 260] /P (X) >>")], prev, "");
+    let inspection = inspect(&base, &edited, InspectLimits::default()).unwrap();
+    assert_eq!(inspection.annotations.changed, 1, "{inspection:?}");
+}
+
+#[test]
+fn the_reachability_walk_fails_closed() {
+    // Follow-up 7 audit, item 5. An object only the walk reaches that cannot be read is refused,
+    // not passed over; and a walk past the objects bound is too complex, not accepted.
+    let base = hiding(false, &Hiding::default());
+    let unreadable = hiding(true, &Hiding { element: "/Obj 7 0 R", extra: vec![(7, b"<< /Unterminated (".to_vec())], ..Hiding::default() });
+    assert!(matches!(inspect(&base, &unreadable, InspectLimits::default()), Err(InspectError::Edited(_))));
+    // A chain of 2,000 arrays, each the next one's only reference, under an element's /Obj.
+    let chain: Vec<(u32, Vec<u8>)> =
+        (7..2_007u32).map(|num| (num, if num < 2_006 { format!("[{} 0 R]", num + 1) } else { "[]".into() }.into_bytes())).collect();
+    let long = hiding(true, &Hiding { element: "/Obj 7 0 R", extra: chain, ..Hiding::default() });
+    assert!(inspect(&base, &long, InspectLimits::default()).is_ok(), "within the bound");
+    let limits = Limits { objects: 500, ..Limits::default() };
+    assert_eq!(inspect_with(&base, &long, limits), Err(InspectError::TooComplex));
 }
