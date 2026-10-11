@@ -502,3 +502,18 @@ fn a_jump_that_lands_while_the_button_is_held_is_not_reported() {
 fn k_to(a: egui::Pos2, b: egui::Pos2, k: usize) -> egui::Pos2 {
     a + (b - a) * (k as f32 / 4.0)
 }
+
+#[test]
+fn copy_after_a_found_text_jump_copies_the_jumped_text() {
+    let (mut h, bridge) = embedded();
+    open(&mut h, &bridge, "three.pdf", three_pages());
+    assert!(selections_after_jump(&mut h, &bridge, text_target("THIRTY days", None)).is_empty());
+    h.event(Event::Copy);
+    let mut copied = false;
+    for _ in 0..4 {
+        h.step();
+        copied |= h.output().platform_output.commands.iter().any(|c| matches!(c, egui::OutputCommand::CopyText(t) if t == "thirty days"));
+    }
+    assert!(copied, "⌘C copies the match the jump selected, as the document spells it");
+    assert!(selections(&bridge.take_events()).is_empty(), "copying reports nothing");
+}

@@ -128,14 +128,19 @@ The command fails for a file that was not built by this repository's release wor
   folded (NFKC), curly quotes and dashes straightened and case folded, within one page. A text
   jump waits until the pages it searches have their text; a newer jump replaces a waiting one.
 - `selection` is sent each time a selection settles (button released, or a keyboard selection),
-  not on every frame, and again when it equals the one reported before: a press and release, or
-  the same passage selected again, settle it anew, since the host hides its toolbar on input.
+  not on every frame, and again when it equals the one reported before: a press and release on the
+  page view (a page or the pasteboard beside it), or the same passage selected again, settle it
+  anew, since the host hides its toolbar on input. A press on the zoom controls, the page display
+  menu, the scrollbar or the find field does not. Nothing is told without input: if the selection
+  is off screen when the button is released, it is not told when a scroll brings it back.
   `x`, `y` are CSS pixels from the canvas's top-left at the end of its last line.
 - A found text jump selects its match, so it shows highlighted. That selection is the editor's
   own and is never reported, not even after a press that leaves it as it is; selecting it again by
   hand is a person's selection and is. The editor moving the view (a page jump, a later text jump,
   its page buttons, a find step) or opening a document clears it without an event, and answers a
   selection it had reported with `selectionCleared`. A jump that finds nothing leaves either.
+  While the canvas has keyboard focus, Ctrl/Cmd+C after a found jump copies the jumped text, as the
+  document spells it, and reports nothing.
 - Malformed arguments throw a `TypeError` and change nothing, from every method: `mount` with
   anything but an `HTMLCanvasElement` or with malformed options (its promise rejects), `open` with
   anything but a `Uint8Array` and a string, `jumpTo`, `setMarks` and `setTheme` with a wrong shape,
@@ -172,6 +177,9 @@ The command fails for a file that was not built by this repository's release wor
   answered `openFailed` as a broken file. After `destroy`, `open` copies nothing.
 - `open` requires a `Uint8Array` from the host page's own realm (not from another frame or window):
   anything else throws a `TypeError`, as does an array whose buffer cannot be read.
+- `mount` requires a canvas from the realm the glue was loaded in: a canvas from an iframe or a
+  pop-out window is not an `HTMLCanvasElement` there and is refused with a `TypeError` (the promise
+  rejects). Load the glue in the window whose document holds the canvas.
 - A text jump or mark without a page loads every page's text layer, so its cost grows with the
   page count; a page-scoped one loads that page alone. Matching costs O(page text × passage) per
   page searched, on the frame.
@@ -181,6 +189,12 @@ The command fails for a file that was not built by this repository's release wor
   read, "This file is password-protected and can't be shown here." for one that needs a password,
   and the too-large message below. The engine's own reason goes to the browser console as a
   warning.
+- The editor's warnings reach the browser console at warn level (`mount` sets eframe's logger to
+  warn): a file that could not be opened, and a page whose text layer or rendering failed
+  (`page N text: …`, `page N: …`). The page warnings carry the page number and a fixed reason (the
+  page does not exist, or its page box is empty or invalid, with its size), never document text.
+  The page renderer's own diagnostics are compiled out of this build (hayro without its `logging`
+  feature).
 - The command and event queues are unbounded: the host page is trusted not to flood them.
 
 ## Crashes
