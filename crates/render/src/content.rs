@@ -528,4 +528,86 @@ mod tests {
         // The mask alone is a canvas of 200 × 300 pixels: about 230 units.
         assert!(matches!(ContentDocument::open(file, 100).unwrap().render_upright(0, 300), Err(ContentError::TooComplex)));
     }
+
+    /// A 200 × 300 page drawing `content` with a Type 3 font `/T` (glyph "a": a black box over the
+    /// advance, 0–700 of its em, `/FontMatrix` as given) and a form `/Fm` drawing `form` under
+    /// `/Matrix` `matrix`.
+    fn type3_page(content: &str, font_matrix: &str, form: &str, matrix: &str) -> Vec<u8> {
+        let font = format!(
+            "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 500 700] /FontMatrix [{font_matrix}] /CharProcs << /a 4 0 R >> \
+             /Encoding << /Type /Encoding /Differences [97 /a] >> /FirstChar 97 /LastChar 97 /Widths [500] /Resources << >> >>"
+        );
+        let glyph = "500 0 0 0 500 700 d1 0 0 500 700 re f";
+        let resources = "<< /Font << /T 3 0 R >> /XObject << /Fm 5 0 R >> >>";
+        let bodies = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [6 0 R] /Count 1 /MediaBox [0 0 200 300] >>".to_string(),
+            font,
+            format!("<< /Length {} >>\nstream\n{glyph}\nendstream", glyph.len()),
+            format!(
+                "<< /Type /XObject /Subtype /Form /BBox [0 0 400 400] /Matrix [{matrix}] /Resources {resources} /Length {} >>\nstream\n{form}\nendstream",
+                form.len()
+            ),
+            format!("<< /Type /Page /Parent 2 0 R /Contents 7 0 R /Resources {resources} >>"),
+            format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()),
+        ];
+        let mut out = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, body) in bodies.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", i + 1).as_bytes());
+        }
+        let xref = out.len();
+        out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", bodies.len() + 1).as_bytes());
+        for offset in offsets {
+            out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", bodies.len() + 1).as_bytes());
+        out
+    }
+
+    /// The glyph boxes the text extraction reports agree with where the same interpreter draws:
+    /// every inked pixel of the render lies in a reported box (within a point), and each box's
+    /// centre is inked. The boxes come from hayro's own interpretation (`GlyphDevice`), not from
+    /// state tracked beside it, so q/Q, cm, text state and form matrices are hayro's.
+    #[test]
+    fn glyph_boxes_are_where_the_interpreter_draws() {
+        let identity = "0.001 0 0 0.001 0 0";
+        let cases = [
+            ("unbalanced Q", type3_page("Q Q BT /T 20 Tf 30 150 Td (aaa) Tj ET Q", identity, "", "1 0 0 1 0 0")),
+            ("q/Q inside BT/ET", type3_page("BT /T 20 Tf 30 150 Td q 2 0 0 2 0 0 cm Q (aa) Tj q (a) Tj Q ET", identity, "", "1 0 0 1 0 0")),
+            ("Tz, Ts and TJ", type3_page("BT /T 20 Tf 150 Tz 5 Ts 2 Tc 30 150 Td [(a) -800 (a) 300 (a)] TJ ET", identity, "", "1 0 0 1 0 0")),
+            ("nested form with /Matrix", type3_page("q 1 0 0 1 10 20 cm /Fm Do Q", identity, "BT /T 20 Tf 0 0 Td (aa) Tj ET", "0.5 0 0 1.5 40 60")),
+            ("Type 3 font matrix", type3_page("BT /T 20 Tf 30 150 Td (aa) Tj ET", "0.002 0 0 0.001 0 0", "", "1 0 0 1 0 0")),
+        ];
+        for (case, file) in cases {
+            let doc = ContentDocument::open(Arc::new(file), 1_000_000).unwrap();
+            let glyphs = doc.text(0).unwrap();
+            assert!(!glyphs.is_empty(), "{case}");
+            let raster = doc.render_upright(0, 600).unwrap();
+            let to_user = |px: usize, py: usize| {
+                (raster.crop[0] + (px as f32 + 0.5) / raster.scale, raster.crop[1] + raster.height_pt - (py as f32 + 0.5) / raster.scale)
+            };
+            let boxes: Vec<[f32; 4]> = (0..glyphs.len()).map(|i| glyphs.glyph(i).unwrap().1).collect();
+            let inked = |px: usize, py: usize| raster.rgba.get((py * raster.width as usize + px) * 4).is_some_and(|r| *r < 128);
+            for py in 0..raster.height as usize {
+                for px in 0..raster.width as usize {
+                    if inked(px, py) {
+                        let (x, y) = to_user(px, py);
+                        assert!(
+                            boxes.iter().any(|b| x >= b[0] - 1.0 && x <= b[2] + 1.0 && y >= b[1] - 1.0 && y <= b[3] + 1.0),
+                            "{case}: ink at {x},{y} outside {boxes:?}"
+                        );
+                    }
+                }
+            }
+            for b in &boxes {
+                // The glyph's ink is its advance by 0–700 of the em; its box spans −200–800.
+                let (x, y) = ((b[0] + b[2]) / 2.0, b[1] + (b[3] - b[1]) * 0.45);
+                let px = ((x - raster.crop[0]) * raster.scale) as usize;
+                let py = ((raster.height_pt - (y - raster.crop[1])) * raster.scale) as usize;
+                assert!(inked(px, py), "{case}: no ink at the box {b:?}");
+            }
+        }
+    }
 }
