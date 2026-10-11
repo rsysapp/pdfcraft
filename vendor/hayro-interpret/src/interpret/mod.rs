@@ -120,6 +120,10 @@ pub struct InterpreterSettings {
     /// shows is the viewer's choice (a Layers panel shows hidden ones), and readers disagree on
     /// which marked content is optional content.
     pub all_layers_visible: bool,
+    /// Embed build: hand the device each glyph shown in text rendering mode 7 (clip only) as an
+    /// invisible glyph (`false` by default: such a glyph only adds to the clip). For a caller
+    /// that must see all of a page's text: other readers extract it.
+    pub report_clip_glyphs: bool,
 }
 
 impl Default for InterpreterSettings {
@@ -142,6 +146,7 @@ impl Default for InterpreterSettings {
             ocg_overrides: Arc::new(Vec::new()),
             work_budget: u64::MAX,
             all_layers_visible: false,
+            report_clip_glyphs: false,
         }
     }
 }

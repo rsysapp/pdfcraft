@@ -130,6 +130,17 @@ pub(crate) fn show_glyph<'a>(
         }
         TextRenderingMode::Clip => {
             clip_glyph(ctx, glyph, glyph_transform);
+            // Embed build: a glyph that only clips is still text (other readers extract it);
+            // reported as an invisible glyph, which draws nothing, when asked for.
+            if ctx.settings.report_clip_glyphs {
+                device.draw_glyph(
+                    glyph,
+                    ctx.get().ctm,
+                    glyph_transform,
+                    &get_paint(ctx, false),
+                    &GlyphDrawMode::Invisible,
+                );
+            }
         }
         TextRenderingMode::FillAndClip => {
             clip_glyph(ctx, glyph, glyph_transform);
