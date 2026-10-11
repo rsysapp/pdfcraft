@@ -5,6 +5,9 @@ use std::collections::HashSet;
 pub(crate) struct OcgState {
     inactive_ocgs: HashSet<ObjectIdentifier>,
     visibility_stack: Vec<bool>,
+    /// Embed build: every layer shows, whatever the configuration or marked content says (see
+    /// `InterpreterSettings::all_layers_visible`).
+    pub(crate) all_visible: bool,
 }
 
 impl OcgState {
@@ -12,6 +15,7 @@ impl OcgState {
         Self {
             inactive_ocgs: HashSet::default(),
             visibility_stack: vec![],
+            all_visible: false,
         }
     }
 
@@ -62,6 +66,7 @@ impl OcgState {
         Self {
             inactive_ocgs: inactive,
             visibility_stack: Vec::new(),
+            all_visible: false,
         }
     }
 
@@ -130,7 +135,8 @@ impl OcgState {
     }
 
     pub(crate) fn is_visible(&self) -> bool {
-        self.visibility_stack.last().copied().unwrap_or(true)
+        // Embed build: marked content is still tracked (balanced), but hides nothing.
+        self.all_visible || self.visibility_stack.last().copied().unwrap_or(true)
     }
 }
 

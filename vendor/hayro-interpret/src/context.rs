@@ -225,6 +225,8 @@ impl<'a> Context<'a> {
         for (num, generation, visible) in settings.ocg_overrides.iter() {
             ocg_state.set_active(hayro_syntax::object::ObjectIdentifier::new(*num, *generation), *visible);
         }
+        // Embed build: see `InterpreterSettings::all_layers_visible`.
+        ocg_state.all_visible = settings.all_layers_visible;
 
         Self {
             states: vec![state],
@@ -440,6 +442,11 @@ impl<'a> Context<'a> {
     }
     pub(crate) fn resolve_font(&mut self, font_dict: &Dict<'a>) -> Option<TextStateFont<'a>> {
         let cache_key = font_dict.cache_key();
+        // Embed build: a dictionary written directly inside another object reports that object's
+        // number; only a font dictionary that is its object's whole data is that object.
+        let object = font_dict
+            .obj_id()
+            .filter(|id| self.xref.get::<Dict<'_>>(*id).is_some_and(|own| own.data() == font_dict.data()));
 
         let resolved = {
             let mut font_cache = self.interpreter_cache.font_cache.borrow_mut();
@@ -450,6 +457,7 @@ impl<'a> Context<'a> {
                         font_dict,
                         &self.settings.font_resolver,
                         &self.settings.cmap_resolver,
+                        object,
                     )
                 })
                 .clone()

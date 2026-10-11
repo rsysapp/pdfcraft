@@ -16,7 +16,7 @@ use bitflags::bitflags;
 use hayro_syntax::object::Name;
 use hayro_syntax::object::dict::keys::SUBTYPE;
 use hayro_syntax::object::dict::keys::*;
-use hayro_syntax::object::{Dict, Stream};
+use hayro_syntax::object::{Dict, ObjectIdentifier, Stream};
 use hayro_syntax::page::Resources;
 use hayro_syntax::xref::XRef;
 use kurbo::{Affine, BezPath, Vec2};
@@ -105,6 +105,17 @@ impl Glyph<'_> {
             Glyph::Type3(g) => g.as_unicode(),
         }
     }
+
+    /// Embed build: which glyph of which font this is, for a caller identifying a glyph that has
+    /// no Unicode value: the font dictionary's object and the glyph's ID in the font (for a Type 3
+    /// font, the code that selects its procedure). `None` when the font has no object (a
+    /// dictionary written directly in a resource dictionary, or a standard font standing in).
+    pub fn identity(&self) -> Option<(ObjectIdentifier, u32)> {
+        match self {
+            Glyph::Outline(g) => g.font_object.map(|font| (font, g.id.to_u32())),
+            Glyph::Type3(g) => g.font_object.map(|font| (font, g.char_code)),
+        }
+    }
 }
 
 /// An identifier that uniquely identifies a glyph, for caching purposes.
@@ -126,6 +137,8 @@ pub struct OutlineGlyph {
     pub(crate) id: GlyphId,
     pub(crate) font: OutlineFont,
     pub(crate) char_code: u32,
+    /// Embed build: the font dictionary's object (see [`Glyph::identity`]).
+    pub(crate) font_object: Option<ObjectIdentifier>,
 }
 
 impl OutlineGlyph {
@@ -204,6 +217,8 @@ pub struct Type3Glyph<'a> {
     pub(crate) settings: InterpreterSettings,
     pub(crate) nesting_depth: u32,
     pub(crate) char_code: u32,
+    /// Embed build: the font dictionary's object (see [`Glyph::identity`]).
+    pub(crate) font_object: Option<ObjectIdentifier>,
 }
 
 /// A glyph defined by PDF drawing instructions.
@@ -239,14 +254,18 @@ impl CacheKey for Type3Glyph<'_> {
     }
 }
 
+// Embed build: the third field is the font dictionary's object (see `Glyph::identity`).
 #[derive(Clone, Debug)]
-pub(crate) struct Font<'a>(u128, FontType<'a>);
+pub(crate) struct Font<'a>(u128, FontType<'a>, Option<ObjectIdentifier>);
 
 impl<'a> Font<'a> {
+    // Embed build: `object` is the font dictionary's own object, when it is one (see
+    // `Glyph::identity`).
     pub(crate) fn new(
         dict: &Dict<'a>,
         font_resolver: &FontResolverFn,
         cmap_resolver: &CMapResolverFn,
+        object: Option<ObjectIdentifier>,
     ) -> Option<Self> {
         let f_type = match dict.get::<Name<'_>>(SUBTYPE)?.deref() {
             TYPE1 | MM_TYPE1 => {
@@ -272,7 +291,7 @@ impl<'a> Font<'a> {
 
         let cache_key = dict.cache_key();
 
-        Some(Self(cache_key, f_type))
+        Some(Self(cache_key, f_type, object))
     }
 
     pub(crate) fn new_standard(
@@ -281,7 +300,7 @@ impl<'a> Font<'a> {
     ) -> Option<Self> {
         let font = Type1Font::new_standard(standard_font, font_resolver)?;
 
-        Some(Self(0, FontType::Type1(Rc::new(font))))
+        Some(Self(0, FontType::Type1(Rc::new(font)), None))
     }
 
     pub(crate) fn map_code(&self, code: u32) -> GlyphId {
@@ -324,6 +343,7 @@ impl<'a> Font<'a> {
                     id: glyph,
                     font,
                     char_code,
+                    font_object: self.2,
                 })
             }
             FontType::TrueType(t) => {
@@ -332,6 +352,7 @@ impl<'a> Font<'a> {
                     id: glyph,
                     font,
                     char_code,
+                    font_object: self.2,
                 })
             }
             FontType::Type0(t) => {
@@ -340,6 +361,7 @@ impl<'a> Font<'a> {
                     id: glyph,
                     font,
                     char_code,
+                    font_object: self.2,
                 })
             }
             FontType::Type3(t) => {
@@ -354,6 +376,7 @@ impl<'a> Font<'a> {
                     settings: ctx.settings.clone(),
                     nesting_depth,
                     char_code,
+                    font_object: self.2,
                 };
 
                 Glyph::Type3(Box::new(shape_glyph))

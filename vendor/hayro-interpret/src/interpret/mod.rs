@@ -114,6 +114,12 @@ pub struct InterpreterSettings {
     /// by the device area it covers. Past it the rest is skipped and
     /// [`InterpreterWarning::WorkBudgetExceeded`] is sent once. Unbounded by default.
     pub work_budget: u64,
+    /// Embed build: interpret every optional-content layer as visible, whatever the document's
+    /// configuration, [`InterpreterSettings::ocg_overrides`] or marked content say (`false` by
+    /// default). For a caller that must see all of a page's content: which layers a viewer
+    /// shows is the viewer's choice (a Layers panel shows hidden ones), and readers disagree on
+    /// which marked content is optional content.
+    pub all_layers_visible: bool,
 }
 
 impl Default for InterpreterSettings {
@@ -135,6 +141,7 @@ impl Default for InterpreterSettings {
             hide_comments: false,
             ocg_overrides: Arc::new(Vec::new()),
             work_budget: u64::MAX,
+            all_layers_visible: false,
         }
     }
 }
