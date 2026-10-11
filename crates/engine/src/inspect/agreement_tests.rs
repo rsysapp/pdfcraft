@@ -1818,3 +1818,96 @@ fn the_reachability_walk_fails_closed() {
     let limits = Limits { objects: 500, ..Limits::default() };
     assert_eq!(inspect_with(&base, &long, limits), Err(InspectError::TooComplex));
 }
+
+/// A one-page file: object 3 the page (`page` its extra entries, `resources` its resources,
+/// with `/F1` Helvetica unless they name their own `/Font`), drawing "Alpha" and `last`; object
+/// 5 `extra`.
+fn laid_out(page: &str, resources: &str, last: &str, extra: &[u8]) -> Vec<u8> {
+    let mut b = Builder::new();
+    head(&mut b);
+    let fonts = if resources.contains("/Font") { "" } else { "/Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >>" };
+    b.object(3, format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << {fonts} {resources} >> {page} >>").as_bytes());
+    b.object(4, &stream("", &[text("Alpha"), b"\n".to_vec(), last.as_bytes().to_vec()].concat()));
+    b.object(5, if extra.is_empty() { b"null" } else { extra });
+    let rows = b.offsets.clone();
+    b.finish(6, &rows, "")
+}
+
+const X: &str = "BT /F1 12 Tf 150 20 Td (X) Tj ET";
+const X_BOX: &str = "0 g 146 14 16 18 re f";
+
+#[test]
+fn a_resource_nothing_draws_cannot_keep_what_a_rewrite_took_away() {
+    // Follow-up 7 audit, item 7: the unredacted "X" kept as a form nothing draws, under the
+    // page's resources, passed (the resources were compared only through what was drawn).
+    let form = stream("/Type /XObject /Subtype /Form /BBox [0 0 200 300]", X.as_bytes());
+    let base = laid_out("", "", X, b"");
+    let outside = |edited: &[u8]| inspect(&base, edited, InspectLimits::default()).unwrap().content.pages_changed_outside_redactions;
+    assert_eq!(outside(&laid_out("", "", X_BOX, b"")), 0);
+    assert_eq!(outside(&laid_out("", "/XObject << /Hidden 5 0 R >>", X_BOX, &form)), 1, "a new entry nothing draws");
+    // The base drawing X as a form: kept, undrawn, under its name, after the redaction.
+    let base = laid_out("", "/XObject << /Fm 5 0 R >>", "/Fm Do", &form);
+    let outside = |edited: &[u8]| inspect(&base, edited, InspectLimits::default()).unwrap().content.pages_changed_outside_redactions;
+    assert_eq!(outside(&laid_out("", "/XObject << /Fm 5 0 R >>", X_BOX, &form)), 1, "the base's drawn form left undrawn");
+    assert_eq!(outside(&laid_out("", "", X_BOX, b"")), 0, "the form gone with what it drew");
+    // An entry the base did not draw either may stay; the editor's standard fonts may be added.
+    let base = laid_out("", "/XObject << /Unused 5 0 R >>", X, &form);
+    let outside = |edited: &[u8]| inspect(&base, edited, InspectLimits::default()).unwrap().content.pages_changed_outside_redactions;
+    assert_eq!(outside(&laid_out("", "/XObject << /Unused 5 0 R >>", X_BOX, &form)), 0);
+    let fonts = |added: &str| format!("/Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> {added} >>");
+    let base = laid_out("", "", X, b"");
+    let outside = |edited: &[u8]| inspect(&base, edited, InspectLimits::default()).unwrap().content.pages_changed_outside_redactions;
+    let standard = fonts("/PCHelv << /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>");
+    assert_eq!(outside(&laid_out("", &standard, X_BOX, b"")), 0, "the editor's standard font");
+    let other = fonts("/F9 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode 5 0 R >>");
+    assert_eq!(outside(&laid_out("", &other, X_BOX, &stream("", X.as_bytes()))), 1, "a font holding more");
+}
+
+#[test]
+fn a_page_tree_viewers_count_otherwise_is_refused() {
+    // Follow-up 7 audit, item 6: PDFium takes the root's /Count; a /Count that lies, or an entry
+    // with /Kids that is not a /Pages node, shows another document there.
+    let base = laid_out("", "", X, b"");
+    let tree = |pages: &str, second: &str| {
+        let mut b = Builder::new();
+        b.object(1, b"<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, format!("<< /Type /Pages {pages} /MediaBox [0 0 200 300] >>").as_bytes());
+        b.object(3, format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R {RESOURCES} >>").as_bytes());
+        b.object(4, &stream("", &[text("Alpha"), b"\n".to_vec(), X.as_bytes().to_vec()].concat()));
+        b.object(5, second.as_bytes());
+        b.object(6, format!("<< /Type /Page /Parent 5 0 R /Contents 4 0 R {RESOURCES} >>").as_bytes());
+        let rows = b.offsets.clone();
+        b.finish(7, &rows, "")
+    };
+    let pages = |edited: &[u8]| inspect(&base, edited, InspectLimits::default());
+    assert_eq!(pages(&tree("/Kids [3 0 R 5 0 R] /Count 2", "<< /Type /Pages /Parent 2 0 R /Kids [6 0 R] /Count 1 >>")).unwrap().pages.inserted, 1);
+    for (case, file) in [
+        ("the root's /Count", tree("/Kids [3 0 R 5 0 R] /Count 1", "<< /Type /Pages /Parent 2 0 R /Kids [6 0 R] /Count 1 >>")),
+        ("a node's /Count", tree("/Kids [3 0 R 5 0 R] /Count 2", "<< /Type /Pages /Parent 2 0 R /Kids [6 0 R] /Count 3 >>")),
+        ("no /Count", tree("/Kids [3 0 R 5 0 R] /Count 2", "<< /Type /Pages /Parent 2 0 R /Kids [6 0 R] >>")),
+        ("/Kids on a page", tree("/Kids [3 0 R 5 0 R] /Count 2", "<< /Type /Page /Parent 2 0 R /Kids [6 0 R] /Count 1 >>")),
+        ("/Kids without a type", tree("/Kids [3 0 R 5 0 R] /Count 2", "<< /Parent 2 0 R /Kids [6 0 R] /Count 1 >>")),
+    ] {
+        match pages(&file) {
+            Err(InspectError::Edited(message)) => assert!(message.contains("page tree"), "{case}: {message}"),
+            other => panic!("{case}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn the_page_s_boxes_rotation_and_unit_are_compared() {
+    // Follow-up 7 audit, item 6 (pinned, already so): a box that hides what a rewrite kept, the
+    // unit, the media box: outside the redactions; a rotation: reported; a crop box past the
+    // media box (viewers show their intersection): unchanged.
+    let base = laid_out("", "", X, b"");
+    let inspection = |page: &str| inspect(&base, &laid_out(page, "", X, b""), InspectLimits::default()).unwrap();
+    for page in ["/CropBox [0 50 200 300]", "/UserUnit 2", "/MediaBox [0 50 200 300]"] {
+        assert_eq!(inspection(page).content.pages_changed_outside_redactions, 1, "{page}");
+    }
+    for page in ["/Rotate 90", "/Rotate -90"] {
+        let found = inspection(page);
+        assert_eq!((found.pages.rotated, found.content.pages_changed_outside_redactions), (1, 0), "{page}");
+    }
+    assert_eq!(inspection("/CropBox [-100 -100 400 400]").content.pages_changed_outside_redactions, 0);
+}

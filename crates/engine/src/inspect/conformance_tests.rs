@@ -633,8 +633,10 @@ fn text_added_in_a_layer_that_is_off_is_a_change_outside_redactions() {
     assert_eq!(inspection.text.pages_with_text_added, 1, "{inspection:?}");
     assert_eq!(inspection.content.pages_changed_outside_redactions, 1, "{inspection:?}");
     // Text in the layer redacted under a box is a redaction like any other.
+    // (The emptied layer's marked content stays, as the editor's redactor leaves it: its
+    // property list is still drawn with, follow-up 7 audit item 7.)
     let base = layer_page("6 0 R", "/OFF [6 0 R]", &format!("/OC /L BDC {WORD} EMC"));
-    let edited = layer_page("6 0 R", "/OFF [6 0 R]", WORD_BOX);
+    let edited = layer_page("6 0 R", "/OFF [6 0 R]", &format!("/OC /L BDC EMC\n{WORD_BOX}"));
     let inspection = run(&base, &edited).unwrap();
     assert_eq!(inspection.text, TextChanges { pages_with_text_removed: 1, pages_with_text_added: 0 }, "{inspection:?}");
     assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{inspection:?}");

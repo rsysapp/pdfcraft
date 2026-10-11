@@ -302,6 +302,12 @@ pub(crate) struct PageFacts {
     pub levels_agree: bool,
     /// A level closed that its content stream did not open, or left open at its end.
     pub levels_unbalanced: bool,
+    /// Embed build (follow-up 7 audit, item 7): the entries of the resource dictionaries the
+    /// page and what it draws use (by category and content, not name) that nothing looks up:
+    /// a rewrite may keep the base's own unused entries, never leave one the base used, or add
+    /// one (it could hold what the rewrite took away, drawn by nothing). The editor's standard
+    /// fonts (a name-only Type 1 dictionary of the standard 14) are not counted.
+    pub unused_resources: BTreeSet<Digest>,
     /// The page dictionary's own entries (not in [`PAGE_OWN_KEYS`], nor `/Type`), by
     /// their values' digests: in a rewrite they must be the same, but for [`PAGE_REMOVABLE`]
     /// ones removed.
@@ -350,6 +356,7 @@ impl PageFacts {
             levels: Vec::new(),
             levels_agree: true,
             levels_unbalanced: false,
+            unused_resources: BTreeSet::new(),
             entries: BTreeMap::new(),
             type3: BTreeSet::new(),
             render_risk: None,
@@ -833,6 +840,11 @@ struct Drawn {
     floor: usize,
     /// A level closed that its content stream did not open, or left open at its end.
     unbalanced: bool,
+    /// Embed build (follow-up 7 audit, item 7): the resource entries the page's and its forms'
+    /// resource dictionaries hold, and those the drawing looked up (see
+    /// [`PageFacts::unused_resources`]).
+    offered: BTreeSet<Digest>,
+    used: BTreeSet<Digest>,
 }
 
 /// One level of marked content (`BDC`, `BMC`) the page's own content or a form it draws opens
@@ -1409,6 +1421,20 @@ impl<'d, 'b> Reader<'d, 'b> {
         Ok(pages)
     }
 
+    /// Embed build (follow-up 7 audit, item 6): in an edited file, a page tree node's `/Count`
+    /// must be the number of pages under it. PDFium takes the root's `/Count` for the page count
+    /// (where it is plausible), hayro and this reader count the pages: a `/Count` that lies shows
+    /// another document in one of them. (A base's own tree is read as it is.)
+    fn check_count(&mut self, node: &Dict, leaves: usize) -> Result<(), Fail> {
+        if matches!(*self.tolerated, Tolerated::Base) {
+            return Ok(());
+        }
+        match self.int_of(node.get(b"Count"))? {
+            Some(count) if usize::try_from(count).ok() == Some(leaves) => Ok(()),
+            _ => Err(read_error(format!("a page tree node's /Count is not the {leaves} page(s) under it, which viewers count differently"))),
+        }
+    }
+
     fn walk(
         &mut self,
         node: &Dict,
@@ -1421,6 +1447,7 @@ impl<'d, 'b> Reader<'d, 'b> {
         if depth > MAX_TREE_DEPTH {
             return Err(read_error("the page tree is too deep"));
         }
+        let before = pages.len();
         let here = with_inherited(node, inherited);
         let Some(kids) = node.get(b"Kids") else { return Err(read_error("a page tree node has no /Kids")) };
         let kids = self.array_of(Some(kids), "/Kids")?;
@@ -1428,6 +1455,11 @@ impl<'d, 'b> Reader<'d, 'b> {
             self.budget.tick()?;
             let Object::Ref(r) = kid else { return Err(read_error("a page tree entry is not a reference")) };
             let dict = self.get(r)?.as_dict().cloned().ok_or_else(|| read_error(format!("page tree entry {r} is not a dictionary")))?;
+            // Embed build (follow-up 7 audit, item 6): a node is `/Type /Pages`, a page has no
+            // `/Kids`; PDFium and pdf.js take an entry with `/Kids` for a node whatever its type.
+            if dict.name(b"Type") != Some(b"Pages") && dict.contains(b"Kids") {
+                return Err(read_error(format!("page tree entry {r} has /Kids but is not a /Pages node, which viewers read differently")));
+            }
             if dict.name(b"Type") == Some(b"Pages") {
                 if !nodes.insert(r) {
                     return Err(read_error("the page tree loops"));
@@ -1446,7 +1478,7 @@ impl<'d, 'b> Reader<'d, 'b> {
                 pages.push(page);
             }
         }
-        Ok(())
+        self.check_count(node, pages.len().saturating_sub(before))
     }
 
     // ── content ─────────────────────────────────────────────────────────────────────────────
@@ -1708,10 +1740,17 @@ impl<'d, 'b> Reader<'d, 'b> {
                     let kind: &'static [u8] = match *kind {
                         b"Font" => b"Font",
                         b"Shading" => b"Shading",
-                        // Colour spaces are names or arrays: what they mean, hayro draws.
-                        _ => continue,
+                        // Colour spaces are names or arrays: what they mean, hayro draws. Only
+                        // noted as used.
+                        _ => {
+                            if let Some(entry) = self.resource_entry(chain, b"ColorSpace", name)? {
+                                self.use_resource(b"ColorSpace", &entry, drawn)?;
+                            }
+                            continue;
+                        }
                     };
                     if let Some(entry) = self.resource_entry(chain, kind, name)? {
+                        self.use_resource(kind, &entry, drawn)?;
                         match &*self.resolve(&entry)? {
                             Object::Dict(dict) => self.note_keys(kind, dict, drawn)?,
                             Object::Stream(stream) => self.note_keys(kind, &stream.dict, drawn)?,
@@ -1722,7 +1761,10 @@ impl<'d, 'b> Reader<'d, 'b> {
                 Item::Span(tag, list, level) => {
                     let found = match list {
                         PropertyList::Named(name) => match self.resource_entry(chain, b"Properties", name)? {
-                            Some(entry) => match &*self.resolve(&entry)? {
+                            Some(entry) => match &*{
+                                self.use_resource(b"Properties", &entry, drawn)?;
+                                self.resolve(&entry)?
+                            } {
                                 Object::Dict(dict) => Some(dict.clone()),
                                 Object::Stream(stream) => Some(stream.dict.clone()),
                                 _ => None,
@@ -1764,6 +1806,7 @@ impl<'d, 'b> Reader<'d, 'b> {
                 }
                 Item::Draw(name) => {
                     let Some(r) = self.xobject(chain, name)? else { continue };
+                    self.use_resource(b"XObject", &Object::Ref(r), drawn)?;
                     let obj = self.get(r)?;
                     let Object::Stream(stream) = &*obj else { continue };
                     match stream.dict.name(b"Subtype") {
@@ -1792,6 +1835,9 @@ impl<'d, 'b> Reader<'d, 'b> {
                             }
                             drawn.interpreted = drawn.interpreted.saturating_add(scan.len);
                             let (inner, key) = self.inner_chain(stream.dict.get(b"Resources"), "a form's /Resources", chain, &at.chain)?;
+                            if let Some(own) = inner.first() {
+                                self.offer_resources(own, drawn)?;
+                            }
                             self.type3_fonts(&inner, &key, drawn)?;
                             // Embed build: the form's content may close only the levels it opened.
                             let floor = std::mem::replace(&mut drawn.floor, drawn.open.len());
@@ -1806,6 +1852,9 @@ impl<'d, 'b> Reader<'d, 'b> {
                     }
                 }
                 Item::Pattern(name) => {
+                    if let Some(entry) = self.resource_entry(chain, b"Pattern", name)? {
+                        self.use_resource(b"Pattern", &entry, drawn)?;
+                    }
                     let Some(r) = self.resource(chain, b"Pattern", name)? else { continue };
                     let obj = self.get(r)?;
                     // Shading patterns (dictionaries) draw no images, but may set a graphics
@@ -1834,10 +1883,16 @@ impl<'d, 'b> Reader<'d, 'b> {
                     let scan = self.form_content(r, stream)?;
                     drawn.interpreted = drawn.interpreted.saturating_add(scan.len);
                     let (inner, key) = self.inner_chain(stream.dict.get(b"Resources"), "a pattern's /Resources", chain, &at.chain)?;
+                    if let Some(own) = inner.first() {
+                        self.offer_resources(own, drawn)?;
+                    }
                     self.type3_fonts(&inner, &key, drawn)?;
                     self.draw(&scan.items, &inner, Context { depth: at.depth.saturating_add(1), patterned: true, chain: key, ..at }, drawn)?;
                 }
                 Item::State(name) => {
+                    if let Some(entry) = self.resource_entry(chain, b"ExtGState", name)? {
+                        self.use_resource(b"ExtGState", &entry, drawn)?;
+                    }
                     if let Some(entry) = self.resource_entry(chain, b"ExtGState", name)?
                         && let Some(state) = self.dict_of(Some(&entry), "a graphics state")?
                     {
@@ -1861,6 +1916,9 @@ impl<'d, 'b> Reader<'d, 'b> {
                     drawn.forms.push(FormUse { obj: group, key, placed: false });
                     drawn.interpreted = drawn.interpreted.saturating_add(scan.len);
                     let (inner, key) = self.inner_chain(stream.dict.get(b"Resources"), "a soft mask's /Resources", chain, &at.chain)?;
+                    if let Some(own) = inner.first() {
+                        self.offer_resources(own, drawn)?;
+                    }
                     self.type3_fonts(&inner, &key, drawn)?;
                     self.draw(&scan.items, &inner, Context { depth: at.depth.saturating_add(1), masked: true, chain: key, ..at }, drawn)?;
                 }
@@ -1915,6 +1973,63 @@ impl<'d, 'b> Reader<'d, 'b> {
             }
         }
         Ok(())
+    }
+
+    /// Embed build (follow-up 7 audit, item 7): a resource entry by its category and content.
+    fn resource_digest(&mut self, kind: &[u8], entry: &Object) -> Result<Digest, Fail> {
+        let digest = self.digest(entry)?;
+        Ok(sha256(&[b"resource", kind, &digest]))
+    }
+
+    fn use_resource(&mut self, kind: &[u8], entry: &Object, drawn: &mut Drawn) -> Result<(), Fail> {
+        let digest = self.resource_digest(kind, entry)?;
+        drawn.used.insert(digest);
+        Ok(())
+    }
+
+    /// Note every entry `resources` offers (see [`PageFacts::unused_resources`]).
+    fn offer_resources(&mut self, resources: &Dict, drawn: &mut Drawn) -> Result<(), Fail> {
+        for kind in [b"XObject".as_slice(), b"Font", b"ExtGState", b"Pattern", b"Shading", b"Properties", b"ColorSpace"] {
+            let Some(entries) = self.dict_of(resources.get(kind), "a resource dictionary")? else { continue };
+            for (_, entry) in entries.iter() {
+                self.budget.tick()?;
+                if kind == b"Font" && self.standard_font(entry)? {
+                    continue;
+                }
+                let digest = self.resource_digest(kind, entry)?;
+                drawn.offered.insert(digest);
+            }
+        }
+        Ok(())
+    }
+
+    /// A Type 1 font dictionary of the standard 14 naming nothing but its type, subtype, base
+    /// font and a standard encoding (what the editor adds for its own text): it holds no text.
+    fn standard_font(&mut self, entry: &Object) -> Result<bool, Fail> {
+        const STANDARD: [&[u8]; 14] = [
+            b"Helvetica",
+            b"Helvetica-Bold",
+            b"Helvetica-Oblique",
+            b"Helvetica-BoldOblique",
+            b"Times-Roman",
+            b"Times-Bold",
+            b"Times-Italic",
+            b"Times-BoldItalic",
+            b"Courier",
+            b"Courier-Bold",
+            b"Courier-Oblique",
+            b"Courier-BoldOblique",
+            b"Symbol",
+            b"ZapfDingbats",
+        ];
+        let Object::Dict(font) = &*self.resolve(entry)? else { return Ok(false) };
+        Ok(font.iter().all(|(key, value)| match (key.as_slice(), value) {
+            (b"Type", Object::Name(name)) => name.as_slice() == b"Font",
+            (b"Subtype", Object::Name(name)) => name.as_slice() == b"Type1",
+            (b"BaseFont", Object::Name(name)) => STANDARD.contains(&name.as_slice()),
+            (b"Encoding", Object::Name(name)) => matches!(name.as_slice(), b"WinAnsiEncoding" | b"MacRomanEncoding" | b"StandardEncoding"),
+            _ => false,
+        }))
     }
 
     /// Keep one use of a property list, tagged `tag`, in drawing order (see [`Span`]).
@@ -2191,6 +2306,7 @@ impl<'d, 'b> Reader<'d, 'b> {
         self.group_risk(&node.dict, &mut drawn)?;
         for level in &chain {
             self.note_keys(b"Resources", level, &mut drawn)?;
+            self.offer_resources(level, &mut drawn)?;
         }
         self.type3_fonts(&chain, &resources, &mut drawn)?;
         self.draw(&scan.items, &chain, Context { depth: 0, patterned: false, masked: false, chain: resources, form: None }, &mut drawn)?;
@@ -2209,6 +2325,7 @@ impl<'d, 'b> Reader<'d, 'b> {
             levels: drawn.levels,
             levels_agree: false,
             levels_unbalanced: drawn.unbalanced,
+            unused_resources: drawn.offered.difference(&drawn.used).copied().collect(),
             entries,
             image_pixels: drawn.pixels,
             render_risk: drawn.render_risk,

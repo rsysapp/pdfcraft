@@ -1851,6 +1851,10 @@ fn compare_pages(
                 }
                 // Text kept but drawn in another order reads otherwise.
                 outside |= !pairing.in_order;
+                // Follow-up 7 audit (item 7): a resource entry nothing draws may only be one the
+                // base page did not draw either (the unredacted original, kept under its old
+                // name or a new one, is not).
+                outside |= !e.unused_resources.is_subset(&b.unused_resources);
             }
             let mut areas = Areas::new(&boxes);
             // Every removed glyph by its centre, and every image at its own resolution.
