@@ -1885,6 +1885,9 @@ pub struct Session {
     js_off: bool,
     /// Embed build: every change is refused ([`Session::set_view_only`]).
     view_only: bool,
+    /// Embed build: saves leave the document information alone
+    /// ([`Session::set_keep_document_information`]).
+    keep_document_information: bool,
 }
 
 /// Lay a dynamic XFA form out (pages and fields) and give its widgets appearances.
@@ -1986,6 +1989,28 @@ impl Session {
         self.now().unwrap_or(0)
     }
 
+    /// Embed build: never write the document information (the trailer's `/Info`) when saving:
+    /// no `/ModDate` stamped, no `/Info` added where there is none, whatever the clock. Saves,
+    /// rewrites, optimized copies, new documents, signing and document timestamps all leave it
+    /// as it was (an edit that sets it, `Edit::SetInfo`, still does). The embed build sets this:
+    /// its host checks every save, refuses any change to the document information (R6b-45) and
+    /// records when the edit was made itself.
+    pub fn set_keep_document_information(&mut self, on: bool) {
+        self.keep_document_information = on;
+    }
+
+    pub fn keeps_document_information(&self) -> bool {
+        self.keep_document_information
+    }
+
+    /// The options every save of this session writes with: `/ModDate` from the clock, unless
+    /// the document information is kept ([`Session::set_keep_document_information`]).
+    fn save_options(&self) -> SaveOptions {
+        // Embed build: no modification date where the document information is kept (R6b-45).
+        let mod_date = if self.keep_document_information { None } else { self.now().map(pdfcraft_cos::pdf_date) };
+        SaveOptions { mod_date, ..SaveOptions::default() }
+    }
+
     fn now(&self) -> Option<i64> {
         if let Some(c) = self.clock {
             return Some(c());
@@ -2058,7 +2083,8 @@ impl Session {
         // A dynamic XFA form is a shell around an XML template; lay the template out into real
         // pages and fields so the rest of the engine works on it. The original bytes stay: the
         // laid-out form is one appended revision.
-        let opts = SaveOptions { mod_date: self.now().map(pdfcraft_cos::pdf_date), ..SaveOptions::default() };
+        // Embed build: the session decides whether a save stamps /ModDate (R6b-45).
+        let opts = self.save_options();
         // Write `work` as one more revision and reopen it: what the document then is.
         let rebase = |work: &pdfcraft_cos::Document| -> Result<(Arc<Vec<u8>>, DocInfo, pdfcraft_cos::Document), String> {
             let new_bytes = write_incremental(work, &opts).map(Arc::new).map_err(|e| e.to_string())?;
@@ -2498,7 +2524,8 @@ impl Session {
         if !editor.cos.is_modified() {
             return Ok(editor.cos.bytes().clone());
         }
-        let opts = SaveOptions { mod_date: self.now().map(pdfcraft_cos::pdf_date), ..SaveOptions::default() };
+        // Embed build: the session decides whether a save stamps /ModDate (R6b-45).
+        let opts = self.save_options();
         guard(|| write_incremental(&editor.cos, &opts)).map_err(EditError::Write)?.map(Arc::new).map_err(|e| EditError::Write(e.to_string()))
     }
 
@@ -2509,7 +2536,8 @@ impl Session {
             return Err(EditError::Signed);
         }
         let editor = doc.editor.as_ref().ok_or_else(|| EditError::ReadOnly(doc.read_only_reason.clone().unwrap_or_default()))?;
-        let opts = SaveOptions { mod_date: self.now().map(pdfcraft_cos::pdf_date), ..SaveOptions::default() };
+        // Embed build: the session decides whether a save stamps /ModDate (R6b-45).
+        let opts = self.save_options();
         guard(|| write_full(&editor.cos, &opts)).map_err(EditError::Write)?.map(Arc::new).map_err(|e| EditError::Write(e.to_string()))
     }
 
@@ -2809,7 +2837,8 @@ impl Session {
     }
 
     fn write_new(&self, doc: &pdfcraft_cos::Document) -> Result<Arc<Vec<u8>>, EditError> {
-        let opts = SaveOptions { mod_date: self.now().map(pdfcraft_cos::pdf_date), ..SaveOptions::default() };
+        // Embed build: the session decides whether a save stamps /ModDate (R6b-45).
+        let opts = self.save_options();
         write_full(doc, &opts).map(Arc::new).map_err(|e| EditError::Write(e.to_string()))
     }
 
@@ -2941,6 +2970,8 @@ impl Session {
         if opts.date.is_empty() {
             opts.date = self.signing_date();
         }
+        // Embed build: a session that keeps the document information signs without /ModDate.
+        opts.keep_document_information |= self.keep_document_information;
         Ok(Arc::new(pdfcraft_sign::sign(&editor.cos, id, &opts)?))
     }
 
@@ -2958,6 +2989,8 @@ impl Session {
         if opts.date.is_empty() {
             opts.date = self.signing_date();
         }
+        // Embed build: a session that keeps the document information signs without /ModDate.
+        opts.keep_document_information |= self.keep_document_information;
         Ok(Arc::new(pdfcraft_sign::sign_with_timestamp(&editor.cos, id, &opts, tsa)?))
     }
 
@@ -2967,7 +3000,8 @@ impl Session {
         let d = self.get(doc).ok_or(EditError::NoDocument)?;
         let editor = d.editor.as_ref().ok_or_else(|| EditError::ReadOnly(d.read_only_reason.clone().unwrap_or_default()))?;
         let date = if date.is_empty() { self.signing_date() } else { date };
-        Ok(Arc::new(pdfcraft_sign::timestamp_document(&editor.cos, tsa, &date)?))
+        // Embed build: a session that keeps the document information stamps no /ModDate.
+        Ok(Arc::new(pdfcraft_sign::timestamp_document_with(&editor.cos, tsa, &date, self.keep_document_information)?))
     }
 
     /// Embed revocation evidence into the catalog's `/DSS` with `/VRI` entries per signature

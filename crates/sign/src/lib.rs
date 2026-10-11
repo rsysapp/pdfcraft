@@ -25,7 +25,7 @@ pub use der::Time;
 pub use keys::{DigestAlg, PrivateKey, PublicKey};
 pub use pdf::{
     Appearance, DigestCache, Modification, SignOptions, SignatureInfo, Status, TrustStore, list as signatures, sign, sign_with_timestamp,
-    timestamp_document, validate,
+    timestamp_document, timestamp_document_with, validate,
 };
 pub use pkcs12::DigitalId;
 pub use timestamp::{TimestampAuthority, TimestampQuery, TimestampToken};

@@ -1278,6 +1278,24 @@ fn signing_saving_trusting_and_commenting_afterwards() {
 }
 
 #[test]
+fn a_session_keeping_the_document_information_signs_without_writing_it() {
+    // R6b-45: the embed build's session writes no /Info in any save, signing included.
+    let p12 = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../sign/tests/data/ec-p256.p12")).unwrap();
+    let digital_id = sign::pkcs12::open(&p12, "test").unwrap();
+    for keep in [false, true] {
+        let mut s = Session::new().with_clock(|| 1_800_000_000);
+        s.set_keep_document_information(keep);
+        let base = fixture(1);
+        let id = s.open("fixture.pdf", None, Arc::new(base.clone()), None).unwrap();
+        let signed = s.sign(id, &digital_id, SignOptions { rect: None, ..SignOptions::default() }).unwrap();
+        let appended = signed.strip_prefix(base.as_slice()).unwrap();
+        assert_eq!(appended.windows(8).any(|w| w == b"/ModDate"), !keep, "keep {keep}");
+        s.mark_signed(id, signed, None).unwrap();
+        assert_eq!(s.get(id).unwrap().signatures[0].date.as_deref(), Some("D:20270115080000Z"), "the signing time stays the signature's");
+    }
+}
+
+#[test]
 #[ignore = "timing probe"]
 fn probe_edit_latency_on_a_large_signed_document() {
     // ~120 MB: one page whose content stream is large.

@@ -957,6 +957,9 @@ pub struct SignOptions {
     /// Certify with these DocMDP permissions (1 no changes, 2 form fill and signing, 3 also comments).
     pub certify: Option<u8>,
     pub appearance: Appearance,
+    /// Embed build: leave the document information (the trailer's `/Info`) as it is: no
+    /// `/ModDate` written with the signature (the signing time is still the signature's `/M`).
+    pub keep_document_information: bool,
 }
 
 /// Placeholder `/ByteRange` values: fixed width, patched after writing.
@@ -1126,7 +1129,9 @@ fn sign_inner(
     apd.set(b"N".to_vec(), Object::Ref(ap_ref));
     doc.update_dict(widget, |w| w.set(b"AP".to_vec(), Object::Dict(apd)))?;
     // Write with the placeholders, then patch them.
-    let save = SaveOptions { mod_date: Some(opts.date.clone()), object_streams: false, ..SaveOptions::default() };
+    // Embed build: no `/ModDate` where the document information is kept.
+    let mod_date = (!opts.keep_document_information).then(|| opts.date.clone());
+    let save = SaveOptions { mod_date, object_streams: false, ..SaveOptions::default() };
     let mut out = pdfcraft_cos::write_incremental(&doc, &save)?;
     let (br_at, gap) = locate(&out, reserve)?;
     let (start, end) = gap;
@@ -1164,6 +1169,17 @@ fn sign_inner(
 /// whose `/Contents` is an RFC 3161 token covering the whole current file (`/ETSI.RFC3161`).
 /// The transport is the caller's; a rejected or malformed token produces no file.
 pub fn timestamp_document(doc: &Document, tsa: &dyn crate::timestamp::TimestampAuthority, date: &str) -> Result<Vec<u8>, SignError> {
+    timestamp_document_with(doc, tsa, date, false)
+}
+
+/// Embed build: [`timestamp_document`], leaving the document information (the trailer's
+/// `/Info`) as it is when `keep_document_information` (no `/ModDate` written).
+pub fn timestamp_document_with(
+    doc: &Document,
+    tsa: &dyn crate::timestamp::TimestampAuthority,
+    date: &str,
+    keep_document_information: bool,
+) -> Result<Vec<u8>, SignError> {
     if doc.security().is_some() || doc.output_handler().is_some() {
         return Err(SignError::Unsupported("timestamping encrypted documents".into()));
     }
@@ -1181,7 +1197,8 @@ pub fn timestamp_document(doc: &Document, tsa: &dyn crate::timestamp::TimestampA
     build.set(b"App".to_vec(), Object::Dict(app));
     v.set(b"Prop_Build".to_vec(), Object::Dict(build));
     doc.add(Object::Dict(v));
-    let save = SaveOptions { mod_date: Some(date.to_string()), object_streams: false, ..SaveOptions::default() };
+    // Embed build: no `/ModDate` where the document information is kept.
+    let save = SaveOptions { mod_date: (!keep_document_information).then(|| date.to_string()), object_streams: false, ..SaveOptions::default() };
     let mut out = pdfcraft_cos::write_incremental(&doc, &save)?;
     let (br_at, gap) = locate(&out, TOKEN_RESERVE)?;
     let (start, end) = gap;

@@ -461,3 +461,12 @@ fn the_control_channel_runs_no_refused_command_and_opens_nothing() {
     assert_no_host_events(&bridge);
     assert_untouched(&h, &original);
 }
+
+#[test]
+fn the_embedded_session_never_writes_the_document_information() {
+    // R6b-45: the host refuses any change to /Info and records the edit time itself, so the
+    // embed build's session stamps no /ModDate on any save; the full app still does.
+    let (h, _bridge) = embedded();
+    assert!(h.state().session.keeps_document_information());
+    assert!(!pdfcraft_ui_egui::PdfCraftApp::new().session.keeps_document_information());
+}

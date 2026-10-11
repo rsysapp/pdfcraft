@@ -709,3 +709,26 @@ fn signing_with_windows_store_identities() {
         assert!(out.status.success(), "test certificate remains: {thumbprint}");
     }
 }
+
+#[test]
+fn signing_and_timestamping_can_leave_the_document_information_alone() {
+    // Embed build (R6b-45): a host that refuses any change to /Info has the signer write no
+    // /ModDate; the signing time stays the signature's own /M. Without the option, /ModDate is
+    // stamped as before.
+    let has_mod_date = |bytes: &[u8]| bytes.get(fixture().len()..).is_some_and(|tail| tail.windows(8).any(|w| w == b"/ModDate"));
+    let id = pkcs12::open(&data("ec-p256.p12"), "test").unwrap();
+    let signed = pdfcraft_sign::sign(&open(&fixture()), &id, &opts()).unwrap();
+    assert!(has_mod_date(&signed));
+    let kept = pdfcraft_sign::sign(&open(&fixture()), &id, &SignOptions { keep_document_information: true, ..opts() }).unwrap();
+    assert!(kept.starts_with(&fixture()) && !has_mod_date(&kept));
+    let s = signatures(&open(&kept), &kept, &TrustStore::default()).into_iter().find(|s| s.signed).unwrap();
+    assert_eq!(s.date.as_deref(), Some("D:20261002120000+01'00'"));
+    let tsa = TestTsa {
+        id: pkcs12::open(&data("rsa-aes.p12"), "test").unwrap(),
+        time: Time { year: 2026, month: 10, day: 6, hour: 12, minute: 0, second: 0 },
+    };
+    let stamped = pdfcraft_sign::timestamp_document(&open(&fixture()), &tsa, "D:20261006120000Z").unwrap();
+    assert!(has_mod_date(&stamped));
+    let stamped = pdfcraft_sign::timestamp_document_with(&open(&fixture()), &tsa, "D:20261006120000Z", true).unwrap();
+    assert!(stamped.starts_with(&fixture()) && !has_mod_date(&stamped));
+}

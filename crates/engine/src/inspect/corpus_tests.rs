@@ -26,8 +26,16 @@ fn run(base: &[u8], edited: &[u8]) -> Result<Inspection, InspectError> {
     inspect(base, edited, InspectLimits::default())
 }
 
-fn edit(base: &[u8], edits: Vec<Edit>) -> Vec<u8> {
+/// A session as the embed build sets it up: it keeps the document information (R6b-45), with a
+/// clock that would otherwise stamp the modification date.
+fn embed_session() -> Session {
     let mut session = Session::new().with_clock(|| 1_700_000_000);
+    session.set_keep_document_information(true);
+    session
+}
+
+fn edit(base: &[u8], edits: Vec<Edit>) -> Vec<u8> {
+    let mut session = embed_session();
     let id = session.open("sample.pdf", None, Arc::new(base.to_vec()), None).unwrap();
     for edit in edits {
         session.apply(id, edit).unwrap();
@@ -79,7 +87,7 @@ fn redact_line(bytes: &[u8], page: usize) -> Option<Vec<Edit>> {
 
 /// `edit`, or `None` where the Session refuses an edit (a signed file is not rewritten).
 fn try_edit(base: &[u8], edits: Vec<Edit>) -> Option<Vec<u8>> {
-    let mut session = Session::new().with_clock(|| 1_700_000_000);
+    let mut session = embed_session();
     let id = session.open("sample.pdf", None, Arc::new(base.to_vec()), None).ok()?;
     for edit in edits {
         session.apply(id, edit).ok()?;
@@ -87,9 +95,9 @@ fn try_edit(base: &[u8], edits: Vec<Edit>) -> Option<Vec<u8>> {
     session.save_bytes(id).ok().map(|bytes| bytes.as_ref().clone())
 }
 
-/// The document information a save through the test session changes: its clock stamps the
-/// modification date. (The embed build on wasm32 has no clock, so its saves stamp nothing.)
-const STAMPED: [&str; 1] = ["ModDate"];
+/// The document information a save through the embed build's session changes: none, though its
+/// clock would stamp the modification date (R6b-45).
+const STAMPED: [&str; 0] = [];
 
 /// A rewrite that is nothing but redactions on `redacted` pages and `deleted` pages deleted.
 fn assert_redacted(name: &str, inspection: &Inspection, count: u32, deleted: u32) {

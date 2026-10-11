@@ -234,6 +234,54 @@ fn reports_an_applied_redaction_as_a_rewrite_that_removed_text() {
     assert_eq!(inspection.pages, PageChanges { before: 2, after: 2, ..PageChanges::default() });
 }
 
+/// Save `edits` to `base` through a session with the test clock: one that keeps the document
+/// information (the embed build's, R6b-45) or not (the desktop app's), incrementally or whole.
+fn session_save(base: &[u8], edits: Vec<Edit>, keep_information: bool, whole: bool) -> Vec<u8> {
+    let mut session = Session::new().with_clock(|| 1_700_000_000);
+    session.set_keep_document_information(keep_information);
+    let id = session.open("base.pdf", None, Arc::new(base.to_vec()), None).unwrap();
+    for edit in edits {
+        session.apply(id, edit).unwrap();
+    }
+    let saved = if whole { session.save_full_bytes(id) } else { session.save_bytes(id) };
+    saved.unwrap().as_ref().clone()
+}
+
+#[test]
+fn an_embed_session_save_never_writes_the_document_information() {
+    // R6b-45: the host refuses any change to /Info, so the embed build's session stamps no
+    // /ModDate (nor adds /Info) on any save, whatever its clock; the desktop app's session does.
+    let lines = [page(&text_line(20.0, 150.0, "Quarterly results")), page(&text_line(20.0, 150.0, "Appendix"))];
+    let plain = pages_pdf(&lines, &[]);
+    let titled = update_with(&plain, &[(8, b"<< /Title (Quarterly) /ModDate (D:20200101000000Z) >>".to_vec())], |_, prev| {
+        format!("/Size 9 /Root 1 0 R /Info 8 0 R /Prev {prev}")
+    });
+    let note = Shape::Note { at: [20.0, 20.0], icon: Default::default() };
+    for (name, base) in [("no /Info", &plain), ("an /Info", &titled)] {
+        let cases: [(&str, Vec<Edit>, bool); 5] = [
+            ("rotated", vec![Edit::RotatePages { pages: vec![0], degrees: 90 }], false),
+            ("annotated", vec![annotation(1, note.clone())], false),
+            ("redacted", vec![annotation(0, redact([15.0, 135.0, 190.0, 160.0])), Edit::ApplyRedactions { pages: None }], false),
+            ("a page deleted", vec![Edit::DeletePages { pages: vec![1] }], false),
+            ("rotated, written whole", vec![Edit::RotatePages { pages: vec![0], degrees: 90 }], true),
+        ];
+        for (case, edits, whole) in cases {
+            let saved = session_save(base, edits.clone(), true, whole);
+            let inspection = run(base, &saved).unwrap_or_else(|error| panic!("{name}, {case}: {error:?}"));
+            assert_eq!(inspection.info, InfoChanges::default(), "{name}, {case}: {inspection:?}");
+            if case == "redacted" {
+                assert!(!inspection.base_kept && inspection.text.pages_with_text_removed == 1, "{name}, {case}: {inspection:?}");
+                assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{name}, {case}: {inspection:?}");
+            }
+            if let Some(appended) = saved.strip_prefix(base.as_slice()) {
+                assert!(!appended.windows(8).any(|w| w == b"/ModDate"), "{name}, {case}: the update writes no /ModDate");
+            }
+            let stamped = session_save(base, edits, false, whole);
+            assert_eq!(run(base, &stamped).unwrap().info.changed, ["ModDate"], "{name}, {case}: the desktop session stamps it");
+        }
+    }
+}
+
 // A signature or a stamp image is a typical redaction target (D11): a rewrite that removed
 // only an image is a redaction too. The fixture's text sits at y 126–150 of a 200 × 300 page
 // (display space, as `AddImage` and the marks take it); the image sits well below it.

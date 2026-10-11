@@ -65,7 +65,8 @@ impl Session {
             cos: editor.cos.clone(),
             settings: settings.clone(),
             discard: discard.to_vec(),
-            opts: SaveOptions { mod_date: self.now().map(pdfcraft_cos::pdf_date), ..SaveOptions::default() },
+            // Embed build: the session decides whether a save stamps /ModDate (R6b-45).
+            opts: self.save_options(),
         })
     }
 }
