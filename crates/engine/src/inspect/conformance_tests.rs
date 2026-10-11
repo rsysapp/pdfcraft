@@ -359,3 +359,511 @@ fn an_image_the_content_draws_that_hayro_does_not_is_refused() {
     let message = edited_error(run(&base, &with_pattern("", WORD_BOX)));
     assert!(message.contains("did not draw every use of image"), "a pattern never painted: {message}");
 }
+
+// ── follow-up: streams keyed by their resolved dictionary and their data ────────────────────
+
+/// Append one update holding `objects` (number, body) to `base`, with `/Size` `size`.
+fn update_objects(base: &[u8], objects: &[(u32, Vec<u8>)], size: u32) -> Vec<u8> {
+    let at = base.windows(9).rposition(|w| w == b"startxref").unwrap();
+    let prev: usize = std::str::from_utf8(&base[at + 9..]).unwrap().split_whitespace().next().unwrap().parse().unwrap();
+    let mut out = base.to_vec();
+    let mut rows = Vec::new();
+    for (num, body) in objects {
+        rows.push((*num, out.len()));
+        out.extend_from_slice(format!("{num} 0 obj\n").as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    rows.sort_unstable();
+    let xref = out.len();
+    out.extend_from_slice(b"xref\n0 1\n0000000000 65535 f \n");
+    for (num, offset) in rows {
+        out.extend_from_slice(format!("{num} 1\n{offset:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(format!("trailer\n<< /Size {size} /Root 1 0 R /Prev {prev} >>\nstartxref\n{xref}\n%%EOF\n").as_bytes());
+    out
+}
+
+/// `data` encoded with RunLengthDecode (literal runs only).
+fn run_length(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for chunk in data.chunks(128) {
+        out.push((chunk.len() - 1) as u8);
+        out.extend_from_slice(chunk);
+    }
+    out.push(128);
+    out
+}
+
+/// The appearance a Square annotation (object 5) of the edited files shows: a blue square.
+const SQUARE: &str = "0 0 1 RG 2 2 56 56 re S";
+
+/// A page with a Square annotation (object 5) whose appearance dictionary is `appearances`
+/// (naming streams 6 and 7), and `objects` from 6.
+fn with_square(appearances: &str, objects: &[Vec<u8>]) -> Vec<u8> {
+    let mut all = vec![format!("<< /Type /Annot /Subtype /Square /Rect [20 200 80 260] /C [0 0 1] /AP {appearances} >>").into_bytes()];
+    all.extend(objects.iter().cloned());
+    page_file("", "/Annots [5 0 R]", &text(20, 150, "Alpha"), "", &all)
+}
+
+fn appearance_stream(extra: &str, data: &[u8]) -> Vec<u8> {
+    stream(&format!("/Type /XObject /Subtype /Form /BBox [0 0 60 60] {extra}"), data)
+}
+
+#[test]
+fn an_indirect_filter_on_an_appearance_is_a_change() {
+    // An appended update writes the appearance again, byte for byte, with `/Filter 9 0 R`
+    // (RunLengthDecode): readers now decode it into other drawing (PDFium draws it black).
+    for (case, appearances) in [("normal", "<< /N 6 0 R >>"), ("down", "<< /N 7 0 R /D 6 0 R >>"), ("rollover", "<< /N 7 0 R /R 6 0 R >>")] {
+        let base = with_square(appearances, &[appearance_stream("", SQUARE.as_bytes()), appearance_stream("", SQUARE.as_bytes())]);
+        let edited = update_objects(&base, &[(6, appearance_stream("/Filter 9 0 R", SQUARE.as_bytes())), (9, b"/RunLengthDecode".to_vec())], 10);
+        let inspection = run(&base, &edited).unwrap_or_else(|error| panic!("{case}: {error:?}"));
+        assert!(inspection.base_kept);
+        assert_eq!(inspection.annotations.changed, 1, "{case}: {inspection:?}");
+    }
+    // A form in an appearance's resources, changed the same way.
+    let nested = |filter: &str| appearance_stream(&format!("/Resources << /XObject << /Inner 7 0 R >> >> {filter}"), b"/Inner Do");
+    let base = with_square("<< /N 6 0 R >>", &[nested(""), appearance_stream("", SQUARE.as_bytes())]);
+    let edited = update_objects(&base, &[(7, appearance_stream("/Filter 9 0 R", SQUARE.as_bytes())), (9, b"/RunLengthDecode".to_vec())], 10);
+    let inspection = run(&base, &edited).unwrap();
+    assert_eq!(inspection.annotations.changed, 1, "a form in an appearance's resources: {inspection:?}");
+}
+
+#[test]
+fn indirect_decode_parameters_on_an_appearance_are_a_change() {
+    // The same Flate data, now with `/DecodeParms 9 0 R` (a PNG predictor): another drawing.
+    let flated = |extra: &str| {
+        stream(
+            &format!("/Type /XObject /Subtype /Form /BBox [0 0 60 60] /Filter /FlateDecode {extra}"),
+            &pdfcraft_cos::Stream::flate(pdfcraft_cos::Dict::new(), SQUARE.as_bytes()).raw,
+        )
+    };
+    let base = with_square("<< /N 6 0 R >>", &[flated(""), b"null".to_vec()]);
+    let edited = update_objects(&base, &[(6, flated("/DecodeParms 9 0 R")), (9, b"<< /Predictor 12 /Columns 4 >>".to_vec())], 10);
+    let inspection = run(&base, &edited).unwrap();
+    assert_eq!(inspection.annotations.changed, 1, "{inspection:?}");
+}
+
+#[test]
+fn a_form_encoded_with_an_indirect_filter_is_decoded_as_written_directly() {
+    // `pdfcraft_cos` applies an indirect filter as hayro does: a form re-encoded with one draws
+    // what it drew (it was taken undecoded, and the readers disagreed).
+    let content = text(10, 10, "Alpha");
+    let base = page_file("", "", &format!("/Fm Do\n{WORD}"), "/XObject << /Fm 5 0 R >>", &[form("0 0 200 300", &content)]);
+    let encoded = stream("/Type /XObject /Subtype /Form /BBox [0 0 200 300] /Filter 9 0 R", &run_length(content.as_bytes()));
+    let inspection = run(&base, &update_objects(&base, &[(5, encoded), (9, b"/RunLengthDecode".to_vec())], 10)).unwrap();
+    assert!(inspection.base_kept);
+    assert_eq!(inspection.content, ContentChanges::default(), "{inspection:?}");
+}
+
+/// An appended update giving a stream hayro does not decode another filter: noticed as a change
+/// (`count` of it), or refused where `pdfcraft_cos` reads the stream (scanning what it draws) and
+/// cannot decode it so.
+fn noticed(result: Result<Inspection, InspectError>, count: impl Fn(&Inspection) -> u32, case: &str) {
+    match result {
+        Ok(inspection) => assert_eq!(count(&inspection), 1, "{case}: {inspection:?}"),
+        Err(InspectError::Edited(message)) => assert!(message.contains("cannot be decoded"), "{case}: {message}"),
+        other => panic!("{case}: {other:?}"),
+    }
+}
+
+#[test]
+fn streams_hayro_does_not_decode_are_compared_as_encoded() {
+    let filter = (9, b"/RunLengthDecode".to_vec());
+    // A form-field widget's appearance.
+    let widget = |appearance: Vec<u8>| {
+        page_file(
+            "/AcroForm << /Fields [5 0 R] >>",
+            "/Annots [5 0 R]",
+            &text(20, 150, "Alpha"),
+            "",
+            &[
+                b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (name) /V (Ann) /Rect [20 200 120 220] /P 3 0 R /AP << /N 6 0 R >> >>".to_vec(),
+                appearance,
+            ],
+        )
+    };
+    let shows = b"BT /F1 12 Tf 2 5 Td (Ann) Tj ET";
+    let base = widget(stream(
+        "/Type /XObject /Subtype /Form /BBox [0 0 100 20] /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >>",
+        shows,
+    ));
+    let edited = update_objects(
+        &base,
+        &[
+            (
+                6,
+                stream(
+                    "/Type /XObject /Subtype /Form /BBox [0 0 100 20] /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> /Filter 9 0 R",
+                    shows,
+                ),
+            ),
+            filter.clone(),
+        ],
+        10,
+    );
+    assert_eq!(run(&base, &edited).unwrap().form_fields_changed, 1, "a widget's appearance");
+    // A Type 3 glyph procedure for a glyph no page draws ("b").
+    let font = |b_object: u32| {
+        format!(
+            "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 500 700] /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs << /a 6 0 R /b {b_object} 0 R >> \
+             /Encoding << /Type /Encoding /Differences [97 /a /b] >> /FirstChar 97 /LastChar 98 /Widths [500 500] /Resources << >> >>"
+        )
+        .into_bytes()
+    };
+    let base = page_file(
+        "",
+        "",
+        &format!("BT /T3 20 Tf 30 150 Td (aa) Tj ET\n{WORD}"),
+        "/Font << /T3 5 0 R >>",
+        &[font(7), stream("", GLYPH.as_bytes()), stream("", GLYPH.as_bytes())],
+    );
+    let edited = update_objects(&base, &[(7, stream("/Filter 9 0 R", GLYPH.as_bytes())), filter.clone()], 10);
+    noticed(run(&base, &edited), |i| i.content.pages_with_content_changed, "a glyph procedure no page draws");
+    // The same procedure validly encoded so: compared as encoded, it changed.
+    let edited = update_objects(&base, &[(7, stream("/Filter 9 0 R", &run_length(GLYPH.as_bytes()))), filter.clone()], 10);
+    assert_eq!(run(&base, &edited).unwrap().content.pages_with_content_changed, 1, "a glyph procedure no page draws, encoded");
+    // A soft mask's group nothing is painted through.
+    let masked = page_file(
+        "",
+        "",
+        &format!("/GS1 gs\n{WORD}"),
+        "/ExtGState << /GS1 << /SMask << /S /Luminosity /G 5 0 R >> >> >>",
+        &[stream("/Type /XObject /Subtype /Form /BBox [0 0 200 300] /Group << /S /Transparency /CS /DeviceGray >>", b"1 g 0 0 200 300 re f")],
+    );
+    let edited = update_objects(
+        &masked,
+        &[
+            (
+                5,
+                stream(
+                    "/Type /XObject /Subtype /Form /BBox [0 0 200 300] /Group << /S /Transparency /CS /DeviceGray >> /Filter 9 0 R",
+                    b"1 g 0 0 200 300 re f",
+                ),
+            ),
+            filter.clone(),
+        ],
+        10,
+    );
+    noticed(run(&masked, &edited), |i| i.content.pages_with_content_changed, "an unpainted soft mask's group");
+    let edited = update_objects(
+        &masked,
+        &[
+            (
+                5,
+                stream(
+                    "/Type /XObject /Subtype /Form /BBox [0 0 200 300] /Group << /S /Transparency /CS /DeviceGray >> /Filter 9 0 R",
+                    &run_length(b"1 g 0 0 200 300 re f"),
+                ),
+            ),
+            filter.clone(),
+        ],
+        10,
+    );
+    // hayro interprets a mask's group when the state sets it, painted through or not: decoded
+    // by both readers alike, the group is compared by its decoded data, and it did not change.
+    assert_eq!(run(&masked, &edited).unwrap().content.pages_with_content_changed, 0, "an unpainted soft mask's group, encoded");
+    // A form in a layer that is off: drawn now, and decoded by both readers; the same bytes
+    // under another filter are other content, or cannot be read.
+    let layer = page_file(
+        "/OCProperties << /OCGs [6 0 R] /D << /OFF [6 0 R] >> >>",
+        "",
+        &format!("/OC /L BDC /Fm Do EMC\n{WORD}"),
+        "/XObject << /Fm 5 0 R >> /Properties << /L 6 0 R >>",
+        &[form("0 0 200 300", &text(10, 10, "Alpha")), b"<< /Type /OCG /Name (Layer) >>".to_vec()],
+    );
+    let edited = update_objects(
+        &layer,
+        &[(5, stream("/Type /XObject /Subtype /Form /BBox [0 0 200 300] /Filter 9 0 R", text(10, 10, "Alpha").as_bytes())), filter],
+        10,
+    );
+    noticed(run(&layer, &edited), |i| i.content.pages_with_content_changed, "a form in a layer that is off");
+}
+
+// ── follow-up: every layer is content ───────────────────────────────────────────────────────
+
+/// A page drawing "Alpha" and `content`, with group 6 (`/L`) and membership dictionary 7 (`/M`)
+/// in a configuration listing `listed` groups and saying `config`.
+fn layer_page(listed: &str, config: &str, content: &str) -> Vec<u8> {
+    page_file(
+        &format!("/OCProperties << /OCGs [{listed}] /D << {config} >> >>"),
+        "",
+        &format!("{}\n{content}", text(20, 150, "Alpha")),
+        "/Properties << /L 6 0 R /M 7 0 R >>",
+        &[b"null".to_vec(), b"<< /Type /OCG /Name (Layer) >>".to_vec(), b"<< /Type /OCMD /OCGs [6 0 R] /P /AllOn /VE [/Not 6 0 R] >>".to_vec()],
+    )
+}
+
+#[test]
+fn text_added_where_hayro_alone_hid_it_is_seen() {
+    // Each was accepted as a redaction of one word while it added "Secret": hayro hid it, other
+    // readers show it (or show it with the layer on).
+    let cases = [
+        ("a group named by /Span, the group off", "6 0 R", "/OFF [6 0 R]", "/Span /L BDC"),
+        ("a group off but not listed in /OCGs", "", "/OFF [6 0 R]", "/OC /L BDC"),
+        ("a membership dictionary with a visibility expression", "6 0 R", "/OFF [6 0 R]", "/OC /M BDC"),
+        ("a group with an automatic state", "6 0 R", "/OFF [6 0 R] /AS [<< /Event /View /OCGs [6 0 R] /Category [/View] >>]", "/OC /L BDC"),
+    ];
+    for (case, listed, config, begin) in cases {
+        let base = layer_page(listed, config, WORD);
+        assert_eq!(run(&base, &base).unwrap().content, ContentChanges::default(), "{case}");
+        let edited = layer_page(listed, config, &format!("{WORD_BOX}\n{begin} {} EMC", text(20, 200, "Secret")));
+        let inspection = run(&base, &edited).unwrap_or_else(|error| panic!("{case}: {error:?}"));
+        assert_eq!(inspection.text.pages_with_text_added, 1, "{case}: {inspection:?}");
+        assert_eq!(inspection.content.pages_changed_outside_redactions, 1, "{case}: {inspection:?}");
+    }
+}
+
+#[test]
+fn text_added_in_a_layer_that_is_off_is_a_change_outside_redactions() {
+    let base = layer_page("6 0 R", "/OFF [6 0 R]", WORD);
+    let edited = layer_page("6 0 R", "/OFF [6 0 R]", &format!("{WORD_BOX}\n/OC /L BDC {} EMC", text(20, 200, "Secret")));
+    let inspection = run(&base, &edited).unwrap();
+    assert_eq!(inspection.text.pages_with_text_added, 1, "{inspection:?}");
+    assert_eq!(inspection.content.pages_changed_outside_redactions, 1, "{inspection:?}");
+    // Text in the layer redacted under a box is a redaction like any other.
+    let base = layer_page("6 0 R", "/OFF [6 0 R]", &format!("/OC /L BDC {WORD} EMC"));
+    let edited = layer_page("6 0 R", "/OFF [6 0 R]", WORD_BOX);
+    let inspection = run(&base, &edited).unwrap();
+    assert_eq!(inspection.text, TextChanges { pages_with_text_removed: 1, pages_with_text_added: 0 }, "{inspection:?}");
+    assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{inspection:?}");
+    assert_eq!(inspection.redaction_areas.len(), 1);
+}
+
+#[test]
+fn an_image_in_a_group_off_but_not_listed_in_ocgs_is_compared() {
+    let pixels = texture(16, 16);
+    let mut changed = pixels.clone();
+    changed[0] ^= 0x40;
+    let file = |pixels: &[u8], word: &str| {
+        page_file(
+            "/OCProperties << /OCGs [] /D << /OFF [6 0 R] >> >>",
+            "",
+            &format!("/OC /L BDC {DRAW_IMAGE} EMC\n{word}"),
+            "/XObject << /Im1 5 0 R >> /Properties << /L 6 0 R >>",
+            &[grey(16, 16, pixels, ""), b"<< /Type /OCG /Name (Layer) >>".to_vec()],
+        )
+    };
+    let base = file(&pixels, WORD);
+    let inspection = run(&base, &file(&changed, WORD_BOX)).unwrap();
+    assert_eq!(inspection.content.pages_changed_outside_redactions, 1, "{inspection:?}");
+}
+
+#[test]
+fn a_rewrite_that_changes_which_layers_show_is_a_change_outside_redactions() {
+    let base = layer_page("6 0 R", "", &format!("/OC /L BDC {} EMC\n{WORD}", text(20, 200, "Shown")));
+    let edited = layer_page("6 0 R", "/OFF [6 0 R]", &format!("/OC /L BDC {} EMC\n{WORD_BOX}", text(20, 200, "Shown")));
+    let inspection = run(&base, &edited).unwrap();
+    assert_eq!(inspection.content.pages_changed_outside_redactions, 1, "{inspection:?}");
+}
+
+// ── follow-up: Type 3 fonts with everything their procedures draw ───────────────────────────
+
+/// A page showing "aa" in Type 3 font `/T3` (object 5, its glyph "a" drawn by object 6, its own
+/// resources `resources`), then `word`; `objects` from 7, and page resources `page_resources`.
+fn type3_page(resources: &str, procedure: &str, page_resources: &str, word: &str, objects: &[Vec<u8>]) -> Vec<u8> {
+    let font = format!(
+        "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 500 700] /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs << /a 6 0 R >> \
+         /Encoding << /Type /Encoding /Differences [97 /a] >> /FirstChar 97 /LastChar 97 /Widths [500] {resources} >>"
+    );
+    let mut all = vec![font.into_bytes(), stream("", procedure.as_bytes())];
+    all.extend(objects.iter().cloned());
+    page_file("", "", &format!("BT /T3 20 Tf 30 150 Td (aa) Tj ET\n{word}"), &format!("/Font << /T3 5 0 R >> {page_resources}"), &all)
+}
+
+#[test]
+fn a_type3_font_inside_a_glyph_procedure_is_keyed() {
+    // Glyph "a" shows glyph "a" of an inner Type 3 font (object 7, procedure 8).
+    let inner = |procedure: &str| [type3_font(8), stream("", procedure.as_bytes())];
+    let outer = "500 0 d0 BT /U 1000 Tf 0 0 Td (a) Tj ET";
+    let base = type3_page("/Resources << /Font << /U 7 0 R >> >>", outer, "", WORD, &inner(GLYPH));
+    assert_eq!(run(&base, &base).unwrap().content, ContentChanges::default());
+    // The inner procedure draws more, off the page.
+    let edited = type3_page("/Resources << /Font << /U 7 0 R >> >>", outer, "", WORD_BOX, &inner(&format!("{GLYPH} -9000 -9000 100 100 re f")));
+    let inspection = run(&base, &edited).unwrap();
+    assert_eq!(inspection.content.pages_changed_outside_redactions, 1, "{inspection:?}");
+}
+
+#[test]
+fn a_form_inside_a_glyph_procedure_is_keyed() {
+    let procedure = "500 0 d0 /Fx Do";
+    let with = |form_content: &str, word: &str| {
+        type3_page("/Resources << /XObject << /Fx 7 0 R >> >>", procedure, "", word, &[form("0 0 500 700", form_content)])
+    };
+    let base = with("0 0 500 700 re f", WORD);
+    assert_eq!(run(&base, &base).unwrap().content, ContentChanges::default());
+    // The form draws more outside its box (clipped away).
+    let inspection = run(&base, &with("0 0 500 700 re f 900 900 10 10 re f", WORD_BOX)).unwrap();
+    assert_eq!(inspection.content.pages_changed_outside_redactions, 1, "{inspection:?}");
+    // A font without resources draws with the page's: a form named there is keyed too.
+    let from_page =
+        |form_content: &str, word: &str| type3_page("", procedure, "/XObject << /Fx 7 0 R >>", word, &[form("0 0 500 700", form_content)]);
+    let base = from_page("0 0 500 700 re f", WORD);
+    assert_eq!(run(&base, &base).unwrap().content, ContentChanges::default());
+    let inspection = run(&base, &from_page("0 0 500 700 re f 900 900 10 10 re f", WORD_BOX)).unwrap();
+    assert_eq!(inspection.content.pages_changed_outside_redactions, 1, "the page's form: {inspection:?}");
+}
+
+#[test]
+fn an_image_a_glyph_procedure_draws_is_keyed() {
+    let pixels = texture(4, 4);
+    let mut changed = pixels.clone();
+    changed[0] ^= 0x40;
+    // Drawn by glyph "a", which the page shows: compared where it is drawn, too.
+    let procedure = "500 0 d0 q 500 0 0 700 0 0 cm /Gi Do Q";
+    let with = |pixels: &[u8], word: &str| type3_page("/Resources << /XObject << /Gi 7 0 R >> >>", procedure, "", word, &[grey(4, 4, pixels, "")]);
+    let base = with(&pixels, WORD);
+    let inspection = run(&base, &with(&changed, WORD_BOX)).unwrap();
+    assert_eq!(inspection.content.pages_changed_outside_redactions, 1, "{inspection:?}");
+    // Drawn by glyph "b", which no page shows yet: the font changed all the same.
+    let font = String::from(
+        "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 500 700] /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs << /a 6 0 R /b 7 0 R >> \
+         /Encoding << /Type /Encoding /Differences [97 /a /b] >> /FirstChar 97 /LastChar 98 /Widths [500 500] /Resources << /XObject << /Gi 8 0 R >> >> >>",
+    );
+    let undrawn = |pixels: &[u8], word: &str| {
+        page_file(
+            "",
+            "",
+            &format!("BT /T3 20 Tf 30 150 Td (aa) Tj ET\n{word}"),
+            "/Font << /T3 5 0 R >>",
+            &[font.clone().into_bytes(), stream("", GLYPH.as_bytes()), stream("", procedure.as_bytes()), grey(4, 4, pixels, "")],
+        )
+    };
+    let base = undrawn(&pixels, WORD);
+    assert_eq!(run(&base, &base).unwrap().content, ContentChanges::default());
+    let inspection = run(&base, &undrawn(&changed, WORD_BOX)).unwrap();
+    assert_eq!(inspection.content.pages_changed_outside_redactions, 1, "a glyph no page shows: {inspection:?}");
+}
+
+// ── follow-up: a form drawn once is judged by its page ──────────────────────────────────────
+
+#[test]
+fn a_redaction_inside_a_form_drawn_once_is_judged_by_the_page() {
+    // Page content wrapped in one page-wide form, as imposition and merging tools write it: the
+    // redactor rewrites the form.
+    let wrapped = |content: &str| page_file("", "", "q /Pg Do Q", "/XObject << /Pg 5 0 R >>", &[form("0 0 200 300", content)]);
+    let base = wrapped(&format!("{}\n{WORD}", text(20, 150, "Alpha")));
+    let redacted = wrapped(&format!("{}\n{WORD_BOX}", text(20, 150, "Alpha")));
+    let inspection = run(&base, &redacted).unwrap();
+    assert_eq!(inspection.text, TextChanges { pages_with_text_removed: 1, pages_with_text_added: 0 }, "{inspection:?}");
+    assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{inspection:?}");
+    assert_eq!(inspection.redaction_areas.len(), 1);
+    // A change the page shows outside the box still counts (grey: a black box is a box).
+    let changed = wrapped(&format!("{}\n{WORD_BOX}\n0.5 g 20 250 30 30 re f", text(20, 150, "Alpha")));
+    assert_eq!(run(&base, &changed).unwrap().content.pages_changed_outside_redactions, 1);
+    // The same form drawn twice keeps its key: the redaction changes both places.
+    let twice = |content: &str| page_file("", "", "q /Pg Do Q q /Pg Do Q", "/XObject << /Pg 5 0 R >>", &[form("0 0 200 300", content)]);
+    let base = twice(&format!("{}\n{WORD}", text(20, 150, "Alpha")));
+    let inspection = run(&base, &twice(&format!("{}\n{WORD_BOX}", text(20, 150, "Alpha")))).unwrap();
+    assert_eq!(inspection.content.pages_changed_outside_redactions, 1, "{inspection:?}");
+}
+
+// ── follow-up: the outline is a fact ────────────────────────────────────────────────────────
+
+/// A three-page file with an outline (object 3): an entry per page (objects 10–12; the second
+/// goes there by a GoTo action, the third has a child, object 13, going to page 3), each titled
+/// from `titles`; page `i` is object `4 + i`, its content `7 + i`.
+fn outlined(titles: [&str; 4]) -> Vec<u8> {
+    let page = |i: usize| {
+        format!("<< /Type /Page /Parent 2 0 R /Contents {} 0 R /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> >>", 7 + i).into_bytes()
+    };
+    let mut bodies = vec![
+        b"<< /Type /Catalog /Pages 2 0 R /Outlines 3 0 R /PageMode /UseOutlines >>".to_vec(),
+        b"<< /Type /Pages /Kids [4 0 R 5 0 R 6 0 R] /Count 3 /MediaBox [0 0 200 300] >>".to_vec(),
+        b"<< /Type /Outlines /First 10 0 R /Last 12 0 R /Count 4 >>".to_vec(),
+        page(0),
+        page(1),
+        page(2),
+    ];
+    for i in 0..3 {
+        bodies.push(stream("", text(20, 150, &format!("Page {}", i + 1)).as_bytes()));
+    }
+    bodies.push(format!("<< /Title ({}) /Parent 3 0 R /Next 11 0 R /Dest [4 0 R /XYZ 0 300 0] >>", titles[0]).into_bytes());
+    bodies.push(format!("<< /Title ({}) /Parent 3 0 R /Prev 10 0 R /Next 12 0 R /A << /S /GoTo /D [5 0 R /Fit] >> >>", titles[1]).into_bytes());
+    bodies
+        .push(format!("<< /Title ({}) /Parent 3 0 R /Prev 11 0 R /First 13 0 R /Last 13 0 R /Count 1 /Dest [6 0 R /Fit] >>", titles[2]).into_bytes());
+    bodies.push(format!("<< /Title ({}) /Parent 12 0 R /Dest [6 0 R /XYZ 0 150 0] >>", titles[3]).into_bytes());
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, body) in bodies.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", bodies.len() + 1).as_bytes());
+    for offset in offsets {
+        out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", bodies.len() + 1).as_bytes());
+    out
+}
+
+const TITLES: [&str; 4] = ["Parties", "Scope", "Term", "Renewal"];
+
+fn session(base: &[u8], edits: Vec<crate::Edit>) -> Vec<u8> {
+    let mut session = crate::Session::new().with_clock(|| 1_700_000_000);
+    let id = session.open("base.pdf", None, std::sync::Arc::new(base.to_vec()), None).unwrap();
+    for edit in edits {
+        session.apply(id, edit).unwrap();
+    }
+    session.save_bytes(id).unwrap().as_ref().clone()
+}
+
+#[test]
+fn page_edits_of_a_file_with_an_outline_are_reported_not_refused() {
+    use crate::Edit;
+    let base = outlined(TITLES);
+    assert_eq!(run(&base, &base).unwrap().outlines, OutlineChanges::default());
+    // A rotation leaves every destination where it was.
+    let rotated = run(&base, &session(&base, vec![Edit::RotatePages { pages: vec![1], degrees: 90 }])).unwrap();
+    assert_eq!((rotated.pages.rotated, rotated.outlines), (1, OutlineChanges::default()));
+    // Page 2 deleted: its entry loses its destination, and the entries after it go to page 2.
+    let deleted = run(&base, &session(&base, vec![Edit::DeletePages { pages: vec![1] }])).unwrap();
+    assert_eq!(deleted.pages.deleted, 1);
+    assert_eq!(deleted.outlines, OutlineChanges { destinations_changed: 3, ..OutlineChanges::default() }, "{deleted:?}");
+    // Page 3 moved first: every destination's page number changes.
+    let moved = run(&base, &session(&base, vec![Edit::MovePages { pages: vec![2], to: 0 }])).unwrap();
+    assert!(moved.pages.moved >= 1, "{moved:?}");
+    assert_eq!(moved.outlines, OutlineChanges { destinations_changed: 4, ..OutlineChanges::default() }, "{moved:?}");
+    assert_eq!(moved.content, ContentChanges::default());
+}
+
+#[test]
+fn outline_titles_entries_and_other_changes() {
+    let base = outlined(TITLES);
+    // A title changed in an appended update.
+    let renamed = update_objects(&base, &[(13, b"<< /Title (Extension) /Parent 12 0 R /Dest [6 0 R /XYZ 0 150 0] >>".to_vec())], 14);
+    assert_eq!(run(&base, &renamed).unwrap().outlines, OutlineChanges { titles_changed: 1, ..OutlineChanges::default() });
+    // An entry added after the last, and one removed (the child).
+    let added = update_objects(
+        &base,
+        &[
+            (12, b"<< /Title (Term) /Parent 3 0 R /Prev 11 0 R /Next 14 0 R /First 13 0 R /Last 13 0 R /Count 1 /Dest [6 0 R /Fit] >>".to_vec()),
+            (14, b"<< /Title (Signatures) /Parent 3 0 R /Prev 12 0 R /Dest [6 0 R /Fit] >>".to_vec()),
+        ],
+        15,
+    );
+    assert_eq!(run(&base, &added).unwrap().outlines, OutlineChanges { added: 1, ..OutlineChanges::default() });
+    let removed = update_objects(&base, &[(12, b"<< /Title (Term) /Parent 3 0 R /Prev 11 0 R /Dest [6 0 R /Fit] >>".to_vec())], 14);
+    assert_eq!(run(&base, &removed).unwrap().outlines, OutlineChanges { removed: 1, ..OutlineChanges::default() });
+    // A destination moved to another page.
+    let retargeted = update_objects(&base, &[(10, b"<< /Title (Parties) /Parent 3 0 R /Next 11 0 R /Dest [6 0 R /XYZ 0 300 0] >>".to_vec())], 14);
+    assert_eq!(run(&base, &retargeted).unwrap().outlines, OutlineChanges { destinations_changed: 1, ..OutlineChanges::default() });
+    // What no fact reports fails: a style changed, an action that is not a destination.
+    let styled = update_objects(&base, &[(10, b"<< /Title (Parties) /Parent 3 0 R /Next 11 0 R /F 2 /Dest [4 0 R /XYZ 0 300 0] >>".to_vec())], 14);
+    assert!(edited_error(run(&base, &styled)).contains("outline entry"));
+    let scripted =
+        update_objects(&base, &[(10, b"<< /Title (Parties) /Parent 3 0 R /Next 11 0 R /A << /S /JavaScript /JS (app.alert(1)) >> >>".to_vec())], 14);
+    assert!(edited_error(run(&base, &scripted)).contains("outline entry"));
+    let added_link = update_objects(
+        &base,
+        &[
+            (12, b"<< /Title (Term) /Parent 3 0 R /Prev 11 0 R /Next 14 0 R /First 13 0 R /Last 13 0 R /Count 1 /Dest [6 0 R /Fit] >>".to_vec()),
+            (14, b"<< /Title (Site) /Parent 3 0 R /Prev 12 0 R /A << /S /URI /URI (https://example.com) >> >>".to_vec()),
+        ],
+        15,
+    );
+    assert!(edited_error(run(&base, &added_link)).contains("added outline entry"));
+}

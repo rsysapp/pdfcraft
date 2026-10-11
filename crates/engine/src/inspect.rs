@@ -1086,6 +1086,8 @@ mod agreement_tests;
 #[cfg(test)]
 mod conformance_tests;
 #[cfg(test)]
+mod corpus_tests;
+#[cfg(test)]
 mod limit_tests;
 #[cfg(test)]
 mod placement_tests;
