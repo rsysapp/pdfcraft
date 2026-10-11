@@ -96,15 +96,24 @@ pub(crate) fn compare(
 }
 
 /// Whether a destination `after` followed its page from `before` (`true`: its page number
-/// changed, or its page was deleted and it goes nowhere now: it has none, or its page is `null`
-/// or a reference that names no page of the file), stayed as it was (`false`), or changed otherwise (an error:
-/// another page, another view, a destination gained, a named or external destination changed).
-/// Outline entries, named destinations and links' destinations all follow this rule.
+/// changed, or its page was deleted and it goes nowhere now: it has none, or its page is `null`,
+/// a reference or a number that names no page of the file), stayed as it was (`false`), or
+/// changed otherwise (an error: another page, another view, a destination gained, a named or
+/// external destination changed, a page named by reference now named by number or the
+/// reverse). A page given by its number (R6b-43) is that page of each file, and follows its page
+/// as a reference does: the number of a page deleted, moved or inserted before it must change
+/// with it. Outline entries, named destinations and links' destinations all follow this rule.
 pub(crate) fn followed(before: &Destination, after: &Destination, pages: &BTreeMap<usize, usize>) -> Result<bool, Fail> {
     match (before, after) {
-        (Destination::Page(page, view), Destination::Page(now, same)) if pages.get(page) == Some(now) && view == same => Ok(page != now),
-        (Destination::Page(page, _), Destination::None) if !pages.contains_key(page) => Ok(true),
-        (Destination::Page(page, view), Destination::Unpaged(same) | Destination::NullPage(same)) if !pages.contains_key(page) && view == same => {
+        (Destination::Page(page, view), Destination::Page(now, same)) | (Destination::Index(page, view), Destination::Index(now, same))
+            if pages.get(page) == Some(now) && view == same =>
+        {
+            Ok(page != now)
+        }
+        (Destination::Page(page, _) | Destination::Index(page, _), Destination::None) if !pages.contains_key(page) => Ok(true),
+        (Destination::Page(page, view) | Destination::Index(page, view), Destination::Unpaged(same) | Destination::NullPage(same))
+            if !pages.contains_key(page) && view == same =>
+        {
             Ok(true)
         }
         (Destination::None, Destination::None) => Ok(false),
@@ -134,7 +143,7 @@ pub(crate) fn named(
                 followed(destination, now, pages).map_err(|_| Fail::Read("a named destination changed other than by following its page".into()))?
             }
             // An editor may drop the name of a page it deleted.
-            None if matches!(destination, Destination::Page(page, _) if !pages.contains_key(page)) => true,
+            None if matches!(destination, Destination::Page(page, _) | Destination::Index(page, _) if !pages.contains_key(page)) => true,
             None => return Err(Fail::Read("a named destination was removed, though its page is still there".into())),
         };
         changed = changed.saturating_add(u32::from(moved));

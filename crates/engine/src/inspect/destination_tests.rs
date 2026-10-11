@@ -699,3 +699,107 @@ fn every_object_read_parses_alike_in_both_readers() {
     let refused = known.agree_shapes(&doc, &mut budget, &read, &shapes);
     assert!(matches!(refused, Err(Fail::Read(message)) if message.contains("hayro parses object 10 0 R otherwise")));
 }
+
+// ── R6b-43: destinations that give their page by number ─────────────────────────────────────
+
+/// Four pages; the name "p3" (in the `/Names /Dests` tree, leaf 40 under root 41, or in the
+/// catalog's `/Dests`, 42), a bookmark (30) and a link on page 2 (43) all go to `target`, which
+/// gives page 3 by its number (`[2 /Fit]`); the catalog has `catalog` entries too.
+fn numbered_targets(tree: bool, target: &str, catalog: &str) -> Vec<u8> {
+    let names = if tree { "/Names << /Dests 41 0 R >>" } else { "/Dests 42 0 R" };
+    pages(
+        4,
+        &format!("/Outlines 3 0 R {names} {catalog}"),
+        false,
+        |i| if i == 1 { "/Annots [43 0 R]".to_string() } else { String::new() },
+        &[
+            (3, "<< /Type /Outlines /First 30 0 R /Last 30 0 R /Count 1 >>".to_string()),
+            (30, format!("<< /Title (Clause 3) /Parent 3 0 R /Dest {target} >>")),
+            (40, format!("<< /Names [(p3) {target}] /Limits [(p3) (p3)] >>")),
+            (41, "<< /Kids [40 0 R] >>".to_string()),
+            (42, format!("<< /p3 {target} >>")),
+            (43, format!("<< /Type /Annot /Subtype /Link /Rect [20 20 120 40] /Border [0 0 0] /Dest {target} >>")),
+        ],
+    )
+}
+
+#[test]
+fn destinations_that_give_their_page_by_number_follow_it() {
+    // The reviewer's I-2: PDFium and pdf.js read `[2 /Fit]` as the third page of the file. After a
+    // Session delete of page 1 the name, the bookmark and the link go to the page showing
+    // "Page 4", after a Session move of page 4 to the front to "Page 2": aedee8c compared the
+    // destination by its digest and found no change.
+    for tree in [true, false] {
+        let form = if tree { "/Names /Dests" } else { "/Dests" };
+        for target in ["[2 /Fit]", "[2.0 /Fit]"] {
+            let base = numbered_targets(tree, target, "");
+            assert_eq!(run(&base, &base).unwrap().destinations, DestinationChanges::default(), "{form}, {target}");
+            for (case, edits) in
+                [("delete page 1", Edit::DeletePages { pages: vec![0] }), ("move page 4 first", Edit::MovePages { pages: vec![3], to: 0 })]
+            {
+                assert!(refused(run(&base, &session(&base, vec![edits]))).contains("destination"), "{form}, {target}, {case}");
+            }
+            // Pages before the target kept where they were: the number still names its page.
+            for (case, edits) in [
+                ("rotate the target", Edit::RotatePages { pages: vec![2], degrees: 90 }),
+                ("delete the last page", Edit::DeletePages { pages: vec![3] }),
+            ] {
+                let inspection = run(&base, &session(&base, vec![edits])).unwrap_or_else(|error| panic!("{form}, {target}, {case}: {error:?}"));
+                assert_eq!(inspection.destinations, DestinationChanges::default(), "{form}, {target}, {case}: {inspection:?}");
+                assert_eq!(inspection.outlines.destinations_changed, 0, "{form}, {target}, {case}: {inspection:?}");
+            }
+        }
+    }
+    // Written again to follow its page (page 1 deleted, the number one less): followed, and
+    // reported as for a destination by reference.
+    let base = numbered_targets(true, "[2 /Fit]", "");
+    let kids = "<< /Type /Pages /Kids [11 0 R 12 0 R 13 0 R] /Count 3 /MediaBox [0 0 200 300] >>";
+    let follow = |target: &str| {
+        update_objects(
+            &base,
+            &[
+                (2, kids),
+                (30, &format!("<< /Title (Clause 3) /Parent 3 0 R /Dest {target} >>")),
+                (40, &format!("<< /Names [(p3) {target}] /Limits [(p3) (p3)] >>")),
+                (43, &format!("<< /Type /Annot /Subtype /Link /Rect [20 20 120 40] /Border [0 0 0] /Dest {target} >>")),
+            ],
+            44,
+        )
+    };
+    let inspection = run(&base, &follow("[1 /Fit]")).unwrap();
+    assert_eq!(inspection.pages.deleted, 1, "{inspection:?}");
+    assert_eq!(inspection.destinations, DestinationChanges { named: 1, links: 1 }, "{inspection:?}");
+    assert_eq!(inspection.outlines.destinations_changed, 1, "{inspection:?}");
+    // Left on its number, or named by reference instead: not following its page by number.
+    assert!(refused(run(&base, &follow("[2 /Fit]"))).contains("destination"));
+    assert!(refused(run(&base, &follow("[11 0 R /Fit]"))).contains("destination"));
+    // A number that names no page goes nowhere, as a reference to no page does.
+    let nowhere = numbered_targets(true, "[7 /Fit]", "");
+    assert_eq!(run(&nowhere, &nowhere).unwrap().destinations, DestinationChanges::default());
+    // A number that is not whole: PDFium takes its whole part, pdf.js none.
+    let fraction = numbered_targets(true, "[2.5 /Fit]", "");
+    assert!(matches!(run(&fraction, &fraction), Err(InspectError::Base(_))));
+}
+
+#[test]
+fn a_page_number_no_destination_rule_follows_is_refused_once_pages_move() {
+    // R6b-43: a destination giving its page by number anywhere a digest compares it (the
+    // catalog's opening action, an action chained after another, a name with other entries)
+    // would go to another page, unseen, once pages are deleted, moved or inserted. aedee8c
+    // accepted each of these after a Session delete of page 1.
+    for (case, catalog, extra) in [
+        ("an opening action", "/OpenAction [2 /Fit]", None),
+        ("a chained action", "/OpenAction << /S /URI /URI (https://example.com/terms) /Next << /S /GoTo /D [2 /Fit] >> >>", None),
+        ("a name with other entries", "/Dests 44 0 R", Some((44, "<< /p3 << /D [2 /Fit] /Note (a third page) >> >>".to_string()))),
+    ] {
+        let extra: Vec<(u32, String)> = extra.into_iter().collect();
+        let base = pages(4, catalog, false, |_| String::new(), &extra);
+        assert!(run(&base, &base).is_ok(), "{case}");
+        let rotated = run(&base, &session(&base, vec![Edit::RotatePages { pages: vec![0], degrees: 90 }]));
+        assert!(rotated.is_ok(), "{case}: {rotated:?}");
+        for edits in [Edit::DeletePages { pages: vec![0] }, Edit::MovePages { pages: vec![3], to: 0 }] {
+            let result = run(&base, &session(&base, vec![edits]));
+            assert!(matches!(&result, Err(InspectError::Edited(message)) if message.contains("by number")), "{case}: {result:?}");
+        }
+    }
+}

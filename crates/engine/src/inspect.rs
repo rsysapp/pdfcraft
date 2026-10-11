@@ -256,7 +256,10 @@ pub struct OutlineChanges {
     /// same view, now at another page number (a page deleted or moved before it renumbers it),
     /// or no destination any more where its page was deleted (an editor drops those). Any other
     /// change of a destination (another page, another view, a new destination, a named or
-    /// external one) fails the inspection.
+    /// external one) fails the inspection. A destination that gives its page by number
+    /// (`[2 /Fit]`, read as a page index by PDFium and pdf.js) names that page of each file, and
+    /// must follow it the same way: its number changes with the pages deleted, moved or
+    /// inserted before it (R6b-43).
     pub destinations_changed: u32,
     /// Edited entries paired with no base entry.
     pub added: u32,
@@ -267,12 +270,19 @@ pub struct OutlineChanges {
 /// Named destinations and links' destinations that followed their page (R6b-32), as outline
 /// destinations do (see [`OutlineChanges::destinations_changed`]): the same page, at the same
 /// view, now at another page number (a page deleted or moved before it), or, where its page was
-/// deleted, going nowhere (no destination, a `null` page, or a page reference that names no page
-/// of the file: R6b-37) or, for a named destination, the name gone. A host may accept these as part of a page delete
-/// or move. Any other change of a destination fails the inspection: another page, another view,
-/// a destination gained, a named destination added, removed (its page still there) or retargeted.
-/// A name tree that viewers could resolve differently (keys out of order or named twice,
-/// `/Limits` that do not bound a node) fails it too.
+/// deleted, going nowhere (no destination, a `null` page, or a page reference or number that
+/// names no page of the file: R6b-37) or, for a named destination, the name gone. A host may
+/// accept these as part of a page delete or move. Any other change of a destination fails the
+/// inspection: another page, another view, a destination gained, a named destination added,
+/// removed (its page still there) or retargeted. A name tree that viewers could resolve
+/// differently (keys out of order or named twice, `/Limits` that do not bound a node) fails it
+/// too.
+///
+/// A destination that gives its page by number (R6b-43) follows it as one by reference does,
+/// in each file (see [`OutlineChanges::destinations_changed`]). Where such a destination is
+/// compared whole instead (the catalog's opening action, an action chained after another, a
+/// form field's action, a named destination with entries besides `/D`, …), any page deleted,
+/// moved or inserted fails the inspection: it would go to another page, and no fact could say.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DestinationChanges {
     /// Named destinations (the catalog's `/Dests`, the `/Names /Dests` tree) whose destination
@@ -623,6 +633,15 @@ fn compare(base: &[u8], edited: &[u8], limits: Limits) -> Result<Inspection, Ins
         match_pages(&before.structure.pages, &after.structure.pages, &mut inspection.pages, &votes, &mut thumbs, &mut budget).map_err(edited_fail)?;
     // Destinations are judged through the pages' pairing: one may follow its page, nothing more.
     let followed: BTreeMap<usize, usize> = pairs.iter().copied().collect();
+    // R6b-43: a destination giving its page by number that no destination rule resolves (one
+    // compared by its digest) would go to another page, unseen, once a page moved.
+    let renumbered =
+        pairs.len() != before.structure.pages.len() || pairs.len() != after.structure.pages.len() || pairs.iter().any(|(old, new)| old != new);
+    if renumbered && (before.structure.numbered_destinations || after.structure.numbered_destinations) {
+        return Err(InspectError::Edited(
+            "a destination gives its page by number where this comparison cannot follow it (an action, a named destination with other entries, …), and pages were deleted, moved or inserted".into(),
+        ));
+    }
     if before.structure.outline_root != after.structure.outline_root {
         return Err(InspectError::Edited("the outline's root dictionary changed, which this comparison does not report".into()));
     }
@@ -815,6 +834,8 @@ fn read_side(bytes: &[u8], against: Option<(&[u8], &Structure, bool)>, placement
         return Err(Fail::Read(format!("stream {stream} does not have the length it declares")));
     }
     side.structure.misdeclared = known.misdeclared_at(&doc);
+    // Every digest is taken by now: whether any held a destination giving its page by number.
+    side.structure.numbered_destinations = known.numbered_destinations();
     // An appended update is compared by what the comparison reads: every object it writes must
     // be one of them (audit of the appended-update path).
     if let Some((base_bytes, _, true)) = against {
@@ -1111,9 +1132,9 @@ impl Votes {
 
     fn vote(&mut self, before: &structure::Destination, after: structure::Destination) {
         use structure::Destination;
-        let Destination::Page(page, _) = before else { return };
+        let (Destination::Page(page, _) | Destination::Index(page, _)) = before else { return };
         let slot = match after {
-            Destination::Page(other, _) => self.pairs.entry((*page, other)).or_default(),
+            Destination::Page(other, _) | Destination::Index(other, _) => self.pairs.entry((*page, other)).or_default(),
             Destination::None | Destination::Unpaged(_) | Destination::NullPage(_) => self.deleted.entry(*page).or_default(),
             _ => return,
         };

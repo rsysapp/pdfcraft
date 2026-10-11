@@ -406,9 +406,14 @@ pub(crate) enum Destination {
     /// An explicit destination to one of this file's pages: the page's index and the view (the
     /// rest of the array: the fit, position and zoom).
     Page(usize, Digest),
+    /// An explicit destination whose page is given by its number (`[2 /Fit]`): PDFium and pdf.js
+    /// read a whole number there as a page index in this file (R6b-43). The index, which names
+    /// one of this file's pages, and the view, as for `Page`. Kept apart from `Page`: a
+    /// destination may follow its page, not change how it names it.
+    Index(usize, Digest),
     /// An explicit destination whose page is a reference that names no page of this file (a page
-    /// deleted and freed, or an object outside the page tree): it goes nowhere. The view, as for
-    /// `Page`.
+    /// deleted and freed, or an object outside the page tree), or a number that names none (below
+    /// 0, or past the last page): it goes nowhere. The view, as for `Page`.
     Unpaged(Digest),
     /// An explicit destination whose page is `null` (R6b-37: an editor writes a deleted page's
     /// named destination so): it goes nowhere. The view, as for `Page`. Kept apart from
@@ -418,8 +423,8 @@ pub(crate) enum Destination {
     /// `/Dests` or the `/Names /Dests` tree, compared name by name (see
     /// [`Structure::named_destinations`]).
     Named(Digest),
-    /// Anything else (an array whose first entry is not one of this file's pages, a page given
-    /// by number, …), by its digest.
+    /// Anything else (an array whose first entry is neither a page, a page number nor `null`, …),
+    /// by its digest.
     Other(Digest),
 }
 
@@ -530,6 +535,12 @@ pub(crate) struct Structure {
     /// data), each with the offset the cross-reference data names for it: in the base, the only
     /// objects an appended update may keep with such a length (see [`Tolerated`]).
     pub misdeclared: BTreeSet<(ObjRef, u64)>,
+    /// An object read for a fact holds an explicit destination that gives its page by number
+    /// (`[2 /Fit]`) where no destination rule follows it: a catalog's `/OpenAction`, an action
+    /// chained after another, a form field's action, a named destination with other entries, …
+    /// Compared by digest, it would go to another page, unseen, once pages are deleted, moved or
+    /// inserted (R6b-43). Filled in after reading (see `inspect::read_side`).
+    pub numbered_destinations: bool,
 }
 
 /// The fingerprint pages are matched by: content, resources, images and text.
@@ -740,6 +751,9 @@ struct Reader<'d, 'b> {
     /// tolerated only in objects of the base revision (see [`Tolerated`]).
     misdeclared: BTreeSet<ObjRef>,
     tolerated: Arc<Tolerated>,
+    /// An object read for a fact holds a destination that gives its page by number (see
+    /// [`Structure::numbered_destinations`]).
+    numbered: bool,
 }
 
 /// Which stream objects may declare a `/Length` other than their data's (R6b-30, R6b-35).
@@ -776,6 +790,15 @@ fn ws(byte: u8) -> bool {
 
 fn delimiter(byte: u8) -> bool {
     matches!(byte, b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%')
+}
+
+/// The views an explicit destination names after its page (ISO 32000-2 §12.3.2.2).
+const VIEW_KINDS: [&[u8]; 8] = [b"XYZ", b"Fit", b"FitH", b"FitV", b"FitR", b"FitB", b"FitBH", b"FitBV"];
+
+/// Whether `items` is an explicit destination that gives its page by number (`[2 /Fit]`).
+fn names_page_by_number(items: &[Object]) -> bool {
+    matches!(items.first(), Some(Object::Int(_) | Object::Real(_)))
+        && items.get(1).and_then(Object::as_name).is_some_and(|kind| VIEW_KINDS.contains(&kind))
 }
 
 /// The number written for a PDF number, so that `20`, `20.0` and a rewrite's `20` agree.
@@ -1093,6 +1116,11 @@ impl<'d, 'b> Reader<'d, 'b> {
                 out.extend_from_slice(name);
             }
             Object::Array(items) => {
+                // R6b-43: a destination naming its page by number, compared here by its digest,
+                // goes to another page once pages are deleted, moved or inserted.
+                if !self.agreeing && names_page_by_number(items) {
+                    self.numbered = true;
+                }
                 out.push(b'[');
                 out.extend_from_slice(&(items.len() as u64).to_le_bytes());
                 for item in items {
@@ -2560,18 +2588,31 @@ impl Reader<'_, '_> {
 
     /// An explicit destination by its page's index and its view; anything else by its digest.
     /// A reference that names no page of this file (a missing object among them) goes nowhere:
-    /// `Unpaged`; a page that is `null` too: `NullPage` (R6b-37).
+    /// `Unpaged`; a page that is `null` too: `NullPage` (R6b-37). A page given by its number is
+    /// that page of this file (`Index`), or nowhere when no page has that number (R6b-43); a
+    /// number that is not whole is refused, since PDFium takes its whole part and pdf.js none.
     fn destination(&mut self, dest: &Object, pages: &HashMap<ObjRef, usize>) -> Result<Destination, Fail> {
         let resolved = self.resolve(dest)?;
         if let Object::Array(items) = &*resolved
-            && let Some(page @ (Object::Ref(_) | Object::Null)) = items.first()
+            && let Some(page @ (Object::Ref(_) | Object::Null | Object::Int(_) | Object::Real(_))) = items.first()
         {
             let view = self.digest(&Object::Array(items.iter().skip(1).cloned().collect()))?;
+            let numbered = |index: Option<usize>| match index {
+                Some(index) if index < pages.len() => Destination::Index(index, view),
+                _ => Destination::Unpaged(view),
+            };
             return Ok(match page {
                 Object::Ref(page) => match pages.get(page) {
                     Some(index) => Destination::Page(*index, view),
                     None => Destination::Unpaged(view),
                 },
+                Object::Int(number) => numbered(usize::try_from(*number).ok()),
+                Object::Real(number) if number.is_finite() && number.fract() == 0.0 => {
+                    numbered((*number >= 0.0 && *number < pages.len() as f64).then_some(*number as usize))
+                }
+                Object::Real(_) => {
+                    return Err(read_error("a destination gives its page as a number that is not whole, which readers read differently"));
+                }
                 _ => Destination::NullPage(view),
             });
         }
@@ -2655,6 +2696,8 @@ pub(crate) struct Known {
     layer_config: Option<LayerConfig>,
     /// Each optional-content mark evaluated (see [`Known::layer`]).
     marks: HashMap<LayerMark, Option<MarkFact>>,
+    /// See `Reader::numbered`.
+    numbered: bool,
 }
 
 /// The document's default optional-content configuration (`/OCProperties /D`), as far as it
@@ -2874,6 +2917,12 @@ impl Known {
     /// the trailer's `/Info`, say, which no fact compares).
     pub fn was_read(&self, num: u32) -> bool {
         self.facts.contains(&num)
+    }
+
+    /// Whether an object read for a fact holds a destination that gives its page by number,
+    /// outside the destinations resolved on their own (see [`Structure::numbered_destinations`]).
+    pub fn numbered_destinations(&self) -> bool {
+        self.numbered
     }
 
     /// The first stream whose `/Length` is not its data's length that hayro did not read as the
@@ -3101,6 +3150,7 @@ impl Known {
             decoded: std::mem::take(&mut self.decoded),
             misdeclared: std::mem::take(&mut self.misdeclared),
             tolerated: self.tolerated.clone(),
+            numbered: self.numbered,
         }
     }
 
@@ -3112,6 +3162,7 @@ impl Known {
         self.images = reader.images;
         self.decoded = reader.decoded;
         self.misdeclared = reader.misdeclared;
+        self.numbered = reader.numbered;
     }
 }
 
@@ -3259,6 +3310,7 @@ pub(crate) fn read(
         decoded: HashMap::new(),
         misdeclared: BTreeSet::new(),
         tolerated: tolerated.clone(),
+        numbered: false,
     };
     let Some(root) = doc.root() else { return Err(read_error("the trailer's /Root is not a reference")) };
     let catalog = reader.get(root)?.as_dict().cloned().ok_or_else(|| read_error("the catalog is not a dictionary"))?;
@@ -3308,6 +3360,7 @@ pub(crate) fn read(
         agreed: BTreeSet::new(),
         layer_config,
         marks: HashMap::new(),
+        numbered: reader.numbered,
     };
     Ok((
         Structure {
@@ -3324,6 +3377,7 @@ pub(crate) fn read(
             structure_tree,
             name_tree_keys,
             misdeclared: BTreeSet::new(),
+            numbered_destinations: false,
         },
         known,
     ))
