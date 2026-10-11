@@ -3,13 +3,13 @@
 # licence, a changed or unvalidated licence file, a notice with a placeholder, about.toml out of
 # step with deny.toml, a toolchain other than the release workflow's.
 #
-# A workflow of its own, not a job in ci.yml: the embed branch needs this check on its pushes, and
-# adding that branch to ci.yml would run the whole upstream CI there.
+# A workflow of its own, not a job in ci.yml: the embed branches (named *-embed) need this check on
+# their pushes, and adding them to ci.yml would run the whole upstream CI there.
 name: Embed licences
 
 on:
   push:
-    branches: [main, clauflow-embed]
+    branches: [main, "*-embed"]
   pull_request:
   workflow_dispatch:
 
