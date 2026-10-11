@@ -248,8 +248,8 @@ impl PdfCraftApp {
     pub fn embedded(bridge: HostBridge) -> Self {
         let mut app = Self::new();
         app.session.set_view_only(true);
-        // The host refuses any change to the document information and records the edit time
-        // itself, so no save of the embed build writes /Info (R6b-45).
+        // Embed build: the host refuses any change to the document information and records the
+        // edit time itself, so no save of the embed build writes /Info (R6b-45).
         app.session.set_keep_document_information(true);
         // Document scripts never run in view mode: they could open addresses or change fields.
         app.session.set_javascript(false);

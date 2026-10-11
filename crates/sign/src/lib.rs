@@ -23,6 +23,7 @@ pub mod x509;
 
 pub use der::Time;
 pub use keys::{DigestAlg, PrivateKey, PublicKey};
+// Embed build: `timestamp_document_with` (R6b-45).
 pub use pdf::{
     Appearance, DigestCache, Modification, SignOptions, SignatureInfo, Status, TrustStore, list as signatures, sign, sign_with_timestamp,
     timestamp_document, timestamp_document_with, validate,
