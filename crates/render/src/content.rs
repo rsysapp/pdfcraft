@@ -15,11 +15,16 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use hayro::hayro_interpret::{InterpreterSettings, InterpreterWarning, TransformExt, work_spent};
+use hayro::hayro_interpret::font::Glyph;
+use hayro::hayro_interpret::{
+    BlendMode, ClipPath, Context, Device, GlyphDrawMode, Image, InterpreterCache, InterpreterSettings, InterpreterWarning, Paint, PathDrawMode,
+    SoftMask, TransformExt, interpret_page, work_spent,
+};
 use hayro::hayro_syntax::object::{Array, Dict};
 use hayro::hayro_syntax::{LoadPdfError, Pdf};
 use hayro::vello_cpu::color::palette::css::WHITE;
 use hayro::{RenderCache, RenderSettings, render_upright};
+use kurbo::{BezPath, Shape};
 
 use crate::raster::{RenderConfig, panic_message};
 
@@ -47,12 +52,87 @@ impl From<String> for ContentError {
     }
 }
 
-/// A page's text: its characters in reading order, whitespace left out, and where each was drawn
-/// (the centre of its box, in the page's user space, PDF points).
+/// The glyphs a page draws, in content order (no reading-order layout, no merging of glyphs drawn
+/// twice): each glyph's text (its Unicode value: one character, several for a ligature, none
+/// when the font maps it to an empty string; whitespace and control characters included, since a
+/// drawn space is a drawn glyph) and its em box in the page's user space (PDF points): the
+/// advance by the em square (descender −200 to ascender 800 of 1,000), as the font places it.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct PageChars {
+pub struct PageGlyphs {
+    /// Every glyph's characters, one after the other.
     pub chars: Vec<char>,
-    pub centres: Vec<[f32; 2]>,
+    /// Per glyph: where its characters end in `chars`, and its box `[x0, y0, x1, y1]`.
+    pub glyphs: Vec<(u32, [f32; 4])>,
+}
+
+impl PageGlyphs {
+    /// Glyph `index`'s characters and box.
+    pub fn glyph(&self, index: usize) -> Option<(&[char], [f32; 4])> {
+        let (end, rect) = *self.glyphs.get(index)?;
+        let start = match index.checked_sub(1) {
+            Some(previous) => self.glyphs.get(previous)?.0,
+            None => 0,
+        };
+        Some((self.chars.get(start as usize..end as usize)?, rect))
+    }
+
+    pub fn len(&self) -> usize {
+        self.glyphs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.glyphs.is_empty()
+    }
+}
+
+/// Records every glyph drawn with its text and its em box in user space.
+struct GlyphDevice {
+    /// View space (where the interpreter draws) to user space.
+    to_user: kurbo::Affine,
+    found: PageGlyphs,
+    /// Glyphs drawn that gave no text (no Unicode value) or no usable box.
+    unread: usize,
+}
+
+impl<'a> Device<'a> for GlyphDevice {
+    fn set_soft_mask(&mut self, _: Option<SoftMask<'a>>) {}
+    fn set_blend_mode(&mut self, _: BlendMode) {}
+    fn draw_path(&mut self, _: &BezPath, _: kurbo::Affine, _: &Paint<'a>, _: &PathDrawMode) {}
+    fn push_clip_path(&mut self, _: &ClipPath) {}
+    fn push_transparency_group(&mut self, _: f32, _: Option<SoftMask<'a>>, _: BlendMode) {}
+    fn draw_glyph(&mut self, glyph: &Glyph<'a>, transform: kurbo::Affine, glyph_transform: kurbo::Affine, _: &Paint<'a>, _: &GlyphDrawMode) {
+        let Some(unicode) = glyph.as_unicode() else {
+            self.unread = self.unread.saturating_add(1);
+            return;
+        };
+        let text = match unicode {
+            hayro::hayro_interpret::hayro_cmap::BfString::Char(c) => c.to_string(),
+            hayro::hayro_interpret::hayro_cmap::BfString::String(s) => s,
+        };
+        // Glyph space uses 1,000 units per em; the em box spans the advance by −200…800, as the
+        // text extraction places glyphs (`text::TextDevice`). Without an advance, the outline's
+        // width (at least half an em) stands in.
+        let advance = match glyph {
+            Glyph::Outline(g) => g
+                .advance_width()
+                .filter(|a| a.is_finite() && *a > 0.0)
+                .map(f64::from)
+                .unwrap_or_else(|| g.outline().bounding_box().width().max(500.0)),
+            Glyph::Type3(g) => g.advance_width().filter(|a| a.is_finite() && *a > 0.0).map(f64::from).unwrap_or(600.0),
+        };
+        let em = kurbo::Rect::new(0.0, -200.0, advance, 800.0);
+        let b = (self.to_user * transform * glyph_transform * em.to_path(0.1)).bounding_box();
+        if !(b.x0.is_finite() && b.y0.is_finite() && b.x1.is_finite() && b.y1.is_finite()) || b.width() > 10_000.0 || b.height() > 10_000.0 {
+            self.unread = self.unread.saturating_add(1);
+            return;
+        }
+        self.found.chars.extend(text.chars());
+        let end = u32::try_from(self.found.chars.len()).unwrap_or(u32::MAX);
+        self.found.glyphs.push((end, [b.x0 as f32, b.y0 as f32, b.x1 as f32, b.y1 as f32]));
+    }
+    fn draw_image(&mut self, _: Image<'a, '_>, _: kurbo::Affine) {}
+    fn pop_clip_path(&mut self) {}
+    fn pop_transparency_group(&mut self) {}
 }
 
 /// A page's content rendered upright: `rgba` is premultiplied RGBA8, `width` × `height` pixels.
@@ -150,15 +230,29 @@ impl ContentDocument {
         (self.warnings(), self.exhausted.load(Ordering::Relaxed))
     }
 
-    /// The page's text in reading order, without whitespace. Fails when a drawn glyph gives no
-    /// text (no Unicode mapping, or no usable box), on an interpreter warning, on a panic, when the
-    /// parser had to rebuild the cross-reference data, and past the work budget.
-    pub fn text(&self, page: usize) -> Result<PageChars, ContentError> {
+    /// The glyphs the page draws (see [`PageGlyphs`]). Fails when a drawn glyph gives no text (no
+    /// Unicode mapping) or no usable box, on an interpreter warning, on a panic, when the parser
+    /// had to rebuild the cross-reference data, and past the work budget.
+    pub fn text(&self, page: usize) -> Result<PageGlyphs, ContentError> {
         let before = self.counts();
         let number = page.saturating_add(1);
-        let extracted = catch_unwind(AssertUnwindSafe(|| crate::text::extract_page_counted(&self.pdf, page, &self.settings)));
-        let (text, unread) = match extracted {
-            Ok(Some(found)) => found,
+        let extracted = catch_unwind(AssertUnwindSafe(|| {
+            let pages = self.pdf.pages();
+            let p = pages.get(page)?;
+            let initial = p.initial_transform(true).to_kurbo();
+            if initial.determinant().abs() <= f64::EPSILON {
+                return Some(Err(()));
+            }
+            let (w, h) = p.render_dimensions();
+            let cache = InterpreterCache::new();
+            let mut ctx = Context::new(initial, kurbo::Rect::new(0.0, 0.0, f64::from(w), f64::from(h)), &cache, p.xref(), self.settings.clone());
+            let mut device = GlyphDevice { to_user: initial.inverse(), found: PageGlyphs::default(), unread: 0 };
+            interpret_page(p, &mut ctx, &mut device);
+            Some(Ok((device.found, device.unread)))
+        }));
+        let (found, unread) = match extracted {
+            Ok(Some(Ok(found))) => found,
+            Ok(Some(Err(()))) => return Err(format!("page {number} has no usable page box").into()),
             Ok(None) => return Err(format!("page {number} does not exist").into()),
             Err(panic) => return Err(format!("text extraction crashed on page {number}: {}", panic_message(&panic)).into()),
         };
@@ -168,24 +262,6 @@ impl ContentDocument {
         }
         if self.repaired() {
             return Err(ContentError::Unreadable("the file's cross-reference data is damaged".into()));
-        }
-        // Glyph boxes are in view space (the displayed page, y down): back to user space.
-        let to_user = self
-            .pdf
-            .pages()
-            .get(page)
-            .map(|p| p.initial_transform(true).to_kurbo())
-            .filter(|t| t.determinant().abs() > f64::EPSILON)
-            .map(|t| t.inverse());
-        let Some(to_user) = to_user else { return Err(format!("page {number} has no usable page box").into()) };
-        let mut found = PageChars::default();
-        for glyph in &text.glyphs {
-            let [x0, y0, x1, y1] = glyph.rect;
-            let centre = to_user * kurbo::Point::new(f64::from(x0 + x1) / 2.0, f64::from(y0 + y1) / 2.0);
-            for c in glyph.text.chars().filter(|c| !c.is_whitespace()) {
-                found.chars.push(c);
-                found.centres.push([centre.x as f32, centre.y as f32]);
-            }
         }
         Ok(found)
     }

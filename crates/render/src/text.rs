@@ -204,8 +204,6 @@ impl PageText {
 struct TextDevice {
     /// Separate flows by writing direction: right, down, left, up.
     glyphs: [Vec<TextGlyph>; 4],
-    /// Embed build: glyphs drawn that gave no text (no Unicode value, or no usable box).
-    unread: usize,
 }
 
 impl<'a> Device<'a> for TextDevice {
@@ -216,7 +214,6 @@ impl<'a> Device<'a> for TextDevice {
     fn push_transparency_group(&mut self, _: f32, _: Option<SoftMask<'a>>, _: BlendMode) {}
     fn draw_glyph(&mut self, glyph: &Glyph<'a>, transform: Affine, glyph_transform: Affine, _: &Paint<'a>, _: &GlyphDrawMode) {
         let Some(u) = glyph.as_unicode() else {
-            self.unread = self.unread.saturating_add(1);
             if std::env::var_os("PDFCRAFT_TEXT_DEBUG").is_some() {
                 eprintln!("NOUNICODE {} {:?}", if matches!(glyph, Glyph::Type3(_)) { "t3" } else { "ol" }, (transform * glyph_transform).as_coeffs());
             }
@@ -261,7 +258,6 @@ impl<'a> Device<'a> for TextDevice {
         let em = Rect::new(0.0, -200.0, advance, 800.0);
         let b = (t * em.to_path(0.1)).bounding_box();
         if !(b.x0.is_finite() && b.y0.is_finite() && b.x1.is_finite() && b.y1.is_finite()) || b.width() > 10_000.0 || b.height() > 10_000.0 {
-            self.unread = self.unread.saturating_add(1);
             return;
         }
         for (i, ch) in text.chars().enumerate() {
@@ -279,11 +275,6 @@ impl<'a> Device<'a> for TextDevice {
 
 /// Extract the text of one page. Panics inside the interpreter are the caller's to catch.
 pub(crate) fn extract_page(pdf: &Pdf, page: usize, settings: &InterpreterSettings) -> Option<PageText> {
-    extract_page_counted(pdf, page, settings).map(|(text, _)| text)
-}
-
-/// Embed build: [`extract_page`], and how many drawn glyphs gave no text (see `TextDevice`).
-pub(crate) fn extract_page_counted(pdf: &Pdf, page: usize, settings: &InterpreterSettings) -> Option<(PageText, usize)> {
     let pages = pdf.pages();
     let p = pages.get(page)?;
     let (w, h) = p.render_dimensions();
@@ -293,9 +284,8 @@ pub(crate) fn extract_page_counted(pdf: &Pdf, page: usize, settings: &Interprete
     let settings = settings.clone();
     let initial = p.initial_transform(true).to_kurbo();
     let mut ctx = Context::new(initial, Rect::new(0.0, 0.0, w as f64, h as f64), &cache, p.xref(), settings);
-    let mut dev = TextDevice { glyphs: Default::default(), unread: 0 };
+    let mut dev = TextDevice { glyphs: Default::default() };
     interpret_page(p, &mut ctx, &mut dev);
-    let unread = dev.unread;
     // A horizontal heading must not force a vertical body back into horizontal line grouping.
     // Group each writing direction independently, then join flows from their topmost position.
     let mut flows = Vec::new();
@@ -321,7 +311,7 @@ pub(crate) fn extract_page_counted(pdf: &Pdf, page: usize, settings: &Interprete
         text.glyphs.extend(flow.glyphs);
         text.space_before.extend(flow.space_before);
     }
-    Some((text, unread))
+    Some(text)
 }
 
 /// View-space box → the frame where text runs left to right, for text running `quarter` × 90°
