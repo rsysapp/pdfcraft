@@ -789,3 +789,122 @@ fn an_unknown_key_in_any_dictionary_is_refused_or_reported() {
         );
     }
 }
+
+/// The objects of a two-page file whose ordered structures can each be reordered: `swap` names
+/// the one reordered (see [`ORDERS`]); `boxed` puts a black box over a word instead of it.
+fn ordered_objects(boxed: bool, swap: &str) -> Vec<(u32, Vec<u8>)> {
+    let pick = |name: &str, plain: &'static str, swapped: &'static str| if swap == name { swapped } else { plain };
+    let content = format!(
+        "{}\nq /GS gs 0 G 20 60 m 180 60 l S Q\n{}",
+        String::from_utf8(text("Alpha")).unwrap(),
+        if boxed { "0 g 146 14 16 18 re f" } else { "BT /F1 12 Tf 150 20 Td (X) Tj ET" }
+    );
+    let widget = |name: &str, y: u32, extra: &str| {
+        format!("<< /T ({name}) /FT /Tx /Type /Annot /Subtype /Widget /Rect [20 {y} 120 {}] /P 3 0 R {extra} >>", y + 15).into_bytes()
+    };
+    let outline = swap == "outline";
+    vec![
+        (
+            1,
+            format!(
+                "<< /Type /Catalog /Pages 2 0 R /Outlines 20 0 R /Names << /Dests 22 0 R >> /AcroForm << /Fields [{}] /CO [{}] >> /OCProperties << /OCGs [40 0 R 41 0 R] /D << /ON [{}] /Order [{}] >> >> >>",
+                pick("fields", "30 0 R 31 0 R 32 0 R", "31 0 R 30 0 R 32 0 R"),
+                pick("calculation", "30 0 R 31 0 R", "31 0 R 30 0 R"),
+                pick("on", "40 0 R 41 0 R", "41 0 R 40 0 R"),
+                pick("order", "40 0 R 41 0 R", "41 0 R 40 0 R"),
+            )
+            .into_bytes(),
+        ),
+        (2, format!("<< /Type /Pages /Kids [{}] /Count 2 /MediaBox [0 0 200 300] >>", pick("pages", "3 0 R 50 0 R", "50 0 R 3 0 R")).into_bytes()),
+        (
+            3,
+            format!(
+                "<< /Type /Page /Parent 2 0 R /Contents [{}] /Annots [{}] /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> /ExtGState << /GS 8 0 R >> >> >>",
+                pick("contents", "4 0 R 13 0 R", "13 0 R 4 0 R"),
+                pick("annots", "10 0 R 30 0 R 31 0 R 33 0 R 34 0 R", "30 0 R 10 0 R 31 0 R 33 0 R 34 0 R"),
+            )
+            .into_bytes(),
+        ),
+        (4, stream("", content.as_bytes())),
+        (13, stream("", b"BT /F1 12 Tf 20 100 Td (Bravo) Tj ET")),
+        (8, format!("<< /Type /ExtGState /LW 2 /D [{} 0] >>", pick("dash", "[6 2]", "[2 6]")).into_bytes()),
+        (10, b"<< /Type /Annot /Subtype /Square /Rect [20 180 80 240] /C [1 0 0] >>".to_vec()),
+        (20, format!("<< /Type /Outlines /First {} 0 R /Last {} 0 R /Count 2 >>", if outline { 23 } else { 21 }, if outline { 21 } else { 23 }).into_bytes()),
+        (21, format!("<< /Title (Terms) /Parent 20 0 R {} /Dest [3 0 R /Fit] >>", if outline { "/Prev 23 0 R" } else { "/Next 23 0 R" }).into_bytes()),
+        (23, format!("<< /Title (Price) /Parent 20 0 R {} /Dest [50 0 R /Fit] >>", if outline { "/Next 21 0 R" } else { "/Prev 21 0 R" }).into_bytes()),
+        (
+            22,
+            format!("<< /Names [{}] >>", pick("names", "(price) [50 0 R /Fit] (terms) [3 0 R /Fit]", "(terms) [3 0 R /Fit] (price) [50 0 R /Fit]")).into_bytes(),
+        ),
+        (30, widget("name", 260, "")),
+        (31, format!("<< /T (choice) /FT /Ch /Opt [{}] /Type /Annot /Subtype /Widget /Rect [130 260 190 275] /P 3 0 R >>", pick("options", "(a) (b)", "(b) (a)")).into_bytes()),
+        (32, format!("<< /T (group) /Kids [{}] >>", pick("kids", "33 0 R 34 0 R", "34 0 R 33 0 R")).into_bytes()),
+        (33, widget("first", 240, "/Parent 32 0 R")),
+        (34, widget("second", 220, "/Parent 32 0 R")),
+        (40, b"<< /Type /OCG /Name (One) >>".to_vec()),
+        (41, b"<< /Type /OCG /Name (Two) >>".to_vec()),
+        (50, b"<< /Type /Page /Parent 2 0 R /Contents 51 0 R /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> >>".to_vec()),
+        (51, stream("", b"BT /F1 12 Tf 20 150 Td (Page two) Tj ET")),
+    ]
+}
+
+/// What [`ordered_objects`] can reorder: (name, what it is).
+const ORDERS: [(&str, &str); 12] = [
+    ("annots", "a page's /Annots"),
+    ("contents", "a page's /Contents array"),
+    ("pages", "the page tree's /Kids"),
+    ("outline", "outline siblings"),
+    ("names", "a name tree's entries"),
+    ("dash", "a graphics state's dash array"),
+    ("on", "/OCProperties /D /ON"),
+    ("order", "/OCProperties /D /Order"),
+    ("fields", "/AcroForm /Fields"),
+    ("calculation", "/AcroForm /CO"),
+    ("kids", "a form field's /Kids"),
+    ("options", "a form field's /Opt"),
+];
+
+fn assemble(objects: &[(u32, Vec<u8>)]) -> Vec<u8> {
+    let mut b = Builder::new();
+    for (num, body) in objects {
+        b.object(*num, body);
+    }
+    let rows = b.offsets.clone();
+    b.finish(52, &rows, "")
+}
+
+#[test]
+fn reordering_anything_whose_order_has_meaning_is_refused_or_reported() {
+    // Order carries meaning in each of these: which annotation is on top and the tab order,
+    // the order text is read in, the pages', the outline's, the layers panel's and the fields'
+    // navigation and calculation order. Each is compared in order, never as a set: reordered,
+    // in a rewrite (with a redaction) and in an appended update, it is refused or reported.
+    let base = assemble(&ordered_objects(false, ""));
+    let clean = inspect(&base, &base, InspectLimits::default()).unwrap();
+    assert_eq!(clean, Inspection { base_kept: true, pages: PageChanges { before: 2, after: 2, ..PageChanges::default() }, ..Inspection::default() });
+    let redacted = inspect(&base, &assemble(&ordered_objects(true, "")), InspectLimits::default()).unwrap();
+    assert_eq!((redacted.content.pages_changed_outside_redactions, redacted.redaction_areas.len()), (0, 1), "{redacted:?}");
+    let caught = |result: &Result<Inspection, InspectError>| match result {
+        Err(InspectError::Edited(_)) => true,
+        Ok(inspection) => {
+            inspection.content.pages_with_content_changed > 0
+                || inspection.content.pages_changed_outside_redactions > 0
+                || inspection.form_fields_changed > 0
+                || inspection.pages.moved > 0
+                || inspection.annotations != AnnotationChanges::default()
+                || inspection.outlines != OutlineChanges::default()
+        }
+        Err(_) => false,
+    };
+    let prev = Some(last_section(&base));
+    let plain = ordered_objects(false, "");
+    for (swap, what) in ORDERS {
+        let rewrite = inspect(&base, &assemble(&ordered_objects(true, swap)), InspectLimits::default());
+        assert!(caught(&rewrite), "{what}, in a rewrite: {rewrite:?}");
+        let changed: Vec<(u32, Vec<u8>)> = ordered_objects(false, swap).into_iter().filter(|object| !plain.contains(object)).collect();
+        assert!(!changed.is_empty(), "{what}");
+        let objects: Vec<Written<'_>> = changed.iter().map(|(num, body)| (*num, body.as_slice())).collect();
+        let appended = inspect(&base, &update_section(&base, &objects, prev, ""), InspectLimits::default());
+        assert!(caught(&appended), "{what}, appended: {appended:?}");
+    }
+}

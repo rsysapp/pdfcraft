@@ -504,6 +504,8 @@ pub(crate) struct Structure {
     pub fields: BTreeMap<String, Digest>,
     /// The `/AcroForm` dictionary without `/Fields`.
     pub form: Option<Digest>,
+    /// Each terminal field's full name, in the order `/Fields` and the fields' `/Kids` give.
+    pub field_order: Vec<String>,
     /// Catalog entries not reported otherwise, by key.
     pub catalog: BTreeMap<Vec<u8>, Digest>,
     /// `/OCProperties`: which layers show.
@@ -2289,13 +2291,14 @@ impl<'d, 'b> Reader<'d, 'b> {
 
     // ── form fields ─────────────────────────────────────────────────────────────────────────
 
-    fn fields(&mut self, form: &Dict, widgets: &mut BTreeSet<ObjRef>) -> Result<BTreeMap<String, Digest>, Fail> {
+    fn fields(&mut self, form: &Dict, widgets: &mut BTreeSet<ObjRef>) -> Result<(BTreeMap<String, Digest>, Vec<String>), Fail> {
         let mut fields = BTreeMap::new();
+        let mut order = Vec::new();
         let mut seen = BTreeSet::new();
         for entry in self.array_of(form.get(b"Fields"), "/Fields")? {
-            self.field(&entry, "", &[], 0, &mut seen, widgets, &mut fields)?;
+            self.field(&entry, "", &[], 0, &mut seen, widgets, (&mut fields, &mut order))?;
         }
-        Ok(fields)
+        Ok((fields, order))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2307,7 +2310,7 @@ impl<'d, 'b> Reader<'d, 'b> {
         depth: usize,
         seen: &mut BTreeSet<ObjRef>,
         widgets: &mut BTreeSet<ObjRef>,
-        fields: &mut BTreeMap<String, Digest>,
+        (fields, order): (&mut BTreeMap<String, Digest>, &mut Vec<String>),
     ) -> Result<(), Fail> {
         self.budget.tick()?;
         if depth > MAX_TREE_DEPTH {
@@ -2352,11 +2355,12 @@ impl<'d, 'b> Reader<'d, 'b> {
                 Some(earlier) => sha256(&[earlier, &digest]),
                 None => digest,
             };
+            order.push(name.clone());
             fields.insert(name, combined);
             return Ok(());
         }
         for child in &children {
-            self.field(child, &name, &path, depth.saturating_add(1), seen, widgets, fields)?;
+            self.field(child, &name, &path, depth.saturating_add(1), seen, widgets, (&mut *fields, &mut *order))?;
         }
         Ok(())
     }
@@ -3261,9 +3265,9 @@ pub(crate) fn read(
     // The page tree first: the page bound is checked before any per-page work.
     let nodes = reader.page_tree(&catalog)?;
     let mut widgets = BTreeSet::new();
-    let (fields, form) = match reader.dict_of(catalog.get(b"AcroForm"), "/AcroForm")? {
+    let ((fields, field_order), form) = match reader.dict_of(catalog.get(b"AcroForm"), "/AcroForm")? {
         Some(form) => (reader.fields(&form, &mut widgets)?, Some(reader.digest_without(&form, &[b"Fields"])?)),
-        None => (BTreeMap::new(), None),
+        None => ((BTreeMap::new(), Vec::new()), None),
     };
     let layers = catalog.get(b"OCProperties").map(|layers| reader.digest(layers)).transpose()?;
     let structure_tree = reader.structure_tree(&catalog)?;
@@ -3310,6 +3314,7 @@ pub(crate) fn read(
             pages,
             fields,
             form,
+            field_order,
             catalog: entries,
             layers,
             outline,

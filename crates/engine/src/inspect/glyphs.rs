@@ -4,8 +4,10 @@
 //! is inside and whether it shows by default, R6b-29) whose em box lies within
 //! [`POSITION_TOLERANCE`] on every side. Glyphs are paired one to one (a maximum matching, so a
 //! glyph drawn twice at one place pairs twice), with no alignment by reading order: what is left
-//! over in the base was removed, what is left over in the edited page was added. A space drawn
-//! as a glyph counts like any other glyph.
+//! over in the base was removed, what is left over in the edited page was added. The glyphs
+//! paired must then be drawn in the same order on both pages ([`Pairing::in_order`]): text kept
+//! at its places but drawn in another order reads otherwise. A space drawn as a glyph counts like
+//! any other glyph.
 
 use std::collections::HashMap;
 
@@ -31,6 +33,11 @@ pub(crate) struct Pairing {
     pub removed: Vec<usize>,
     /// Edited glyphs with no base glyph: added.
     pub added: Vec<usize>,
+    /// The glyphs paired are drawn in the same order on both pages: taken in the edited page's
+    /// order, the base glyphs they pair with come in the base page's order. Drawing order is the
+    /// order readers extract text in (copying, search, reading aloud), so text drawn in another
+    /// order at the same places reads otherwise.
+    pub in_order: bool,
 }
 
 const NONE: u32 = u32::MAX;
@@ -117,7 +124,14 @@ fn pair_by(base: &Glyphs, edited: &Glyphs, layers: bool, budget: &mut Budget) ->
         let stamp = u32::try_from(index).map_err(|_| Fail::TooComplex)?.saturating_add(1);
         augment(index, &candidates, (&mut base_to_edited, &mut edited_to_base), &mut seen, stamp, &mut steps, budget)?;
     }
+    let mut last = None;
+    let mut in_order = true;
+    for &other in edited_to_base.iter().filter(|other| **other != NONE) {
+        in_order &= last.is_none_or(|last| other > last);
+        last = Some(other);
+    }
     Ok(Pairing {
+        in_order,
         removed: base_to_edited.iter().enumerate().filter(|(_, other)| **other == NONE).map(|(index, _)| index).collect(),
         added: edited_to_base.iter().enumerate().filter(|(_, other)| **other == NONE).map(|(index, _)| index).collect(),
     })

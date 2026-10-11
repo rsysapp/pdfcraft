@@ -89,7 +89,8 @@ pub struct Inspection {
     pub base_kept: bool,
     pub pages: PageChanges,
     /// Form fields (by full name) whose value, field dictionary or widgets changed, appeared or
-    /// went, plus one when the form's own dictionary (`/AcroForm` without `/Fields`) changed.
+    /// went, plus one when the form's own dictionary (`/AcroForm` without `/Fields`) or the
+    /// fields' order (`/Fields`, each field's `/Kids`) changed.
     /// A widget's appearance changing with its value unchanged counts here (it can show other
     /// text than the value), as does `/NeedAppearances` (it lets viewers redraw every field):
     /// both are form changes, not annotations.
@@ -221,6 +222,8 @@ pub struct ContentChanges {
     ///   knows in a font, graphics state, form, pattern, shading, property list or resource
     ///   dictionary it draws with), on either side, so that a change hayro's pixels do not show
     ///   may show in another viewer;
+    /// - glyphs kept at their places but drawn in another order (the order readers extract
+    ///   text in);
     /// - a page entry no fact reports (any but its content, resources, boxes, rotation,
     ///   annotations and what no viewer draws) added, removed or changed, but for its actions
     ///   (`/AA`) and thumbnail (`/Thumb`) removed; text for assistive technology and copying in
@@ -630,6 +633,18 @@ fn compare(base: &[u8], edited: &[u8], limits: Limits) -> Result<Inspection, Ins
     // The document's layer configuration decides what every page shows.
     let layers_changed = before.structure.layers != after.structure.layers;
     inspection.form_fields_changed = fields_changed(&before.structure, &after.structure);
+    // The order of each page's annotations (which is on top, the tab order) may not change.
+    for &(old, new) in &pairs {
+        let (Some(b), Some(e)) = (before.structure.pages.get(old), after.structure.pages.get(new)) else {
+            return Err(InspectError::Edited("a page went missing".into()));
+        };
+        if !annotations_in_order(b, e, base_kept) {
+            return Err(InspectError::Edited(format!(
+                "the order of page {}'s annotations changed, which this comparison does not report",
+                new.saturating_add(1)
+            )));
+        }
+    }
     let mut rasters = Rasters::default();
     compare_pages(&before, &after, &pairs, base_kept, layers_changed, &mut budget, &mut rasters, &mut inspection)?;
     inspection.redaction_areas.sort_by(|(page_a, a), (page_b, b)| page_a.cmp(page_b).then(b[3].total_cmp(&a[3])).then(a[0].total_cmp(&b[0])));
@@ -1499,7 +1514,7 @@ fn compare_pages(
         let pairing = if drawn_differently {
             glyphs::pair(&b.glyphs, &e.glyphs, budget).map_err(|fail| fail.of(Role::Edited))?
         } else {
-            glyphs::Pairing { removed: Vec::new(), added: Vec::new() }
+            glyphs::Pairing { removed: Vec::new(), added: Vec::new(), in_order: true }
         };
         let lost_text = !pairing.removed.is_empty();
         let gained_text = !pairing.added.is_empty();
@@ -1530,6 +1545,8 @@ fn compare_pages(
             if drawn_differently {
                 outside |= layers_changed_for(b, e, &pairing, budget).map_err(|fail| fail.of(Role::Edited))?;
                 outside |= structure::page_keys_changed(b, e);
+                // Text kept but drawn in another order reads otherwise.
+                outside |= !pairing.in_order;
             }
             let mut areas = Areas::new(&boxes);
             // Every removed glyph by its centre, and every image at its own resolution.
@@ -1673,10 +1690,48 @@ fn user_rect(raster: &UprightRaster, rect: visual::PixelRect) -> [f32; 4] {
     [x(x0), y(bottom), x(x1), y(top)]
 }
 
+/// Whether the annotations both pages have come in the same order in their `/Annots`: each by
+/// its object in an appended update (which keeps object numbers), else by its digest; those
+/// added or removed are left out.
+fn annotations_in_order(base: &PageFacts, edited: &PageFacts, base_kept: bool) -> bool {
+    let key = |annot: &Annot| match annot.id {
+        Some(id) if base_kept => (Some(id), [0u8; 32]),
+        _ => (None, annot.digest),
+    };
+    let tally = |page: &PageFacts| {
+        let mut counts: BTreeMap<(Option<ObjRef>, Digest), usize> = BTreeMap::new();
+        for annot in &page.annots {
+            let slot = counts.entry(key(annot)).or_default();
+            *slot = slot.saturating_add(1);
+        }
+        counts
+    };
+    let (in_base, in_edited) = (tally(base), tally(edited));
+    // Each side's annotations that the other has too (as many times as both have them).
+    let common = |page: &PageFacts, other: &BTreeMap<(Option<ObjRef>, Digest), usize>| {
+        let mut left = other.clone();
+        page.annots
+            .iter()
+            .filter_map(|annot| {
+                let slot = left.get_mut(&key(annot))?;
+                if *slot == 0 {
+                    return None;
+                }
+                *slot -= 1;
+                Some(key(annot))
+            })
+            .collect::<Vec<_>>()
+    };
+    common(base, &in_edited) == common(edited, &in_base)
+}
+
 fn fields_changed(before: &Structure, after: &Structure) -> u32 {
     let names: BTreeSet<&String> = before.fields.keys().chain(after.fields.keys()).collect();
     let fields = names.into_iter().filter(|name| before.fields.get(*name) != after.fields.get(*name)).count();
-    count(fields).saturating_add(u32::from(before.form != after.form))
+    // The fields' order (`/Fields`, and each field's `/Kids`): their navigation and calculation
+    // order in some viewers; a change counts as the form's own.
+    let form_changed = before.form != after.form || before.field_order != after.field_order;
+    count(fields).saturating_add(u32::from(form_changed))
 }
 
 fn add_kind(changes: &mut AnnotationChanges, subtype: &[u8]) {
