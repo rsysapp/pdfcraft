@@ -462,7 +462,8 @@ fn a_page_drawn_without_text_reports_nothing() {
 fn a_rewrite_that_removes_text_without_a_box_changes_pages_outside_redactions() {
     let base = pages_pdf(&[page(&text_line(20.0, 150.0, "Alpha Bravo Charlie")), page(&text_line(20.0, 150.0, "Delta"))], &[]);
     // "Bravo" left out of page 1 (Charlie stays where it was), page 2 emptied; no box anywhere.
-    let edited = pages_pdf(&[page(&format!("{}{}", text_line(20.0, 150.0, "Alpha"), text_line(88.0, 150.0, "Charlie"))), page("")], &[]);
+    let charlie = 20.0 + width_of("Alpha Bravo ");
+    let edited = pages_pdf(&[page(&format!("{}{}", text_line(20.0, 150.0, "Alpha"), text_line(charlie, 150.0, "Charlie"))), page("")], &[]);
     let inspection = run(&base, &edited).unwrap();
     assert!(!inspection.base_kept);
     assert_eq!(inspection.text, TextChanges { pages_with_text_removed: 2, pages_with_text_added: 0 });
@@ -719,15 +720,15 @@ fn a_page_rotated_and_redacted_in_one_save_is_compared_upright() {
 }
 
 /// "Buyer may not terminate", or the same line with "not" left out and `cover` drawn over the gap
-/// ("terminate" where it was).
+/// (the spaces and "terminate" where they were).
 fn may_not_terminate(cover: Option<&str>) -> Vec<u8> {
     let not_at = 20.0 + width_of("Buyer may ");
-    let terminate_at = 20.0 + width_of("Buyer may not ");
+    let after_not = 20.0 + width_of("Buyer may not");
     let content = match cover {
         None => text_line(20.0, 150.0, "Buyer may not terminate"),
         Some(paint) => {
             let box_ = format!("{paint} {} 146 {} 16 re f 0 g\n", not_at - 0.5, width_of("not") + 1.0);
-            format!("{}{}{box_}", text_line(20.0, 150.0, "Buyer may"), text_line(terminate_at, 150.0, "terminate"))
+            format!("{}{}{box_}", text_line(20.0, 150.0, "Buyer may "), text_line(after_not, 150.0, " terminate"))
         }
     };
     pages_pdf(&[page(&content)], &[])
@@ -738,7 +739,7 @@ fn a_deletion_under_a_coloured_box_is_not_a_redaction() {
     let base = may_not_terminate(None);
     for (case, paint) in [("red", "1 0 0 rg"), ("grey", "0.2 g"), ("translucent black", "/Half gs 0 g")] {
         let inspection = run(&base, &may_not_terminate(Some(paint))).unwrap();
-        // The text left is a subsequence of the base: only the box can tell.
+        // The glyphs left are the base's, where they were: only the box can tell.
         assert_eq!(inspection.text, TextChanges { pages_with_text_removed: 1, pages_with_text_added: 0 }, "{case}");
         assert_eq!(inspection.content.pages_changed_outside_redactions, 1, "{case}");
         assert!(inspection.redaction_areas.is_empty(), "{case}");
@@ -1028,4 +1029,256 @@ fn refuses_a_document_level_change_it_does_not_report() {
     let catalog = b"<< /Type /Catalog /Pages 2 0 R /OpenAction << /S /JavaScript /JS (app.alert(1)) >> >>".to_vec();
     let message = edited_error(run(&base, &update(&base, &[(1, catalog)], 6)));
     assert!(message.contains("OpenAction"), "{message}");
+}
+
+// ── R6b-14: glyphs are identified by their text and their place ─────────────────────────────
+
+/// A page with a grey scan behind `hidden` text (`3 Tr`, so no pixel shows it) and `extra` drawn
+/// on top.
+fn scan_with_hidden_text(hidden: &str, extra: &str) -> Vec<u8> {
+    pages_pdf(&[page(&format!("q 200 0 0 300 0 0 cm /Im1 Do Q BT 3 Tr /F1 12 Tf {hidden} ET 0 Tr\n{extra}"))], &[image(150)])
+}
+
+/// `text` shown at x, baseline 150, inside a `BT … ET` started by [`scan_with_hidden_text`].
+fn shown_at(x: f32, text: &str) -> String {
+    format!("1 0 0 1 {x} 150 Tm ({text}) Tj ")
+}
+
+#[test]
+fn a_repeated_character_removed_outside_the_box_is_not_taken_for_the_one_inside() {
+    // An OCR layer reads "1001". The edit leaves out the second character and draws a box over the
+    // third, which is the same character: an alignment of the text could say the boxed "0" went,
+    // but the glyph that went is the second, outside the box.
+    let base = scan_with_hidden_text(&shown_at(20.0, "1001"), "");
+    let third = 20.0 + width_of("10");
+    let boxed = format!("0 g {} 146 {} 16 re f\n", third - 0.5, width_of("0") + 1.0);
+    let wrong = format!("{}{}", shown_at(20.0, "1"), shown_at(third, "01"));
+    let inspection = run(&base, &scan_with_hidden_text(&wrong, &boxed)).unwrap();
+    assert_eq!(inspection.text, TextChanges { pages_with_text_removed: 1, pages_with_text_added: 0 });
+    assert_eq!(inspection.content.pages_changed_outside_redactions, 1);
+    assert!(inspection.redaction_areas.is_empty(), "{:?}", inspection.redaction_areas);
+    // The boxed glyph itself left out: a redaction there.
+    let right = format!("{}{}", shown_at(20.0, "10"), shown_at(20.0 + width_of("100"), "1"));
+    let inspection = run(&base, &scan_with_hidden_text(&right, &boxed)).unwrap();
+    assert_eq!(inspection.content.pages_changed_outside_redactions, 0);
+    assert_eq!(inspection.redaction_areas.len(), 1);
+}
+
+#[test]
+fn text_removed_and_drawn_again_elsewhere_is_text_added() {
+    // "AB" in an OCR layer; the edit draws the "B" lower down. The text reads the same in order,
+    // but a glyph moved: removed where it was, added where it is.
+    let base = scan_with_hidden_text(&shown_at(20.0, "AB"), "");
+    let b_at = 20.0 + width_of("A");
+    let moved = format!("{}1 0 0 1 {b_at} 100 Tm (B) Tj ", shown_at(20.0, "A"));
+    let inspection = run(&base, &scan_with_hidden_text(&moved, "")).unwrap();
+    assert_eq!(inspection.text, TextChanges { pages_with_text_removed: 1, pages_with_text_added: 1 });
+    assert_eq!(inspection.content.pages_changed_outside_redactions, 1);
+    // The same with the "B" removed under a box where it was: still text added.
+    let boxed = format!("0 g {} 146 {} 16 re f\n", b_at - 0.5, width_of("B") + 1.0);
+    let inspection = run(&base, &scan_with_hidden_text(&moved, &boxed)).unwrap();
+    assert_eq!(inspection.text.pages_with_text_added, 1);
+}
+
+#[test]
+fn a_drawn_space_is_a_glyph() {
+    // "1 000" becomes "1000": the space glyph left out (it has no ink, so no pixel changes), the
+    // digits where they were.
+    let base = pages_pdf(&[page(&text_line(20.0, 150.0, "1 000"))], &[]);
+    let gapless = pages_pdf(&[page(&format!("{}{}", text_line(20.0, 150.0, "1"), text_line(20.0 + width_of("1 "), 150.0, "000")))], &[]);
+    let inspection = run(&base, &gapless).unwrap();
+    assert_eq!(inspection.text, TextChanges { pages_with_text_removed: 1, pages_with_text_added: 0 });
+    assert_eq!(inspection.content.pages_changed_outside_redactions, 1);
+    // Closed up: the digits moved, so text was added too.
+    let closed = pages_pdf(&[page(&text_line(20.0, 150.0, "1000"))], &[]);
+    let inspection = run(&base, &closed).unwrap();
+    assert_eq!(inspection.text, TextChanges { pages_with_text_removed: 1, pages_with_text_added: 1 });
+}
+
+#[test]
+fn a_glyph_whose_ink_lies_outside_its_em_box_is_refused_by_the_render() {
+    // A Type 3 glyph "x" whose ink is drawn 36 pt to the right of its em box. A box over the em
+    // box covers the glyph's position, so the glyph rule accepts its removal; the ink that went is
+    // outside the box, so the render does not: refused (failing closed).
+    let font = b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 3500 800] /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs << /x 5 0 R >> /Encoding << /Type /Encoding /Differences [120 /x] >> /FirstChar 120 /LastChar 120 /Widths [500] /Resources << >> >>".to_vec();
+    let glyph = stream("", b"500 0 d0 3000 0 500 700 re f");
+    let file = |content: &str| {
+        pdf(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [6 0 R] /Count 1 /MediaBox [0 0 200 300] >>".to_vec(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+            font.clone(),
+            glyph.clone(),
+            b"<< /Type /Page /Parent 2 0 R /Contents 7 0 R /Resources << /Font << /T3 4 0 R >> >> >>".to_vec(),
+            stream("", content.as_bytes()),
+        ])
+    };
+    let base = file("BT /T3 12 Tf 20 150 Td (x) Tj ET");
+    let inspection = run(&base, &file("0 g 19 146 8 15 re f")).unwrap();
+    assert_eq!(inspection.text, TextChanges { pages_with_text_removed: 1, pages_with_text_added: 0 });
+    assert_eq!(inspection.content.pages_changed_outside_redactions, 1);
+}
+
+#[test]
+fn redactions_with_page_rotation_deletion_and_moves_are_accepted() {
+    let lines = |n: usize| page(&text_line(20.0, 150.0, &format!("Buyer pays Seller {n}")));
+    let base = pages_pdf(&[lines(1), lines(2), lines(3)], &[]);
+    let redact_first = || vec![annotation(0, redact([18.0, 144.0, 61.0, 163.0])), Edit::ApplyRedactions { pages: None }];
+    let cases: Vec<(&str, Vec<Edit>, PageChanges)> = vec![
+        (
+            "rotated",
+            vec![Edit::RotatePages { pages: vec![0, 2], degrees: 90 }],
+            PageChanges { before: 3, after: 3, rotated: 2, ..PageChanges::default() },
+        ),
+        ("deleted", vec![Edit::DeletePages { pages: vec![1] }], PageChanges { before: 3, after: 2, deleted: 1, ..PageChanges::default() }),
+        ("moved", vec![Edit::MovePages { pages: vec![2], to: 1 }], PageChanges { before: 3, after: 3, moved: 1, ..PageChanges::default() }),
+    ];
+    for (case, more, pages) in cases {
+        let mut edits = redact_first();
+        edits.extend(more);
+        let inspection = run(&base, &session_edit(base.clone(), edits)).unwrap();
+        assert!(!inspection.base_kept, "{case}");
+        assert_eq!(inspection.pages, pages, "{case}");
+        assert_eq!(inspection.text, TextChanges { pages_with_text_removed: 1, pages_with_text_added: 0 }, "{case}");
+        assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{case}");
+        assert_eq!(inspection.redaction_areas.len(), 1, "{case}");
+    }
+}
+
+// ── R6b-15: an image changed in a rewrite is compared at its own resolution ─────────────────
+
+/// A `width` × `height` grey texture, as a scan has.
+fn texture(width: usize, height: usize) -> Vec<u8> {
+    (0..width * height).map(|i| (96 + (i % width) * 7 % 61 + (i / width) * 3 % 37) as u8).collect()
+}
+
+fn grey_flate(width: usize, height: usize, pixels: &[u8]) -> Vec<u8> {
+    flate_stream(&format!("/Type /XObject /Subtype /Image /Width {width} /Height {height} /ColorSpace /DeviceGray /BitsPerComponent 8"), pixels)
+}
+
+/// Pixels `x0..x1` × `y0..y1` (row 0 at the top) set to `value`.
+fn fill_pixels(pixels: &mut [u8], width: usize, (x0, x1): (usize, usize), (y0, y1): (usize, usize), value: u8) {
+    for y in y0..y1 {
+        for x in x0..x1 {
+            pixels[y * width + x] = value;
+        }
+    }
+}
+
+/// A full-page scan (`/Im1`, 400 × 600 pixels over 200 × 300 points: two pixels a point) with
+/// `extra` drawn over it.
+fn full_page_scan(image: Vec<u8>, extra: &str) -> Vec<u8> {
+    pages_pdf(&[page(&format!("q 200 0 0 300 0 0 cm /Im1 Do Q\n{extra}"))], &[image])
+}
+
+#[test]
+fn a_full_page_scan_replaced_under_one_small_box_is_refused() {
+    let (width, height) = (400, 600);
+    let original = texture(width, height);
+    let base = full_page_scan(grey_flate(width, height, &original), "");
+    // Points 40–60 × 200–220 are pixels 80–120 × 160–200 (row 0 at the top of the page).
+    let boxed = "0 g 40 200 20 20 re f\n";
+    let mut redacted = original.clone();
+    fill_pixels(&mut redacted, width, (80, 120), (160, 200), 0);
+    // The same, and also a region far from the box made lighter by 6 levels of 255: below what the
+    // page render notices, but another scan.
+    let mut forged = redacted.clone();
+    for y in 400..500 {
+        for x in 200..300 {
+            forged[y * width + x] += 6;
+        }
+    }
+    let inspection = run(&base, &full_page_scan(grey_flate(width, height, &forged), boxed)).unwrap();
+    assert_eq!(inspection.content.pages_changed_outside_redactions, 1, "{inspection:?}");
+    assert!(inspection.redaction_areas.is_empty());
+    let inspection = run(&base, &full_page_scan(grey_flate(width, height, &redacted), boxed)).unwrap();
+    assert_eq!(
+        inspection.content,
+        ContentChanges { pages_with_images_removed: 1, pages_with_content_removed: 1, ..ContentChanges::default() },
+        "{inspection:?}"
+    );
+    assert_eq!(inspection.redaction_areas.len(), 1);
+    // Another size of image at the same place, under the small box: refused.
+    let smaller = texture(200, 300);
+    let inspection = run(&base, &full_page_scan(grey_flate(200, 300, &smaller), boxed)).unwrap();
+    assert_eq!(inspection.content.pages_changed_outside_redactions, 1);
+}
+
+#[test]
+fn a_real_image_redaction_is_accepted() {
+    let (_, with_image) =
+        edited(1, vec![Edit::AddImage { page: 0, rect: Some([20.0, 200.0, 180.0, 280.0]), name: "scan.png".into(), bytes: Arc::new(png(64, 32)) }]);
+    // The box covers the left half of the image, away from the page's text.
+    let redacted = session_edit(with_image.clone(), vec![annotation(0, redact([10.0, 190.0, 100.0, 290.0])), Edit::ApplyRedactions { pages: None }]);
+    let inspection = run(&with_image, &redacted).unwrap();
+    assert!(!inspection.base_kept);
+    assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{inspection:?}");
+    assert_eq!(inspection.content.pages_with_images_removed, 1);
+    assert_eq!(inspection.content.pages_with_images_added, 0);
+    assert_eq!(inspection.redaction_areas.len(), 1);
+}
+
+fn jpeg_grey(width: u32, height: u32, pixels: &[u8], quality: u8) -> Vec<u8> {
+    let mut out = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality).encode(pixels, width, height, image::ExtendedColorType::L8).unwrap();
+    out
+}
+
+fn dct_image(width: u32, height: u32, jpeg: &[u8]) -> Vec<u8> {
+    stream(
+        &format!("/Type /XObject /Subtype /Image /Width {width} /Height {height} /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /DCTDecode"),
+        jpeg,
+    )
+}
+
+/// A smooth grey photograph-like image.
+fn photo(width: usize, height: usize) -> Vec<u8> {
+    (0..width * height)
+        .map(|i| {
+            let (x, y) = ((i % width) as f64, (i / width) as f64);
+            (128.0 + 60.0 * (x / 23.0).sin() * (y / 31.0).cos() + 30.0 * ((x + y) / 57.0).sin()) as u8
+        })
+        .collect()
+}
+
+#[test]
+fn a_jpeg_re_encoded_by_the_redactor_is_accepted_within_bounds() {
+    let (width, height) = (400usize, 600usize);
+    let original = jpeg_grey(width as u32, height as u32, &photo(width, height), 80);
+    let base = full_page_scan(dct_image(width as u32, height as u32, &original), "");
+    // The redactor decodes the base, clears the pixels under the box, and codes the image again.
+    let decoded = image::load_from_memory_with_format(&original, image::ImageFormat::Jpeg).unwrap().to_luma8().into_raw();
+    let redact = |x: (usize, usize), y: (usize, usize), quality: u8, extra: Option<(usize, usize)>| {
+        let mut pixels = decoded.clone();
+        fill_pixels(&mut pixels, width, x, y, 0);
+        if let Some((ex, ey)) = extra {
+            for row in ey..ey + 8 {
+                for column in ex..ex + 8 {
+                    pixels[row * width + column] = pixels[row * width + column].saturating_add(40);
+                }
+            }
+        }
+        let jpeg = jpeg_grey(width as u32, height as u32, &pixels, quality);
+        // Pixel x is point x / 2; row y is point 300 − y / 2.
+        let (x0, x1) = (x.0 as f32 / 2.0, x.1 as f32 / 2.0);
+        let (y0, y1) = (300.0 - y.1 as f32 / 2.0, 300.0 - y.0 as f32 / 2.0);
+        full_page_scan(dct_image(width as u32, height as u32, &jpeg), &format!("0 g {x0} {y0} {} {} re f\n", x1 - x0, y1 - y0))
+    };
+    // The cleared pixels are whole 8 × 8 blocks (the redactor clears the blocks its box touches):
+    // the blocks outside are the base's requantised, at the same quality or another.
+    for (case, quality) in [("same quality", 80), ("another quality", 60)] {
+        let inspection = run(&base, &redact((80, 160), (160, 240), quality, None)).unwrap();
+        assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{case}: {inspection:?}");
+        assert_eq!(inspection.content.pages_with_images_removed, 1, "{case}");
+        assert_eq!(inspection.content.pages_with_images_added, 0, "{case}");
+        assert_eq!(inspection.redaction_areas.len(), 1, "{case}");
+    }
+    // Cleared pixels that cut through blocks: coding the image again rings around the black
+    // region, outside the box, which the page render refuses (the samples themselves stay within
+    // the per-sample bound: `images::tests::partly_covered_jpeg_blocks_are_held_to_the_sample_bound`).
+    let inspection = run(&base, &redact((83, 151), (165, 229), 80, None)).unwrap();
+    assert_eq!(inspection.content.pages_changed_outside_redactions, 1);
+    // One block far from the box made lighter: beyond what requantising explains.
+    let inspection = run(&base, &redact((80, 160), (160, 240), 80, Some((304, 456)))).unwrap();
+    assert_eq!(inspection.content.pages_changed_outside_redactions, 1, "{inspection:?}");
 }

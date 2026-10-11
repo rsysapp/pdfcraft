@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use pdfcraft_cos::{Dict, Document, Lexer, ObjRef, Object, Stream, XrefEntry, parse_indirect};
+use pdfcraft_render::content::PageGlyphs;
 
 use super::{Budget, Fail, MAX_PAGES};
 
@@ -72,8 +73,8 @@ pub(crate) struct PageFacts {
     pub other: Digest,
     /// The images drawn (directly, inside form XObjects, inline), as a sorted multiset.
     pub images: Vec<Digest>,
-    /// Each image drawn and the box it covers, in user space (for a rewrite's redaction check).
-    pub image_boxes: Vec<(Digest, [f64; 4])>,
+    /// Each image drawn, where (for a rewrite's redaction check).
+    pub image_uses: Vec<ImageUse>,
     /// The image pixels drawn, summed over every use.
     pub image_pixels: u64,
     /// Content bytes the interpreter reads for the page (forms counted per use).
@@ -81,12 +82,31 @@ pub(crate) struct PageFacts {
     pub annots: Vec<Annot>,
     /// How many `/Annots` entries are dictionaries (hayro must count the same).
     pub annots_in_array: usize,
-    /// Filled from hayro: the upright page size in points, the text, the fingerprint.
+    /// Filled from hayro: the upright page size in points, the glyphs drawn, the fingerprint.
     pub size: (f32, f32),
-    pub text: Vec<char>,
-    /// Where each character of `text` was drawn (user space; kept for the base of a rewrite).
-    pub centres: Vec<[f32; 2]>,
+    pub glyphs: PageGlyphs,
     pub fingerprint: Digest,
+}
+
+/// One use of an image on a page.
+#[derive(Clone, Debug)]
+pub(crate) struct ImageUse {
+    /// The raw encoded stream's digest (with its dictionary).
+    pub digest: Digest,
+    /// Image space (the unit square) to user space.
+    pub matrix: Matrix,
+    /// The image XObject (`None`: an inline image).
+    pub image: Option<Arc<ImageInfo>>,
+}
+
+/// An image XObject, for a comparison of its samples.
+#[derive(Debug)]
+pub(crate) struct ImageInfo {
+    pub obj: ObjRef,
+    /// The dictionary without its filters, decode parameters and length: what the samples mean.
+    pub meaning: Digest,
+    pub width: u32,
+    pub height: u32,
 }
 
 /// One cross-reference section of the file.
@@ -114,7 +134,7 @@ pub(crate) struct Structure {
 
 /// The fingerprint pages are matched by: content, resources, images and text.
 pub(crate) fn fingerprint(page: &PageFacts) -> Digest {
-    let text: String = page.text.iter().collect();
+    let text: String = page.glyphs.chars.iter().collect();
     let images: Vec<u8> = page.images.iter().flatten().copied().collect();
     sha256(&[&page.content, &page.resources, &images, text.as_bytes()])
 }
@@ -193,7 +213,7 @@ fn concat(m: &Matrix, then: &Matrix) -> Matrix {
 
 /// The box an image drawn under `m` covers (the unit square), in the space `m` maps into. A
 /// matrix that does not give finite numbers gives a box that contains nothing.
-fn unit_square(m: &Matrix) -> [f64; 4] {
+pub(crate) fn unit_square(m: &Matrix) -> [f64; 4] {
     let corners = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)].map(|(x, y)| (m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]));
     let (mut x0, mut y0, mut x1, mut y1) = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
     for (x, y) in corners {
@@ -220,8 +240,8 @@ struct PageNode {
 #[derive(Default)]
 struct Drawn {
     images: Vec<Digest>,
-    /// Each image drawn and the box it covers, in user space.
-    placements: Vec<(Digest, [f64; 4])>,
+    /// Each image drawn, where.
+    placements: Vec<ImageUse>,
     pixels: u64,
     interpreted: usize,
 }
@@ -240,6 +260,7 @@ struct Reader<'d, 'b> {
     stack: Vec<ObjRef>,
     contents: HashMap<Vec<ObjRef>, Arc<Scan>>,
     forms: HashMap<ObjRef, Arc<Scan>>,
+    images: HashMap<ObjRef, Arc<ImageInfo>>,
 }
 
 fn read_error(what: impl std::fmt::Display) -> Fail {
@@ -757,7 +778,7 @@ impl<'d, 'b> Reader<'d, 'b> {
             match item {
                 Item::Inline(digest, pixels, at) => {
                     drawn.images.push(*digest);
-                    drawn.placements.push((*digest, unit_square(&concat(at, ctm))));
+                    drawn.placements.push(ImageUse { digest: *digest, matrix: concat(at, ctm), image: None });
                     drawn.pixels = drawn.pixels.saturating_add(*pixels);
                 }
                 Item::Draw(name, at) => {
@@ -768,11 +789,10 @@ impl<'d, 'b> Reader<'d, 'b> {
                     match stream.dict.name(b"Subtype") {
                         Some(b"Image") => {
                             let (digest, _) = self.digest_ref(r)?;
+                            let info = self.image_info(r, &stream.dict)?;
                             drawn.images.push(digest);
-                            drawn.placements.push((digest, unit_square(&placed)));
-                            let width = self.int_of(stream.dict.get(b"Width"))?.unwrap_or(0).max(0);
-                            let height = self.int_of(stream.dict.get(b"Height"))?.unwrap_or(0).max(0);
-                            drawn.pixels = drawn.pixels.saturating_add((width as u64).saturating_mul(height as u64));
+                            drawn.pixels = drawn.pixels.saturating_add(u64::from(info.width).saturating_mul(u64::from(info.height)));
+                            drawn.placements.push(ImageUse { digest, matrix: placed, image: Some(info) });
                         }
                         Some(b"Form") => {
                             if depth >= self.budget.limits.form_depth {
@@ -797,6 +817,20 @@ impl<'d, 'b> Reader<'d, 'b> {
             }
         }
         Ok(())
+    }
+
+    /// What image `r` (with dictionary `dict`) is, once per image.
+    fn image_info(&mut self, r: ObjRef, dict: &Dict) -> Result<Arc<ImageInfo>, Fail> {
+        if let Some(found) = self.images.get(&r) {
+            return Ok(found.clone());
+        }
+        let side = |value: Option<i64>| u32::try_from(value.unwrap_or(0).max(0)).unwrap_or(u32::MAX);
+        let width = side(self.int_of(dict.get(b"Width"))?);
+        let height = side(self.int_of(dict.get(b"Height"))?);
+        let meaning = self.digest_without(dict, &[b"Filter", b"DecodeParms", b"Length", b"DL"])?;
+        let info = Arc::new(ImageInfo { obj: r, meaning, width, height });
+        self.images.insert(r, info.clone());
+        Ok(info)
     }
 
     // ── pages ───────────────────────────────────────────────────────────────────────────────
@@ -843,13 +877,12 @@ impl<'d, 'b> Reader<'d, 'b> {
             other,
             images: drawn.images,
             image_pixels: drawn.pixels,
-            image_boxes: drawn.placements,
+            image_uses: drawn.placements,
             interpreted: drawn.interpreted,
             annots,
             annots_in_array,
             size: (0.0, 0.0),
-            text: Vec::new(),
-            centres: Vec::new(),
+            glyphs: PageGlyphs::default(),
             fingerprint: [0; 32],
         })
     }
@@ -1035,6 +1068,7 @@ pub(crate) fn read(doc: &Document, budget: &mut Budget) -> Result<Structure, Fai
         stack: Vec::new(),
         contents: HashMap::new(),
         forms: HashMap::new(),
+        images: HashMap::new(),
     };
     let Some(root) = doc.root() else { return Err(read_error("the trailer's /Root is not a reference")) };
     let catalog = reader.get(root)?.as_dict().cloned().ok_or_else(|| read_error("the catalog is not a dictionary"))?;
