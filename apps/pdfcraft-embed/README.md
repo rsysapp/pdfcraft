@@ -12,7 +12,14 @@ dispatch refuses everything but find, page display and zoom. Ctrl/Cmd+C copies t
 packaging/embed/package.sh   # dist/release/pdfcraft-embed-<version>.zip and .zip.sha256
 ```
 
-The zip holds:
+It needs the `wasm32-unknown-unknown` target, `wasm-bindgen` at the version in `Cargo.lock`
+(`cargo install wasm-bindgen-cli --version <it> --locked`, or `WASM_BINDGEN=…`), binaryen's
+`wasm-opt` at the version in `packaging/embed/tools.env` (`WASM_OPT=…` names a binary; the script
+refuses any other version and runs `wasm-opt -Oz`), cargo-about at the version in
+`packaging/embed/cargo-about.env`, `jq` and `python3`. The version is this crate's own, not the
+app's (`packaging/embed/package.sh --print-version`); release tags are `embed-v<version>`.
+
+The zip holds, at its root:
 
 | File | What |
 |---|---|
@@ -37,10 +44,66 @@ cargo-about at the version in `packaging/embed/cargo-about.env` (CI installs a c
 binary with `install-cargo-about.sh`; elsewhere `cargo install cargo-about --locked --features
 cli --version <it>`), plus `jq` and `python3`.
 
-A tag `embed-v<version>` releases it
-(`.github/workflows/embed-release.yml`); the version is this crate's own, not the app's.
-The zip's hash is reproducible on the same toolchain and checkout path (the module records
-source paths).
+The zip is reproducible: its bytes depend only on the toolchain and tools (the pinned Rust
+toolchain, `wasm-bindgen`, `wasm-opt`, cargo-about), the commit and the dependencies locked in
+`Cargo.lock`, not on the machine, user or checkout path (fixed timestamps under `TZ=UTC`,
+byte-order file lists under `LC_ALL=C`, mode 644, no extra attributes or folder entries). The
+module records the source path of each panic location; the script rewrites those paths with
+`--remap-path-prefix` (registry and git crates to `/cargo/registry/src` and
+`/cargo/git/checkouts`, the checkout to `.`) and fails if the module or its glue still holds
+`CARGO_HOME`, the checkout path or the home folder.
+
+The script sets `CARGO_ENCODED_RUSTFLAGS`, which cargo prefers over every other source of
+rustflags, so it carries over the caller's `RUSTFLAGS` (or the wasm target's or `build`'s
+environment variable) and refuses to build while a cargo config file on the checkout's ancestor
+path or in `CARGO_HOME` sets rustflags that could apply to the wasm build, because those would be
+replaced without a word: `[build]` (also `build.rustflags`), `[target.wasm32-unknown-unknown]`
+(also dotted or quoted) and any `[target.'cfg(...)']` section (a cfg expression may match wasm32
+and the script cannot evaluate it). Rustflags for another target triple, such as a host linker
+under `[target.x86_64-unknown-linux-gnu]`, never reach this build and are allowed; pass flags
+meant for the wasm build in `RUSTFLAGS`. `packaging/embed/rustflags-guard.sh` holds the check and
+`packaging/embed/test-rustflags-guard.sh` tests it.
+
+### Reproducing a release
+
+To rebuild a release's zip and compare it with the published `.zip.sha256`:
+
+1. Check out the tag cleanly (`git clone`, or `git checkout embed-v<version>` in a tree with no
+   changes).
+2. Use the Rust toolchain the workflows pin (their `toolchain:` lines): `RUSTUP_TOOLCHAIN=1.95.0`,
+   with the `wasm32-unknown-unknown` target.
+3. Install `wasm-bindgen-cli` at the version `Cargo.lock` locks for `wasm-bindgen`
+   (`awk '/^name = "wasm-bindgen"$/ { getline; print; exit }' Cargo.lock`), with `--locked`.
+4. Install binaryen at the version in `packaging/embed/tools.env` (123); its SHA-256 for the Linux
+   x86_64 release is there too (`packaging/embed/install-binaryen.sh` does it on that platform).
+   `package.sh` refuses another `wasm-opt`.
+5. Install cargo-about at the version in `packaging/embed/cargo-about.env`
+   (`packaging/embed/install-cargo-about.sh`), and have `jq` and `python3`. Releases are built with
+   `CRAFT_FONTS_DIR` unset; set it only to rebuild a release that names craft-fonts licences in
+   `licenses/`.
+6. Run `packaging/embed/package.sh`, then compare `dist/release/pdfcraft-embed-<version>.zip.sha256`
+   with the release's file, and run `packaging/embed/verify-zip.sh` on your zip.
+
+Honest status: the path check has been run on a macOS build. Equality has not yet been checked
+between two machines, two checkout paths, or macOS and the Linux runner that builds the release,
+so a build elsewhere may differ in bytes (compare the files inside the zip:
+`unzip -p <zip> SHA256SUMS` lists each file's hash) until someone has compared them.
+
+### Releases
+
+A tag `embed-v<version>` runs `.github/workflows/embed-release.yml`: the build (uncached, so no
+earlier run's outputs reach the release), a check of the zip with `packaging/embed/verify-zip.sh`,
+then a GitHub release holding `pdfcraft-embed-<version>.zip` and its `.zip.sha256`. The release
+job alone holds the write token and the right to attest. `Packaging lint` runs shellcheck and the
+self-tests of the packaging scripts (`packaging/embed/test-verify-zip.sh`, crafted zips the
+verifier must refuse, and `packaging/embed/test-rustflags-guard.sh`); `Embed licences` generates
+the licence notices on pushes to the `*-embed` branches.
+
+`verify-zip.sh` extracts nothing. It requires the `.sha256` to be one line naming this zip with
+its hash, the entry names to be exactly the files listed above (plain relative names: no absolute
+path, `..`, backslash or folder entry, at most 100 characters, no two differing only in case) and
+`SHA256SUMS` to list each of them once, and it hashes every entry streamed out of the zip. A host
+can run it on a download.
 
 The release job also attests the zip and its `.sha256` file with GitHub artifact attestation
 (signed SLSA build provenance, `actions/attest-build-provenance`). The checksum only shows that

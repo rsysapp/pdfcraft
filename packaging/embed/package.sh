@@ -6,8 +6,9 @@
 # The version is apps/pdfcraft-embed's own (released as tags embed-v<version>), not the app's.
 # Needs: the wasm32-unknown-unknown target; wasm-bindgen at the version in Cargo.lock
 # (cargo install wasm-bindgen-cli --version <it> --locked, or set WASM_BINDGEN); wasm-opt from
-# binaryen (or set WASM_OPT); cargo-about at the version in cargo-about.env, and jq and python3
-# (see third-party-licenses.sh). The zip holds, at its root, the files the embed API lists.
+# binaryen at the version in tools.env (or set WASM_OPT); cargo-about at the version in
+# cargo-about.env, and jq and python3 (see third-party-licenses.sh). The zip holds, at its root,
+# the files the embed API lists (apps/pdfcraft-embed/README.md).
 set -euo pipefail
 # shellcheck source=../env.sh
 . "$(dirname "${BASH_SOURCE[0]}")/../env.sh"
@@ -20,6 +21,9 @@ if [ "${1:-}" = "--print-version" ]; then
 fi
 [ -n "$EMBED_VERSION" ] || { echo "error: no version in $CRATE/Cargo.toml" >&2; exit 1; }
 
+# shellcheck source=rustflags-guard.sh
+. "$ROOT/packaging/embed/rustflags-guard.sh"
+
 WASM_BINDGEN="${WASM_BINDGEN:-wasm-bindgen}"
 WASM_OPT="${WASM_OPT:-wasm-opt}"
 LOCKED="$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/version = |"/, ""); print; exit }' "$ROOT/Cargo.lock")"
@@ -29,6 +33,14 @@ if [ "$HAVE" != "$LOCKED" ]; then
   exit 1
 fi
 command -v "$WASM_OPT" >/dev/null || { echo "error: wasm-opt not found (binaryen; or set WASM_OPT)" >&2; exit 1; }
+# The optimiser's output is part of the zip's bytes, so only the pinned release is used.
+# shellcheck source=tools.env
+. "$ROOT/packaging/embed/tools.env"
+HAVE_OPT="$("$WASM_OPT" --version 2>/dev/null | awk '{ print $3 }')" || true
+if [ "$HAVE_OPT" != "$BINARYEN_VERSION" ]; then
+  echo "error: wasm-opt ${HAVE_OPT:-not found} (binaryen); tools.env pins version $BINARYEN_VERSION (packaging/embed/install-binaryen.sh, or set WASM_OPT)" >&2
+  exit 1
+fi
 
 NAME="pdfcraft-embed-$EMBED_VERSION"
 WORK="$CARGO_TARGET_DIR/embed-package"
@@ -41,6 +53,42 @@ mkdir -p "$WORK/bindgen" "$OUT"
 # notice, and a missing tool shows before the long build.
 "$ROOT/packaging/embed/third-party-licenses.sh" "$OUT/THIRD-PARTY-LICENSES.txt"
 
+# The module keeps the source path of every panic location. Registry and git crates sit under
+# CARGO_HOME, whose path names the builder's home folder and differs per machine, so they are
+# rewritten to fixed prefixes; the checkout itself becomes `.` (workspace paths are already
+# relative, this catches any that are not). rustc applies the last prefix that matches, so the
+# cargo folders come after the checkout, in case CARGO_HOME lies inside it.
+#
+# CARGO_ENCODED_RUSTFLAGS replaces every other source of rustflags, so the flags cargo would
+# otherwise have used are carried over, ahead of these, from the one source cargo would read:
+# CARGO_ENCODED_RUSTFLAGS, else RUSTFLAGS, else CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS, else
+# CARGO_BUILD_RUSTFLAGS. Rustflags in a cargo config file cannot be read reliably without
+# unstable cargo, so the script refuses to build while one that can apply to the wasm build sets
+# them: [build], [target.wasm32-unknown-unknown] or a [target.'cfg(...)'] section (rustflags-guard.sh;
+# those for another target triple do not apply and are allowed). The workspace sets none.
+HOME_DIR="${HOME:-}"
+CARGO_HOME_DIR="${CARGO_HOME:-$HOME_DIR/.cargo}"
+rustflags_guard_scan "$ROOT" "$CARGO_HOME_DIR" || exit 1
+SEP=$'\x1f'
+REMAP="--remap-path-prefix=$ROOT=.${SEP}--remap-path-prefix=$CARGO_HOME_DIR/registry/src=/cargo/registry/src${SEP}--remap-path-prefix=$CARGO_HOME_DIR/git/checkouts=/cargo/git/checkouts"
+caller_flags=()
+if [ -n "${CARGO_ENCODED_RUSTFLAGS:-}" ]; then
+  IFS="$SEP" read -r -a caller_flags <<<"$CARGO_ENCODED_RUSTFLAGS"
+else
+  for source in RUSTFLAGS CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS CARGO_BUILD_RUSTFLAGS; do
+    if [ -n "${!source:-}" ]; then
+      read -r -a caller_flags <<<"${!source}"
+      break
+    fi
+  done
+fi
+if [ "${#caller_flags[@]}" -gt 0 ]; then
+  CARGO_ENCODED_RUSTFLAGS="$(IFS="$SEP"; echo "${caller_flags[*]}")$SEP$REMAP"
+else
+  CARGO_ENCODED_RUSTFLAGS="$REMAP"
+fi
+export CARGO_ENCODED_RUSTFLAGS
+
 # This package alone: building it beside the apps would turn the `brand` feature back on.
 cargo build --release --locked --target wasm32-unknown-unknown -p pdfcraft-embed
 
@@ -49,6 +97,26 @@ cargo build --release --locked --target wasm32-unknown-unknown -p pdfcraft-embed
 # As trunk's data-wasm-opt="z" for the web app: wasm-opt reads the module's own feature list.
 "$WASM_OPT" -Oz -o "$OUT/pdfcraft_embed_bg.wasm" "$WORK/bindgen/pdfcraft_embed_bg.wasm"
 cp "$WORK/bindgen/pdfcraft_embed.js" "$WORK/bindgen/pdfcraft_embed.d.ts" "$OUT/"
+
+# No path of this machine in what ships: it would name the builder and make the hash differ per
+# machine. A path counts where it ends at a boundary (a `/` or a byte no file name part holds), so
+# a home folder of /home/a does not count /home/ab. A home folder of `/` (or none) would match
+# everything, so it is not searched for, and the script says so.
+if [ "${#HOME_DIR}" -le 1 ]; then
+  echo "note: HOME is '${HOME_DIR}', so the module is not searched for the home folder (CARGO_HOME and the checkout still are)" >&2
+fi
+for path in "$CARGO_HOME_DIR" "$ROOT" "$HOME_DIR"; do
+  [ "${#path}" -gt 1 ] || continue
+  # The path as an extended regular expression: every character outside [A-Za-z0-9/_-] escaped.
+  pattern="$(printf '%s' "$path" | LC_ALL=C sed 's/[^A-Za-z0-9/_-]/\\&/g')([^A-Za-z0-9._-]|$)"
+  for file in pdfcraft_embed_bg.wasm pdfcraft_embed.js pdfcraft_embed.d.ts; do
+    found="$({ LC_ALL=C grep -a -o -E -- "$pattern" "$OUT/$file" || true; } | wc -l | tr -d ' ')"
+    if [ "$found" != 0 ]; then
+      echo "error: $file holds $found copies of the local path $path; a --remap-path-prefix is missing" >&2
+      exit 1
+    fi
+  done
+done
 
 # The declarations the embed API promises (generated, so checked rather than trusted).
 for want in \

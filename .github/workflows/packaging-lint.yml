@@ -4,7 +4,8 @@ name: Packaging lint
 
 on:
   push:
-    branches: [main, release]
+    # Embed build: the embed branches (named *-embed) run these too, for the embed packaging scripts.
+    branches: [main, release, "*-embed"]
     paths: [".github/workflows/**", "packaging/**", "assets/app-icon/**"]
   pull_request:
     paths: [".github/workflows/**", "packaging/**", "assets/app-icon/**"]
@@ -35,6 +36,11 @@ jobs:
           "$RUNNER_TEMP/actionlint" -color
       - name: shellcheck
         run: shellcheck packaging/*.sh packaging/*/*.sh
+      # Embed build: the self-tests of the embed packaging scripts (no Rust build).
+      - name: verify-zip.sh refuses crafted zips
+        run: packaging/embed/test-verify-zip.sh
+      - name: rustflags guard refuses only flags the wasm build would lose
+        run: packaging/embed/test-rustflags-guard.sh
       - name: PowerShell
         shell: pwsh
         run: |
