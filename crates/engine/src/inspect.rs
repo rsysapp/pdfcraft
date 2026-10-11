@@ -203,16 +203,19 @@ pub struct ContentChanges {
 /// The document outline (bookmarks), entry by entry. Entries are read depth first and paired in
 /// that order by their depth and title; an entry whose title alone changed pairs with the base
 /// entry at its place among the unpaired ones. Two paired entries must agree in everything else
-/// (colour, style, any action other than going to a destination in the file), and an added entry
-/// may have no such action, or the inspection fails: no fact here reports them.
+/// (colour, style, any action other than going to a destination in the file), an added entry may
+/// have no such action and must go to one of the file's pages, a named destination or nowhere,
+/// and the outline's root dictionary may not change, or the inspection fails: no fact here
+/// reports them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OutlineChanges {
     /// Paired entries whose title differs.
     pub titles_changed: u32,
-    /// Paired entries whose destination differs: it goes to another page number (in its own file:
-    /// deleting or moving a page renumbers the pages after it, so destinations that follow a
-    /// page delete or move count here), to no page any more (an editor drops the destinations of
-    /// a deleted page), to another view of its page, or anywhere else another way.
+    /// Paired entries whose destination changed by following its page: the same page, at the
+    /// same view, now at another page number (a page deleted or moved before it renumbers it),
+    /// or no destination any more where its page was deleted (an editor drops those). Any other
+    /// change of a destination (another page, another view, a new destination, a named or
+    /// external one) fails the inspection.
     pub destinations_changed: u32,
     /// Edited entries paired with no base entry.
     pub added: u32,
@@ -493,9 +496,15 @@ fn compare(base: &[u8], edited: &[u8], limits: Limits) -> Result<Inspection, Ins
         return Err(InspectError::Edited(format!("the document's /{key} changed, which this comparison does not report")));
     }
     let mut inspection = Inspection { base_kept, ..Inspection::default() };
-    inspection.outlines = outline::compare(&before.structure.outline, &after.structure.outline, &mut budget).map_err(|fail| fail.of(Role::Edited))?;
     let pairs =
         match_pages(&before.structure.pages, &after.structure.pages, &mut inspection.pages, &mut budget).map_err(|fail| fail.of(Role::Edited))?;
+    // Destinations are judged through the pages' pairing: one may follow its page, nothing more.
+    let followed: BTreeMap<usize, usize> = pairs.iter().copied().collect();
+    if before.structure.outline_root != after.structure.outline_root {
+        return Err(InspectError::Edited("the outline's root dictionary changed, which this comparison does not report".into()));
+    }
+    inspection.outlines =
+        outline::compare(&before.structure.outline, &after.structure.outline, &followed, &mut budget).map_err(|fail| fail.of(Role::Edited))?;
     // The document's layer configuration decides what every page shows.
     let layers_changed = before.structure.layers != after.structure.layers;
     inspection.form_fields_changed = fields_changed(&before.structure, &after.structure);

@@ -197,9 +197,13 @@ pub(crate) struct OutlineEntry {
 pub(crate) enum Destination {
     None,
     /// An explicit destination to one of this file's pages: the page's index and the view (the
-    /// rest of the array).
+    /// rest of the array: the fit, position and zoom).
     Page(usize, Digest),
-    /// Anything else (a named destination, a page given by number, …), by its digest.
+    /// A named destination (a name or a string), by its digest: what it names is the catalog's
+    /// `/Dests` or `/Names`, compared whole.
+    Named(Digest),
+    /// Anything else (an array whose first entry is not one of this file's pages, a page given
+    /// by number, …), by its digest.
     Other(Digest),
 }
 
@@ -271,6 +275,9 @@ pub(crate) struct Structure {
     pub layers: Option<Digest>,
     /// The outline's entries, depth first.
     pub outline: Vec<OutlineEntry>,
+    /// The outline's root dictionary but for `/Type`, its links to the entries and `/Count` (an
+    /// empty dictionary's digest when there is no outline).
+    pub outline_root: Digest,
     /// Cross-reference sections, oldest first.
     pub sections: Vec<Section>,
 }
@@ -1710,6 +1717,7 @@ impl Reader<'_, '_> {
         }
         Ok(match &*resolved {
             Object::Null => Destination::None,
+            named @ (Object::Name(_) | Object::String(_)) => Destination::Named(self.digest(named)?),
             other => Destination::Other(self.digest(other)?),
         })
     }
@@ -2124,6 +2132,8 @@ pub(crate) fn read(
     let layers = catalog.get(b"OCProperties").map(|layers| reader.digest(layers)).transpose()?;
     let page_index: HashMap<ObjRef, usize> = nodes.iter().enumerate().map(|(index, node)| (node.obj, index)).collect();
     let outline = reader.outline(&catalog, &page_index)?;
+    let root = reader.dict_of(catalog.get(b"Outlines"), "/Outlines")?.unwrap_or_default();
+    let outline_root = reader.digest_without(&root, &[b"Type", b"First", b"Last", b"Count"])?;
     let mut entries = BTreeMap::new();
     for (key, value) in catalog.iter() {
         if !CATALOG_REPORTED.contains(&key.as_slice()) {
@@ -2146,5 +2156,5 @@ pub(crate) fn read(
         misdeclared: reader.misdeclared,
         agreed: BTreeSet::new(),
     };
-    Ok((Structure { pages, fields, form, catalog: entries, layers, outline, sections }, known))
+    Ok((Structure { pages, fields, form, catalog: entries, layers, outline, outline_root, sections }, known))
 }

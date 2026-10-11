@@ -3,7 +3,9 @@
 //! by their depth and title (a longest common subsequence, after the common start and end), and
 //! between two such pairs, entry by entry at the same depth (an entry whose title alone changed).
 
-use super::structure::OutlineEntry;
+use std::collections::BTreeMap;
+
+use super::structure::{Destination, OutlineEntry};
 use super::{Budget, Fail, OutlineChanges, count};
 
 /// The most cells of the pairing table for the entries between the common start and end: two
@@ -11,10 +13,17 @@ use super::{Budget, Fail, OutlineChanges, count};
 /// deletes and moves) leave no entries between them.
 const MAX_CELLS: usize = 1 << 22;
 
-/// Pair `before` with `after` and count what changed. Paired entries that differ in anything but
-/// their title and destination, and added entries with an action other than going to a
-/// destination, fail: no fact reports them.
-pub(crate) fn compare(before: &[OutlineEntry], after: &[OutlineEntry], budget: &mut Budget) -> Result<OutlineChanges, Fail> {
+/// Pair `before` with `after` and count what changed. `pages`: each base page present in the
+/// edited file, and its index there (a base page missing was deleted). Fails on what no fact
+/// reports: paired entries that differ in anything but their title, or whose destination changed
+/// other than by following its page (see [`followed`]); added entries with an action other than
+/// going to a destination, or going outside the file's pages.
+pub(crate) fn compare(
+    before: &[OutlineEntry],
+    after: &[OutlineEntry],
+    pages: &BTreeMap<usize, usize>,
+    budget: &mut Budget,
+) -> Result<OutlineChanges, Fail> {
     let key = |entry: &OutlineEntry| (entry.depth, entry.title.clone());
     let prefix = before.iter().zip(after).take_while(|(a, b)| key(a) == key(b)).count();
     let (rest_before, rest_after) = (before.get(prefix..).unwrap_or_default(), after.get(prefix..).unwrap_or_default());
@@ -55,7 +64,7 @@ pub(crate) fn compare(before: &[OutlineEntry], after: &[OutlineEntry], budget: &
             return Err(Fail::Read("an outline entry changed other than in its title or destination (its style, colour or action)".into()));
         }
         changes.titles_changed = changes.titles_changed.saturating_add(u32::from(a.title != b.title));
-        changes.destinations_changed = changes.destinations_changed.saturating_add(u32::from(a.destination != b.destination));
+        changes.destinations_changed = changes.destinations_changed.saturating_add(u32::from(followed(&a.destination, &b.destination, pages)?));
         if let Some(slot) = paired_before.get_mut(i) {
             *slot = true;
         }
@@ -68,9 +77,27 @@ pub(crate) fn compare(before: &[OutlineEntry], after: &[OutlineEntry], budget: &
         if !paired && entry.acts {
             return Err(Fail::Read("an added outline entry has an action other than going to a destination".into()));
         }
+        if !paired && matches!(entry.destination, Destination::Other(_)) {
+            return Err(Fail::Read("an added outline entry goes somewhere other than one of the file's pages".into()));
+        }
     }
     changes.added = count(paired_after.iter().filter(|paired| !**paired).count());
     Ok(changes)
+}
+
+/// Whether a paired entry's destination `after` followed its page from `before` (`true`: its
+/// page number changed, or its page was deleted and it has none), stayed as it was (`false`), or
+/// changed otherwise (an error: another page, another view, a destination gained, a named or
+/// external destination changed).
+fn followed(before: &Destination, after: &Destination, pages: &BTreeMap<usize, usize>) -> Result<bool, Fail> {
+    match (before, after) {
+        (Destination::Page(page, view), Destination::Page(now, same)) if pages.get(page) == Some(now) && view == same => Ok(page != now),
+        (Destination::Page(page, _), Destination::None) if !pages.contains_key(page) => Ok(true),
+        (Destination::None, Destination::None) => Ok(false),
+        (Destination::Named(name), Destination::Named(same)) if name == same => Ok(false),
+        (Destination::Other(other), Destination::Other(same)) if other == same => Ok(false),
+        _ => Err(Fail::Read("an outline entry's destination changed other than by following its page".into())),
+    }
 }
 
 type Key = (usize, Option<Vec<u8>>);
@@ -123,20 +150,53 @@ mod tests {
         OutlineEntry { depth, title: Some(title.as_bytes().to_vec()), destination: Destination::Page(page, [0; 32]), rest: [0; 32], acts: false }
     }
 
+    /// Three pages, each where it was.
     fn run(before: &[OutlineEntry], after: &[OutlineEntry]) -> Result<OutlineChanges, Fail> {
-        compare(before, after, &mut Budget::new(Limits::default()))
+        run_with(before, after, &[(0, 0), (1, 1), (2, 2)])
+    }
+
+    fn run_with(before: &[OutlineEntry], after: &[OutlineEntry], pages: &[(usize, usize)]) -> Result<OutlineChanges, Fail> {
+        compare(before, after, &pages.iter().copied().collect(), &mut Budget::new(Limits::default()))
     }
 
     #[test]
     fn entries_pair_by_depth_and_title_then_by_place() {
         let base = [entry(0, "Parties", 0), entry(0, "Scope", 1), entry(1, "Goods", 1), entry(0, "Term", 2)];
         assert_eq!(run(&base, &base).unwrap(), OutlineChanges::default());
-        // Page 2 deleted: its entry lost its destination, the one after it follows the page.
+        // Page 2 deleted: its entries lost their destination, the one after it follows the page.
         let mut deleted = base.clone();
         deleted[1].destination = Destination::None;
         deleted[2].destination = Destination::None;
         deleted[3].destination = Destination::Page(1, [0; 32]);
-        assert_eq!(run(&base, &deleted).unwrap(), OutlineChanges { destinations_changed: 3, ..OutlineChanges::default() });
+        let after_delete = [(0, 0), (2, 1)];
+        assert_eq!(run_with(&base, &deleted, &after_delete).unwrap(), OutlineChanges { destinations_changed: 3, ..OutlineChanges::default() });
+        // A destination that stays on its number while its page went is not where it was.
+        let mut stale = deleted.clone();
+        stale[3].destination = Destination::Page(2, [0; 32]);
+        assert!(run_with(&base, &stale, &after_delete).is_err());
+        // Losing a destination whose page is still there, another page, another view, gaining one.
+        let mut lost = base.clone();
+        lost[0].destination = Destination::None;
+        assert!(run(&base, &lost).is_err());
+        let mut retargeted = base.clone();
+        retargeted[0].destination = Destination::Page(2, [0; 32]);
+        assert!(run(&base, &retargeted).is_err());
+        let mut zoomed = base.clone();
+        zoomed[0].destination = Destination::Page(0, [9; 32]);
+        assert!(run(&base, &zoomed).is_err());
+        let mut gained = base.clone();
+        gained[1].destination = Destination::None;
+        assert!(run(&gained, &base).is_err());
+        // Pages moved: every destination follows its page.
+        let mut moved = base.clone();
+        moved[0].destination = Destination::Page(1, [0; 32]);
+        moved[1].destination = Destination::Page(2, [0; 32]);
+        moved[2].destination = Destination::Page(2, [0; 32]);
+        moved[3].destination = Destination::Page(0, [0; 32]);
+        assert_eq!(
+            run_with(&base, &moved, &[(0, 1), (1, 2), (2, 0)]).unwrap(),
+            OutlineChanges { destinations_changed: 4, ..OutlineChanges::default() }
+        );
         // A title changed in place.
         let mut renamed = base.clone();
         renamed[2].title = Some(b"Products".to_vec());
@@ -151,5 +211,8 @@ mod tests {
         let mut acting = changed.clone();
         acting[3].acts = true;
         assert!(run(&base, &acting).is_err());
+        let mut outside = changed.clone();
+        outside[3].destination = Destination::Other([3; 32]);
+        assert!(run(&base, &outside).is_err());
     }
 }

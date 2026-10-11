@@ -848,9 +848,56 @@ fn outline_titles_entries_and_other_changes() {
     assert_eq!(run(&base, &added).unwrap().outlines, OutlineChanges { added: 1, ..OutlineChanges::default() });
     let removed = update_objects(&base, &[(12, b"<< /Title (Term) /Parent 3 0 R /Prev 11 0 R /Dest [6 0 R /Fit] >>".to_vec())], 14);
     assert_eq!(run(&base, &removed).unwrap().outlines, OutlineChanges { removed: 1, ..OutlineChanges::default() });
-    // A destination moved to another page.
-    let retargeted = update_objects(&base, &[(10, b"<< /Title (Parties) /Parent 3 0 R /Next 11 0 R /Dest [6 0 R /XYZ 0 300 0] >>".to_vec())], 14);
-    assert_eq!(run(&base, &retargeted).unwrap().outlines, OutlineChanges { destinations_changed: 1, ..OutlineChanges::default() });
+    // A destination changed other than by following its page: to another page, another
+    // position or zoom, a named destination, another file, or gaining an action.
+    let entry = |rest: &str| update_objects(&base, &[(10, format!("<< /Title (Parties) /Parent 3 0 R /Next 11 0 R {rest} >>").into_bytes())], 14);
+    for (case, rest) in [
+        ("another page", "/Dest [6 0 R /XYZ 0 300 0]"),
+        ("another position", "/Dest [4 0 R /XYZ 0 200 0]"),
+        ("another zoom", "/Dest [4 0 R /XYZ 0 300 2]"),
+        ("a named destination", "/Dest (Parties)"),
+        ("a page by number", "/Dest [0 /XYZ 0 300 0]"),
+        ("no destination", ""),
+        ("another file", "/A << /S /GoToR /F (other.pdf) /D [0 /Fit] >>"),
+        ("a web address", "/A << /S /URI /URI (https://example.com) >>"),
+        ("a program", "/A << /S /Launch /F (calc.exe) >>"),
+        ("a script", "/A << /S /JavaScript /JS (app.alert(1)) >>"),
+        ("an action and the destination", "/Dest [4 0 R /XYZ 0 300 0] /A << /S /URI /URI (https://example.com) >>"),
+        ("a go-to that chains another action", "/A << /S /GoTo /D [4 0 R /XYZ 0 300 0] /Next << /S /URI /URI (https://example.com) >> >>"),
+    ] {
+        assert!(matches!(run(&base, &entry(rest)), Err(InspectError::Edited(message)) if message.contains("outline entry")), "{case}");
+    }
+    // The same destination written as a go-to action is the same destination.
+    let as_action = entry("/A << /S /GoTo /D [4 0 R /XYZ 0 300 0] >>");
+    assert_eq!(run(&base, &as_action).unwrap().outlines, OutlineChanges::default());
+    // What a named destination names is the catalog's /Dests or /Names, compared whole.
+    for (case, catalog) in [
+        ("/Dests", "<< /Type /Catalog /Pages 2 0 R /Outlines 3 0 R /PageMode /UseOutlines /Dests << /Parties [6 0 R /Fit] >> >>"),
+        (
+            "/Names",
+            "<< /Type /Catalog /Pages 2 0 R /Outlines 3 0 R /PageMode /UseOutlines /Names << /Dests << /Names [(Parties) [6 0 R /Fit]] >> >> >>",
+        ),
+    ] {
+        let named = update_objects(&base, &[(1, catalog.as_bytes().to_vec())], 14);
+        assert!(edited_error(run(&base, &named)).contains(case), "{case}");
+    }
+    // The outline's root dictionary.
+    let root = update_objects(
+        &base,
+        &[(3, b"<< /Type /Outlines /First 10 0 R /Last 12 0 R /Count 4 /A << /S /URI /URI (https://example.com) >> >>".to_vec())],
+        14,
+    );
+    assert!(edited_error(run(&base, &root)).contains("outline's root"));
+    // An added entry going outside the file's pages.
+    let added_outside = update_objects(
+        &base,
+        &[
+            (12, b"<< /Title (Term) /Parent 3 0 R /Prev 11 0 R /Next 14 0 R /First 13 0 R /Last 13 0 R /Count 1 /Dest [6 0 R /Fit] >>".to_vec()),
+            (14, b"<< /Title (Elsewhere) /Parent 3 0 R /Prev 12 0 R /Dest [7 /Fit] >>".to_vec()),
+        ],
+        15,
+    );
+    assert!(edited_error(run(&base, &added_outside)).contains("added outline entry"));
     // What no fact reports fails: a style changed, an action that is not a destination.
     let styled = update_objects(&base, &[(10, b"<< /Title (Parties) /Parent 3 0 R /Next 11 0 R /F 2 /Dest [4 0 R /XYZ 0 300 0] >>".to_vec())], 14);
     assert!(edited_error(run(&base, &styled)).contains("outline entry"));
