@@ -19,7 +19,9 @@ const COMMANDS: &[(&str, &str, Command)] = &[
     ("layers", "Enforce the crate dependency layering (plan/architecture.md §3)", gates::layers),
     ("wasm", "cargo check --target wasm32-unknown-unknown for every crate below L8 and the WebAssembly apps", gates::wasm),
     ("deny", "Dependency licences, bans, sources and advisories (deny.toml; needs cargo-deny)", gates::deny),
-    ("ci", "fmt --check, clippy -D warnings, test, layers, wasm, assets, deny, parity (stops at first failure)", gates::ci),
+    // Embed build: `embed`, and its step in `ci`.
+    ("embed", "Test the embed build's shipped configuration (ui-egui without default features) and clippy pdfcraft-embed on wasm32", gates::embed),
+    ("ci", "fmt --check, clippy -D warnings, test, layers, wasm, embed, assets, deny, parity (stops at first failure)", gates::ci),
     ("assets", "Enforce the asset policy (AGENTS.md §1) against ATTRIBUTION.toml; --write regenerates ATTRIBUTION.md", assets::run),
     ("corpus", "Fetch test corpora into corpus/ (git-ignored): pdf.js test PDFs", gates::corpus),
     ("check", "Robustness sweep over corpus/ with pdfcraft-cli; fails on crashes or regressions vs xtask/baselines", gates::check),

@@ -105,6 +105,8 @@ pub fn ci(_: &[String]) -> anyhow::Result<()> {
         ("test", Box::new(|| run_args(&["test", "--workspace"]))),
         ("layers", Box::new(|| layers(&[]))),
         ("wasm", Box::new(|| wasm(&[]))),
+        // Embed build: the configuration the module ships (see `embed`).
+        ("embed", Box::new(|| embed(&[]))),
         ("assets", Box::new(|| crate::assets::run(&[]))),
         ("deny", Box::new(|| deny(&[]))),
         ("parity", Box::new(|| crate::parity::run(&[]))),
@@ -118,6 +120,27 @@ pub fn ci(_: &[String]) -> anyhow::Result<()> {
     }
     println!("\nCI: all {} steps passed", steps.len());
     Ok(())
+}
+
+/// Embed build: the configuration the module ships, which `cargo test --workspace` never builds,
+/// because the apps turn ui-egui's default features (`brand`) back on. Runs ui-egui's unit tests
+/// and every `tests/embed_*.rs` without default features, then clippy for pdfcraft-embed on wasm32.
+pub fn embed(_: &[String]) -> anyhow::Result<()> {
+    let mut tests: Vec<String> = std::fs::read_dir(root().join("crates/ui-egui/tests"))
+        .context("crates/ui-egui/tests")?
+        .filter_map(Result::ok)
+        .filter_map(|e| e.file_name().to_str().and_then(|n| n.strip_suffix(".rs")).filter(|n| n.starts_with("embed_")).map(str::to_owned))
+        .collect();
+    tests.sort();
+    if tests.is_empty() {
+        bail!("no crates/ui-egui/tests/embed_*.rs found");
+    }
+    let mut args = vec!["test", "--locked", "-p", "pdfcraft-ui-egui", "--no-default-features", "--lib"];
+    for test in &tests {
+        args.extend(["--test", test.as_str()]);
+    }
+    run_args(&args)?;
+    run_args(&["clippy", "--locked", "--target", "wasm32-unknown-unknown", "-p", "pdfcraft-embed", "--", "-D", "warnings"])
 }
 
 /// Dependency licences, bans, sources and advisories (`deny.toml`). Skipped with a hint when
