@@ -466,3 +466,98 @@ fn files_both_readers_read_alike_are_not_refused() {
         assert!(inspect(&sound(), &file, InspectLimits::default()).is_ok(), "{case}");
     }
 }
+
+// ── audit of the appended-update path ───────────────────────────────────────────────────────
+
+/// An object an update writes: its number and body.
+type Written<'a> = (u32, &'a [u8]);
+
+/// `base` with an update appended holding `objects` (number, body), whose section has `/Prev`
+/// `prev` (`None`: none) and the trailer entries `extra`.
+fn update_section(base: &[u8], objects: &[(u32, &[u8])], prev: Option<usize>, extra: &str) -> Vec<u8> {
+    let mut out = base.to_vec();
+    let mut rows = Vec::new();
+    for (num, body) in objects {
+        rows.push((*num, out.len()));
+        out.extend_from_slice(format!("{num} 0 obj\n").as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    rows.sort_unstable();
+    let xref = out.len();
+    out.extend_from_slice(b"xref\n0 1\n0000000000 65535 f \n");
+    for (num, offset) in rows {
+        out.extend_from_slice(format!("{num} 1\n{offset:010} 00000 n \n").as_bytes());
+    }
+    let prev = prev.map(|prev| format!("/Prev {prev}")).unwrap_or_default();
+    out.extend_from_slice(format!("trailer\n<< /Size 9 /Root 1 0 R {prev} {extra} >>\nstartxref\n{xref}\n%%EOF\n").as_bytes());
+    out
+}
+
+/// The offset `startxref` names in `file`.
+fn last_section(file: &[u8]) -> usize {
+    let at = file.windows(9).rposition(|w| w == b"startxref").unwrap();
+    std::str::from_utf8(&file[at + 9..]).unwrap().split_whitespace().next().unwrap().parse().unwrap()
+}
+
+#[test]
+fn an_update_whose_chain_does_not_reach_the_base_s_last_section_is_refused() {
+    // The edited file starts with the base's bytes, but its newest section does not lead back to
+    // the base's newest section at exactly its offset: not an appended update of this base.
+    let first = sound();
+    let base = appended(&first, 4, &String::from_utf8(stream("", &text("Bravo"))).unwrap());
+    let page = format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Rotate 90 {RESOURCES} >>");
+    let page = page.as_bytes();
+    // (case, /Prev)
+    for (case, prev) in [
+        ("no /Prev", None),
+        ("the base's older section, skipping its newest", Some(last_section(&first))),
+        ("an offset inside the base that is no section", Some(object_offset(&base, 3))),
+    ] {
+        let edited = update_section(&base, &[(3, page)], prev, "");
+        assert!(matches!(inspect(&base, &edited, InspectLimits::default()), Err(InspectError::Edited(_))), "{case}");
+    }
+    // Chained onto the base's newest section: a rotation.
+    let edited = update_section(&base, &[(3, page)], Some(last_section(&base)), "");
+    let inspection = inspect(&base, &edited, InspectLimits::default()).unwrap();
+    assert!(inspection.base_kept && inspection.pages.rotated == 1, "{inspection:?}");
+}
+
+#[test]
+fn an_update_that_writes_an_object_nothing_compares_is_refused() {
+    // Every object an appended update writes must be one the comparison reads, so compared
+    // under the appended-update rules. On e91797d each of these was reported as unchanged.
+    let mut b = Builder::new();
+    b.object(1, b"<< /Type /Catalog /Pages 2 0 R /Metadata 5 0 R /StructTreeRoot 7 0 R >>");
+    b.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 300] >>");
+    b.object(3, format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R {RESOURCES} >>").as_bytes());
+    b.object(4, &stream("", &text("Alpha")));
+    b.object(5, &stream("/Type /Metadata /Subtype /XML", b"<x:xmpmeta xmlns:x='adobe:ns:meta/'/>"));
+    b.object(6, b"<< /Title (Agreement) >>");
+    b.object(7, b"<< /Type /StructTreeRoot >>");
+    let rows = b.offsets.clone();
+    let base = b.finish(8, &rows, "/Info 6 0 R");
+    let prev = Some(last_section(&base));
+    let metadata = stream("/Type /Metadata /Subtype /XML", b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><other/></x:xmpmeta>");
+    // The page drawing the same content from a new object, and its old content object written
+    // again with other data: the page is unchanged, the old object read by nothing.
+    let page = format!("<< /Type /Page /Parent 2 0 R /Contents 8 0 R {RESOURCES} >>").into_bytes();
+    let content = stream("", &text("Alpha"));
+    let cases: [(&str, Vec<Written<'_>>); 4] = [
+        ("an object nothing refers to", vec![(8, b"<< /Note (hidden) >>")]),
+        ("a base object nothing refers to any more", vec![(3, &page), (8, &content), (4, b"<< /Note (hidden) >>")]),
+        ("the XMP metadata", vec![(5, &metadata)]),
+        ("the structure tree", vec![(7, b"<< /Type /StructTreeRoot /K [] >>")]),
+    ];
+    for (case, objects) in cases {
+        let edited = update_section(&base, &objects, prev, "/Info 6 0 R");
+        match inspect(&base, &edited, InspectLimits::default()) {
+            Err(InspectError::Edited(message)) => assert!(message.contains("nothing this comparison reports reads"), "{case}: {message}"),
+            other => panic!("{case}: {other:?}"),
+        }
+    }
+    // The document information, which the editor restamps on every save: accepted.
+    let edited = update_section(&base, &[(6, b"<< /Title (Agreement) /ModDate (D:20231114221320Z) >>")], prev, "/Info 6 0 R");
+    let inspection = inspect(&base, &edited, InspectLimits::default()).unwrap();
+    assert_eq!((inspection.text, inspection.content), (TextChanges::default(), ContentChanges::default()), "{inspection:?}");
+}

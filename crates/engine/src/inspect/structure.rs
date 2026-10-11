@@ -45,8 +45,10 @@ const PAGE_OWN_KEYS: [&[u8]; 7] = [b"Parent", b"Annots", b"Rotate", b"Contents",
 ///   is compared name by name too);
 /// - `/Metadata` (the XMP packet), `/StructTreeRoot` and `/MarkInfo` (tags), `/Version` (the PDF
 ///   version): nothing a viewer draws, and editors update them on ordinary saves (a redaction
-///   cleans tags; a save may restamp metadata). Left out deliberately, so a changed `/Metadata`
-///   can carry different document information with no trace in the result.
+///   cleans tags; a save may restamp metadata). Left out deliberately, so in a rewrite a changed
+///   `/Metadata` can carry different document information with no trace in the result. (An
+///   appended update may write only objects the comparison reads: one that writes the metadata
+///   or the structure tree fails, see `inspect::check_update_read`.)
 const CATALOG_REPORTED: [&[u8]; 9] =
     [b"Pages", b"AcroForm", b"OCProperties", b"Outlines", b"Dests", b"Metadata", b"StructTreeRoot", b"MarkInfo", b"Version"];
 
@@ -2501,6 +2503,11 @@ impl Known {
             .collect();
         read.sort_unstable();
         read
+    }
+
+    /// Whether object `num` was read here (see [`Known::objects_read`]).
+    pub fn was_read(&self, num: u32) -> bool {
+        self.checked.contains_key(&num)
     }
 
     /// The first stream whose `/Length` is not its data's length that hayro did not read as the

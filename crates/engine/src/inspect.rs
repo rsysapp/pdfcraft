@@ -45,8 +45,12 @@
 //!   only where hayro read the same data;
 //! - streams are compared by their decoded data only where hayro decoded them and the readers
 //!   agree, everywhere else by their encoded bytes and encoding (see `structure`);
-//! - an appended update must leave every base page's content and resources as they were (edit
-//!   mode never writes page content there); a rewrite is accepted only as an applied redaction,
+//! - an appended update must chain onto the base's own cross-reference sections (its newest
+//!   section's `/Prev` chain reaching the base's newest section at exactly its offset), and every
+//!   object it writes must be one this comparison reads (bar its own cross-reference streams and
+//!   the trailer's `/Info`), so that each is compared under the appended-update rules; it must
+//!   leave every base page's content and resources as they were (edit mode never writes page
+//!   content there); a rewrite is accepted only as an applied redaction,
 //!   checked visually (every changed pixel lies inside a uniformly filled black rectangle), glyph
 //!   by glyph (a glyph is its text and its place; every removed glyph lies under a box, and none
 //!   is added), image by image at each image's own resolution (pixels outside the boxes are
@@ -756,8 +760,10 @@ fn read_side(bytes: &[u8], against: Option<(&[u8], &Structure, bool)>, placement
         budget.object()?;
     }
     let (resolved, unread) = side.hayro.read_objects(&read);
+    // An object hayro cannot read is accepted only where `pdfcraft_cos` reads it as null: one
+    // `pdfcraft_cos` cannot read now either is refused, not passed over.
     if let Some((num, generation)) =
-        unread.into_iter().find(|(num, _)| doc.try_get(*num).is_ok_and(|object| !matches!(*object, pdfcraft_cos::Object::Null)))
+        unread.into_iter().find(|(num, _)| !doc.try_get(*num).is_ok_and(|object| matches!(*object, pdfcraft_cos::Object::Null)))
     {
         return Err(Fail::Read(format!("readers disagree: hayro cannot read object {num} {generation} R")));
     }
@@ -771,6 +777,11 @@ fn read_side(bytes: &[u8], against: Option<(&[u8], &Structure, bool)>, placement
         return Err(Fail::Read(format!("stream {stream} does not have the length it declares")));
     }
     side.structure.misdeclared = known.misdeclared_at(&doc);
+    // An appended update is compared by what the comparison reads: every object it writes must
+    // be one of them (audit of the appended-update path).
+    if let Some((base_bytes, _, true)) = against {
+        check_update_read(&doc, base_bytes, &side.structure.sections, &known, budget)?;
+    }
     if placements {
         structure::retain_shared_forms(&mut side.structure.pages);
     }
@@ -779,6 +790,47 @@ fn read_side(bytes: &[u8], against: Option<(&[u8], &Structure, bool)>, placement
         return Err(Fail::Read("the file's cross-reference data is damaged".into()));
     }
     Ok(side)
+}
+
+/// Every object an appended update writes (an in-use cross-reference entry other than the base
+/// revision's for that number) must be one this comparison read, and so compared under the
+/// appended-update rules: an object nothing reads could change what a reader shows through a path
+/// this comparison does not follow, and no fact would say so. Left out: the cross-reference
+/// streams of the update's own sections, and the trailer's `/Info` dictionary (document
+/// information, restamped by the editor on every save, which no viewer draws; like `/Metadata`,
+/// see `structure`). Freed objects are not checked: a reference to one reads null, which the
+/// facts compare.
+fn check_update_read(
+    doc: &Document,
+    base: &[u8],
+    sections: &[structure::Section],
+    known: &structure::Known,
+    budget: &mut Budget,
+) -> Result<(), Fail> {
+    let base_doc = match catch_unwind(AssertUnwindSafe(|| Document::open(Arc::new(base.to_vec())))) {
+        Ok(Ok(base_doc)) => base_doc,
+        _ => return Err(Fail::Read("the base could not be read again to check the update".into())),
+    };
+    let info = match doc.trailer().get(b"Info") {
+        Some(pdfcraft_cos::Object::Ref(info)) => Some(info.num),
+        _ => None,
+    };
+    let section_offsets: BTreeSet<u64> = sections.iter().map(|section| section.offset).collect();
+    for num in doc.object_numbers() {
+        budget.tick()?;
+        let entry = doc.xref_entry(num);
+        if entry == base_doc.xref_entry(num) || Some(num) == info || known.was_read(num) {
+            continue;
+        }
+        match entry {
+            Some(pdfcraft_cos::XrefEntry::InFile { offset, .. }) if section_offsets.contains(&offset) => {}
+            Some(pdfcraft_cos::XrefEntry::InFile { .. } | pdfcraft_cos::XrefEntry::InStream { .. }) => {
+                return Err(Fail::Read(format!("the update writes object {num}, which nothing this comparison reports reads")));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Whether `bytes` hold the name `/Encrypt` (not `/EncryptMetadata`).
@@ -914,7 +966,7 @@ fn similarities(
     // page sharing it a list item (lists at most half full), held until the pairing ends.
     let mut index: HashMap<u64, Vec<(usize, u32)>> = HashMap::new();
     for &page in base_free {
-        let Some(facts) = before.get(page) else { continue };
+        let Some(facts) = before.get(page) else { return Err(Fail::Read("a page went missing".into())) };
         let found = features(facts, budget)?;
         for (key, count) in found {
             budget.pairing_hold(INDEX_ITEM_BYTES)?;
@@ -928,7 +980,7 @@ fn similarities(
     }
     let mut out = Vec::new();
     for &other in edited_free {
-        let Some(facts) = after.get(other) else { continue };
+        let Some(facts) = after.get(other) else { return Err(Fail::Read("a page went missing".into())) };
         let found = features(facts, budget)?;
         let total: i64 = found.values().map(|count| i64::from(*count)).sum();
         let mut shared: BTreeMap<usize, i64> = BTreeMap::new();
@@ -1307,7 +1359,9 @@ pub const MAX_VIEW_GROUPS: usize = 6;
 /// each view rendered without the content its groups and membership dictionaries hide there.
 /// Views that hide nothing on either page are the render of every layer, compared already.
 fn layer_views_differ(before: &Side, after: &Side, pair: (usize, usize), budget: &mut Budget) -> Result<bool, InspectError> {
-    let (Some(b), Some(e)) = (before.structure.pages.get(pair.0), after.structure.pages.get(pair.1)) else { return Ok(false) };
+    let (Some(b), Some(e)) = (before.structure.pages.get(pair.0), after.structure.pages.get(pair.1)) else {
+        return Err(InspectError::Edited("a page went missing".into()));
+    };
     let mut groups = BTreeSet::new();
     b.layers.groups(&mut groups);
     e.layers.groups(&mut groups);
@@ -1382,7 +1436,9 @@ fn compare_pages(
     let mut counts = PageCounts::default();
     for &(old, new) in pairs {
         budget.time().map_err(|fail| fail.of(Role::Edited))?;
-        let (Some(b), Some(e)) = (before.structure.pages.get(old), after.structure.pages.get(new)) else { continue };
+        let (Some(b), Some(e)) = (before.structure.pages.get(old), after.structure.pages.get(new)) else {
+            return Err(InspectError::Edited("a page went missing".into()));
+        };
         let drawn_differently = b.content != e.content || b.resources != e.resources || b.other != e.other || layers_changed;
         // R6b-36: readers apply `/Usage` differently (PDFium applies `/Usage /View /ViewState`
         // before `/D`, so its default view is not the one `/D` gives), so no fact about a changed
