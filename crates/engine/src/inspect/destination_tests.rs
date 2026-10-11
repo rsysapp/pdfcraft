@@ -395,6 +395,47 @@ fn named_destinations_follow_their_pages() {
     assert!(refused(run(&base, &scripted)).contains("/Names"));
 }
 
+#[test]
+fn a_redaction_and_a_page_delete_on_a_file_with_named_destinations_are_accepted() {
+    // R6b-37, the reviewer's I-A (`i4_named_destinations`): the Session's rewrite writes the name
+    // of a deleted page as `(p1) [null /XYZ 0 300 0]`, a destination whose page is null. e91797d
+    // read that as another destination and refused the save; it goes to the page that was
+    // deleted, and is reported as having followed it.
+    for tree in [true, false] {
+        let form = if tree { "/Names /Dests" } else { "/Dests" };
+        let base = named(tree);
+        // (case, pages redacted, page deleted, page delete first)
+        for (case, redacted, deleted, delete_first) in [
+            ("redact 3, delete 1", vec![2], 0, false),
+            ("delete 1, then redact 3", vec![2], 0, true),
+            ("redact 3 and 4, delete 1", vec![2, 3], 0, false),
+        ] {
+            let mut edits: Vec<Edit> = Vec::new();
+            if delete_first {
+                edits.push(Edit::DeletePages { pages: vec![deleted] });
+            }
+            for &page in &redacted {
+                // After the delete, the pages are one earlier.
+                let page = if delete_first && page > deleted { page - 1 } else { page };
+                edits.extend(redact_number(page));
+            }
+            if !delete_first {
+                edits.push(Edit::DeletePages { pages: vec![deleted] });
+            }
+            let inspection = run(&base, &session(&base, edits)).unwrap_or_else(|error| panic!("{form}, {case}: {error:?}"));
+            assert_eq!(inspection.pages, PageChanges { before: 4, after: 3, deleted: 1, ..PageChanges::default() }, "{form}, {case}: {inspection:?}");
+            assert_eq!(inspection.destinations, DestinationChanges { named: 4, links: 0 }, "{form}, {case}: {inspection:?}");
+            assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{form}, {case}: {inspection:?}");
+            assert_eq!(inspection.redaction_areas.len(), redacted.len(), "{form}, {case}: {inspection:?}");
+        }
+    }
+    // A null page where the base page is still there is not a deleted page's destination.
+    let base = named(true);
+    let all = "(p1) [null /XYZ 0 300 0] (p2) [11 0 R /XYZ 0 300 0] (p3) [12 0 R /XYZ 0 300 0] (p4) [13 0 R /XYZ 0 300 0]";
+    let edited = update_objects(&base, &[(40, &format!("<< /Names [{all}] /Limits [(p1) (p4)] >>"))], 43);
+    assert!(refused(run(&base, &edited)).contains("named destination"));
+}
+
 /// Four pages; page 1 links to page 3 (object 43) by `/Dest`, or by a go-to action.
 fn linked(action: bool) -> Vec<u8> {
     let target = if action { "/A << /S /GoTo /D [12 0 R /Fit] >>" } else { "/Dest [12 0 R /Fit]" };

@@ -258,8 +258,9 @@ pub(crate) enum Destination {
     /// An explicit destination to one of this file's pages: the page's index and the view (the
     /// rest of the array: the fit, position and zoom).
     Page(usize, Digest),
-    /// An explicit destination whose page reference names no page of this file (a page deleted
-    /// and freed, or an object outside the page tree): it goes nowhere. The view, as for `Page`.
+    /// An explicit destination whose page is `null` or a reference that names no page of this
+    /// file (a page deleted and freed, or an object outside the page tree): it goes nowhere. The
+    /// view, as for `Page`.
     Unpaged(Digest),
     /// A named destination (a name or a string), by its digest: what it names is the catalog's
     /// `/Dests` or the `/Names /Dests` tree, compared name by name (see
@@ -2190,13 +2191,20 @@ impl Reader<'_, '_> {
     }
 
     /// An explicit destination by its page's index and its view; anything else by its digest.
+    /// A page that is `null`, or a reference that names no page of this file (a missing object
+    /// among them), goes nowhere: `Unpaged` (R6b-37; an editor writes a deleted page's named
+    /// destination so).
     fn destination(&mut self, dest: &Object, pages: &HashMap<ObjRef, usize>) -> Result<Destination, Fail> {
         let resolved = self.resolve(dest)?;
         if let Object::Array(items) = &*resolved
-            && let Some(Object::Ref(page)) = items.first()
+            && let Some(page @ (Object::Ref(_) | Object::Null)) = items.first()
         {
             let view = self.digest(&Object::Array(items.iter().skip(1).cloned().collect()))?;
-            return Ok(match pages.get(page) {
+            let index = match page {
+                Object::Ref(page) => pages.get(page),
+                _ => None,
+            };
+            return Ok(match index {
                 Some(index) => Destination::Page(*index, view),
                 None => Destination::Unpaged(view),
             });

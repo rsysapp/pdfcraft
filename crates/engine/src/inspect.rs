@@ -248,8 +248,8 @@ pub struct OutlineChanges {
 /// Named destinations and links' destinations that followed their page (R6b-32), as outline
 /// destinations do (see [`OutlineChanges::destinations_changed`]): the same page, at the same
 /// view, now at another page number (a page deleted or moved before it), or, where its page was
-/// deleted, going nowhere (no destination, or a page reference that names no page of the file)
-/// or, for a named destination, the name gone. A host may accept these as part of a page delete
+/// deleted, going nowhere (no destination, a `null` page, or a page reference that names no page
+/// of the file: R6b-37) or, for a named destination, the name gone. A host may accept these as part of a page delete
 /// or move. Any other change of a destination fails the inspection: another page, another view,
 /// a destination gained, a named destination added, removed (its page still there) or retargeted.
 /// A name tree that viewers could resolve differently (keys out of order or named twice,

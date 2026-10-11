@@ -96,8 +96,8 @@ pub(crate) fn compare(
 }
 
 /// Whether a destination `after` followed its page from `before` (`true`: its page number
-/// changed, or its page was deleted and it goes nowhere now: it has none, or its page reference
-/// names no page of the file), stayed as it was (`false`), or changed otherwise (an error:
+/// changed, or its page was deleted and it goes nowhere now: it has none, or its page is `null`
+/// or a reference that names no page of the file), stayed as it was (`false`), or changed otherwise (an error:
 /// another page, another view, a destination gained, a named or external destination changed).
 /// Outline entries, named destinations and links' destinations all follow this rule.
 pub(crate) fn followed(before: &Destination, after: &Destination, pages: &BTreeMap<usize, usize>) -> Result<bool, Fail> {
