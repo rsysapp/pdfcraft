@@ -27,49 +27,74 @@ pub struct OutlineFontData {
     pub is_monospace: bool,
 }
 
-pub(crate) struct OutlinePath(BezPath);
+pub(crate) struct OutlinePath {
+    path: BezPath,
+    /// Embed build: the most elements kept (`MAX_OUTLINE_ELEMENTS` under a work budget), and
+    /// whether the outline had more.
+    limit: usize,
+    overflowed: bool,
+}
 
 impl OutlinePath {
     pub(crate) fn new() -> Self {
-        Self(BezPath::new())
+        let limit = if crate::context::budgeted() { crate::context::MAX_OUTLINE_ELEMENTS } else { usize::MAX };
+        Self { path: BezPath::new(), limit, overflowed: false }
     }
 
+    /// Embed build: the outline, or an empty one when it had more elements than allowed (the
+    /// work budget is then spent: the interpretation is too complex).
     pub(crate) fn take(self) -> BezPath {
-        self.0
+        if self.overflowed {
+            let _ = crate::context::spend_work(u64::MAX);
+            return BezPath::new();
+        }
+        self.path
+    }
+
+    /// Embed build: room for one more element.
+    #[inline]
+    fn room(&mut self) -> bool {
+        if self.path.elements().len() >= self.limit {
+            self.overflowed = true;
+            return false;
+        }
+        true
     }
 }
 
 impl OutlinePen for OutlinePath {
     #[inline]
     fn move_to(&mut self, x: f32, y: f32) {
-        self.0.move_to((x, y));
+        if self.room() {
+            self.path.move_to((x, y));
+        }
     }
 
     #[inline]
     fn line_to(&mut self, x: f32, y: f32) {
-        if !self.0.elements().is_empty() {
-            self.0.line_to((x, y));
+        if !self.path.elements().is_empty() && self.room() {
+            self.path.line_to((x, y));
         }
     }
 
     #[inline]
     fn quad_to(&mut self, cx: f32, cy: f32, x: f32, y: f32) {
-        if !self.0.elements().is_empty() {
-            self.0.quad_to((cx, cy), (x, y));
+        if !self.path.elements().is_empty() && self.room() {
+            self.path.quad_to((cx, cy), (x, y));
         }
     }
 
     #[inline]
     fn curve_to(&mut self, cx0: f32, cy0: f32, cx1: f32, cy1: f32, x: f32, y: f32) {
-        if !self.0.elements().is_empty() {
-            self.0.curve_to((cx0, cy0), (cx1, cy1), (x, y));
+        if !self.path.elements().is_empty() && self.room() {
+            self.path.curve_to((cx0, cy0), (cx1, cy1), (x, y));
         }
     }
 
     #[inline]
     fn close(&mut self) {
-        if !self.0.elements().is_empty() {
-            self.0.close_path();
+        if !self.path.elements().is_empty() && self.room() {
+            self.path.close_path();
         }
     }
 }

@@ -8,8 +8,10 @@
 //! Work is bounded without a clock: each interpretation (a page's text, a page's render) may do at
 //! most the work budget given to [`ContentDocument::open`] (hayro's `work_budget`: operators,
 //! glyphs, and paints weighed by the device area they cover); past it the call is
-//! [`ContentError::TooComplex`]. [`ContentDocument::work_spent`] totals the work done, so a caller
-//! can bound a whole document too.
+//! [`ContentError::TooComplex`]. Stream decoding (font programs, images, every stream the page
+//! needs) is bounded per interpretation too (`hayro_syntax::budget`, set by the interpreter), and
+//! running out of it is the same. [`ContentDocument::work_spent`] totals the work done, decoding
+//! included, so a caller can bound a whole document too.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -20,6 +22,7 @@ use hayro::hayro_interpret::{
     BlendMode, ClipPath, Context, Device, GlyphDrawMode, Image, InterpreterCache, InterpreterSettings, InterpreterWarning, Paint, PathDrawMode,
     SoftMask, TransformExt, interpret_page, work_spent,
 };
+use hayro::hayro_syntax::budget::{decode_budget_exceeded, decode_spent, set_decode_budget};
 use hayro::hayro_syntax::object::{Array, Dict};
 use hayro::hayro_syntax::{LoadPdfError, Pdf};
 use hayro::vello_cpu::color::palette::css::WHITE;
@@ -214,10 +217,15 @@ impl ContentDocument {
     }
 
     /// After an interpretation: count its work, and refuse it when it ran out of budget or the
-    /// interpreter reported a problem.
+    /// interpreter reported a problem. Its stream decoding counts too (one unit per 256 bytes
+    /// decoded and per 64 units of image codec work, `hayro_syntax::budget`), and running out of
+    /// decoding budget is running out of budget.
     fn finish(&self, number: usize, (warnings, exhausted): (usize, usize)) -> Result<(), ContentError> {
-        self.spent.fetch_add(work_spent(), Ordering::Relaxed);
-        if self.exhausted.load(Ordering::Relaxed) != exhausted {
+        let (bytes, codec) = decode_spent();
+        let decode_exceeded = decode_budget_exceeded();
+        set_decode_budget(u64::MAX, u64::MAX);
+        self.spent.fetch_add(work_spent().saturating_add(bytes / 256).saturating_add(codec / 64), Ordering::Relaxed);
+        if self.exhausted.load(Ordering::Relaxed) != exhausted || decode_exceeded {
             return Err(ContentError::TooComplex);
         }
         if self.warnings() != warnings {
@@ -281,6 +289,8 @@ impl ContentDocument {
     pub fn render_upright(&self, page: usize, long_side: u32) -> Result<UprightRaster, ContentError> {
         let before = self.counts();
         let number = page.saturating_add(1);
+        // A file is parsed afresh without a decoding budget (an interpretation sets its own).
+        set_decode_budget(u64::MAX, u64::MAX);
         let pdf = match catch_unwind(AssertUnwindSafe(|| Pdf::new_with_password(self.bytes.clone(), ""))) {
             Ok(Ok(pdf)) => pdf,
             _ => return Err(ContentError::Unreadable("the file could not be parsed again for rendering".into())),
@@ -405,5 +415,117 @@ mod tests {
         let raster = doc.render_upright(0, 300).unwrap();
         // Upright: 200 × 300 points, longer side 300 pixels, whatever `/Rotate` says.
         assert_eq!((raster.width, raster.height), (200, 300));
+    }
+
+    /// A one-page lopdf document: `content` drawn with `resources`; also returns the object id
+    /// of `extra` (a stream added to the file) when given.
+    fn lopdf_page(content: &[u8], resources: lopdf::Dictionary, extra: Option<lopdf::Stream>) -> (Vec<u8>, Option<(u32, u16)>) {
+        use lopdf::{Document, Object, Stream, dictionary};
+        let mut doc = Document::with_version("1.7");
+        let extra = extra.map(|stream| doc.add_object(stream));
+        let content = doc.add_object(Stream::new(dictionary! {}, content.to_vec()));
+        let pages = doc.new_object_id();
+        let page = doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => pages, "Contents" => content, "Resources" => resources,
+            "MediaBox" => vec![Object::Integer(0), Object::Integer(0), Object::Integer(200), Object::Integer(300)],
+        });
+        doc.objects.insert(pages, dictionary! {"Type" => "Pages", "Kids" => vec![Object::Reference(page)], "Count" => 1}.into());
+        let catalog = doc.add_object(dictionary! {"Type" => "Catalog", "Pages" => pages});
+        doc.trailer.set("Root", catalog);
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        (bytes, extra)
+    }
+
+    #[test]
+    fn decoding_stops_at_the_decode_budget() {
+        use hayro::hayro_syntax::object::{ObjectIdentifier, Stream};
+        let data = b"1 0 0 rg 10 10 20 20 re f\n".repeat(2_000);
+        let mut stream = lopdf::Stream::new(lopdf::dictionary! {}, data.clone());
+        stream.compress().unwrap();
+        let (bytes, id) = lopdf_page(b"", lopdf::dictionary! {}, Some(stream));
+        let (num, generation) = id.unwrap();
+        let pdf = Pdf::new(Arc::new(bytes)).unwrap();
+        let read = || pdf.xref().get::<Stream<'_>>(ObjectIdentifier::new(num as i32, i32::from(generation))).unwrap().decoded().map(|d| d.len());
+        // Without a budget, as before.
+        set_decode_budget(u64::MAX, u64::MAX);
+        assert_eq!(read().ok(), Some(data.len()));
+        assert!(!decode_budget_exceeded());
+        // Under one, decoding stops at it and says so.
+        set_decode_budget(1_024, u64::MAX);
+        assert!(read().is_err());
+        assert!(decode_budget_exceeded());
+        set_decode_budget(u64::MAX, u64::MAX);
+        assert_eq!(read().ok(), Some(data.len()));
+    }
+
+    /// A page showing "Hello" in an embedded TrueType font (Inter).
+    fn embedded_font_page() -> Vec<u8> {
+        use lopdf::{Object, Stream, dictionary};
+        let program = include_bytes!("../../../assets/fonts/Inter-Regular.ttf").to_vec();
+        let mut font_file = Stream::new(dictionary! { "Length1" => program.len() as i64 }, program);
+        font_file.compress().unwrap();
+        let mut doc_bytes = Vec::new();
+        let mut doc = lopdf::Document::with_version("1.7");
+        let file = doc.add_object(font_file);
+        let descriptor = doc.add_object(dictionary! {
+            "Type" => "FontDescriptor", "FontName" => "Inter", "Flags" => 32, "ItalicAngle" => 0, "Ascent" => 900, "Descent" => -200,
+            "CapHeight" => 700, "StemV" => 80, "FontBBox" => vec![Object::Integer(0), Object::Integer(-200), Object::Integer(1000), Object::Integer(900)],
+            "FontFile2" => file,
+        });
+        let widths: Vec<Object> = (32..127).map(|_| Object::Integer(600)).collect();
+        let font = doc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "TrueType", "BaseFont" => "Inter", "FirstChar" => 32, "LastChar" => 126, "Widths" => widths,
+            "Encoding" => "WinAnsiEncoding", "FontDescriptor" => descriptor,
+        });
+        let content = doc.add_object(Stream::new(dictionary! {}, b"BT /F1 24 Tf 20 150 Td (Hello) Tj ET".to_vec()));
+        let pages = doc.new_object_id();
+        let page = doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => pages, "Contents" => content, "Resources" => dictionary! { "Font" => dictionary! { "F1" => font } },
+            "MediaBox" => vec![Object::Integer(0), Object::Integer(0), Object::Integer(200), Object::Integer(300)],
+        });
+        doc.objects.insert(pages, dictionary! {"Type" => "Pages", "Kids" => vec![Object::Reference(page)], "Count" => 1}.into());
+        let catalog = doc.add_object(dictionary! {"Type" => "Catalog", "Pages" => pages});
+        doc.trailer.set("Root", catalog);
+        doc.save_to(&mut doc_bytes).unwrap();
+        doc_bytes
+    }
+
+    #[test]
+    fn an_embedded_font_program_and_its_outlines_are_work() {
+        let file = Arc::new(embedded_font_page());
+        // An ordinary font reads and renders under the inspector's budget, and costs work.
+        let ample = ContentDocument::open(file.clone(), 1_000_000).unwrap();
+        assert_eq!(ample.text(0).unwrap().chars, "Hello".chars().collect::<Vec<_>>());
+        let before = ample.work_spent();
+        assert!(ample.render_upright(0, 300).is_ok());
+        assert!(ample.work_spent() - before > 300, "{}", ample.work_spent() - before);
+        // Parsing the program alone (about 400 KB, one unit per 64 bytes) is past a small budget.
+        let tight = ContentDocument::open(file, 2_000).unwrap();
+        assert!(matches!(tight.render_upright(0, 300), Err(ContentError::TooComplex)));
+    }
+
+    #[test]
+    fn a_soft_mask_past_the_budget_is_too_complex() {
+        use lopdf::{Object, Stream, dictionary};
+        let group = Stream::new(
+            dictionary! { "Type" => "XObject", "Subtype" => "Form", "Group" => dictionary! { "S" => "Transparency", "CS" => "DeviceGray" },
+            "BBox" => vec![Object::Integer(0), Object::Integer(0), Object::Integer(200), Object::Integer(300)] },
+            b"1 g 0 0 1 1 re f".to_vec(),
+        );
+        // Tiny paints: only the mask's canvas costs more than the tight budget below.
+        let (bytes, id) = lopdf_page(b"/GS1 gs 0 0 1 rg 0 0 1 1 re f", dictionary! {}, Some(group));
+        let (num, generation) = id.unwrap();
+        // The page again, now naming the soft mask in its resources.
+        let mut doc = lopdf::Document::load_mem(&bytes).unwrap();
+        let page = *doc.get_pages().values().next().unwrap();
+        let resources = dictionary! { "ExtGState" => dictionary! { "GS1" => dictionary! { "SMask" => dictionary! { "S" => "Luminosity", "G" => Object::Reference((num, generation)) } } } };
+        doc.get_object_mut(page).unwrap().as_dict_mut().unwrap().set("Resources", resources);
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        let file = Arc::new(bytes);
+        assert!(ContentDocument::open(file.clone(), 1_000_000).unwrap().render_upright(0, 300).is_ok());
+        // The mask alone is a canvas of 200 × 300 pixels: about 230 units.
+        assert!(matches!(ContentDocument::open(file, 100).unwrap().render_upright(0, 300), Err(ContentError::TooComplex)));
     }
 }

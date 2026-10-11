@@ -703,12 +703,19 @@ impl Renderer {
     fn cached_outline(&self, glyph: &hayro_interpret::font::OutlineGlyph) -> Rc<BezPath> {
         let id = glyph.identifier().cache_key();
 
-        if let Some(path) = self.outline_cache.borrow().get(&id) {
-            return path.clone();
+        let path = if let Some(path) = self.outline_cache.borrow().get(&id) {
+            path.clone()
+        } else {
+            let path = Rc::new(glyph.outline());
+            self.outline_cache.borrow_mut().insert(id, path.clone());
+            path
+        };
+        // Embed build: drawing a glyph costs its outline's elements (one unit per eight), whatever
+        // its size: the interpreter charges only the area a glyph covers. Past the budget the
+        // glyph is not drawn.
+        if !hayro_interpret::spend_work(path.elements().len() as u64 / 8) {
+            return Rc::new(BezPath::new());
         }
-
-        let path = Rc::new(glyph.outline());
-        self.outline_cache.borrow_mut().insert(id, path.clone());
         path
     }
 
@@ -1066,9 +1073,14 @@ fn shading_allowed(bbox: Rect, evaluation_cost: u64) -> bool {
 }
 
 fn draw_soft_mask(mask: &SoftMask<'_>, settings: RenderSettings, width: u16, height: u16) -> Mask {
-    // Embed build: a soft mask is a canvas-sized rendering, charged by its area (its content's
-    // own work is charged as it is interpreted; past the budget it is skipped).
-    let _ = hayro_interpret::spend_work(3 + u64::from(width) * u64::from(height) / 256);
+    // Embed build: a soft mask is a canvas-sized rendering, charged by its area and by its buffers
+    // (a render context and a pixmap of four bytes a pixel, the mask and its transfer map of one)
+    // before any is made; its content's own work is charged as it is interpreted. Once refused,
+    // the mask is left empty and nothing is drawn into it (the interpretation is too complex).
+    let pixels = u64::from(width) * u64::from(height);
+    if !(hayro_interpret::spend_allocation(pixels.saturating_mul(10)) && hayro_interpret::spend_work(3 + pixels / 256)) {
+        return Mask::from_parts(vec![0; pixels as usize], width, height);
+    }
     let mut renderer = Renderer {
         ctx: RenderContext::new_with(width, height, derive_settings(&settings)),
         inside_pattern: false,

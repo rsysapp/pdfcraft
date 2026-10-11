@@ -30,8 +30,15 @@ impl Debug for Type1FontBlob {
     }
 }
 
+/// Embed build: parsing a font program is work, one unit per 64 bytes (`spend_work`); `None` once
+/// the budget is spent.
+fn charge_program(data: &FontData) -> Option<()> {
+    crate::context::spend_work((data.as_ref().as_ref().len() as u64) / 64).then_some(())
+}
+
 impl Type1FontBlob {
     pub(crate) fn new(data: FontData) -> Option<Self> {
+        charge_program(&data)?;
         let table = Type1Font::new(data.as_ref().as_ref()).ok()?;
         Some(Self(Arc::new(table)))
     }
@@ -60,6 +67,7 @@ impl Debug for CffFontBlob {
 
 impl CffFontBlob {
     pub(crate) fn new(data: FontData) -> Option<Self> {
+        charge_program(&data)?;
         let font = CffFontRef::new(data.as_ref().as_ref(), 0, None).ok()?;
         let cff = Cff::read(ReadFontData::new(data.as_ref().as_ref())).ok()?;
         let charset = font.charset();
@@ -175,6 +183,11 @@ impl Debug for OpenTypeFontBlob {
 
 impl OpenTypeFontBlob {
     pub(crate) fn new(data: FontData, index: u32) -> Option<Self> {
+        charge_program(&data)?;
+        // Embed build: under a work budget, glyphs are not hinted: hinting runs the font's own
+        // programs (up to a million instructions a run), and an unhinted outline is the same
+        // outline for every file compared.
+        let hint = !crate::context::budgeted();
         // Check first whether the font is valid so we can unwrap in the closure.
         let f = FontRef::from_index(data.as_ref().as_ref(), index).ok()?;
         // Reject fonts with invalid post table version, fixes pdf.js issue 9462. Not sure if there
@@ -203,7 +216,7 @@ impl OpenTypeFontBlob {
             Yoke::<OTFYoke<'static>, FontData>::attach_to_cart(data.clone(), |data| {
                 let font_ref = FontRef::from_index(data.as_ref(), index).unwrap();
 
-                let hinting_instance = if font_ref.outline_glyphs().require_interpreter() {
+                let hinting_instance = if hint && font_ref.outline_glyphs().require_interpreter() {
                     HintingInstance::new(
                         &font_ref.outline_glyphs(),
                         Size::new(UNITS_PER_EM),

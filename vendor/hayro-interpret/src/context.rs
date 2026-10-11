@@ -46,6 +46,25 @@ std::thread_local! {
 /// that would go past it is refused before it is allocated, as work past the budget.
 pub const MAX_ALLOCATION: u64 = 256 << 20;
 
+/// Embed build: under a work budget, the most bytes one interpretation's stream decoding may
+/// produce (font programs, images, functions, everything `hayro-syntax` decodes for it), and the
+/// most image codec work it may do (`hayro_syntax::budget`: a DCT or CCITT sample one, a JPEG 2000
+/// sample or a JBIG2 pixel four). Past either, decoding fails and the interpretation is too
+/// complex.
+pub const MAX_DECODED: u64 = 256 << 20;
+/// Embed build: see [`MAX_DECODED`].
+pub const MAX_CODEC_WORK: u64 = 1 << 27;
+
+/// Embed build: under a work budget, the most path elements one glyph outline may have. A
+/// TrueType glyph has at most 65,535 points; a CFF or Type 1 charstring can draw millions (24 a
+/// `rlineto`, up to a million operators), which would be kept and rasterised whole.
+pub const MAX_OUTLINE_ELEMENTS: usize = 1 << 16;
+
+/// Embed build: whether this interpretation has a work budget.
+pub(crate) fn budgeted() -> bool {
+    WORK_BUDGET.with(|b| b.get()) != u64::MAX
+}
+
 /// Embed build: the work done by the latest interpretation on this thread (see
 /// `InterpreterSettings::work_budget`), up to the point it stopped.
 pub fn work_spent() -> u64 {
@@ -177,6 +196,12 @@ impl<'a> Context<'a> {
         WORK_BUDGET.with(|b| b.set(settings.work_budget));
         ALLOCATED.with(|a| a.set(0));
         WORK_SINK.with(|s| *s.borrow_mut() = Some(settings.warning_sink.clone()));
+        // Embed build: and with its stream decoding bounded too (`MAX_DECODED`).
+        if settings.work_budget == u64::MAX {
+            hayro_syntax::budget::set_decode_budget(u64::MAX, u64::MAX);
+        } else {
+            hayro_syntax::budget::set_decode_budget(MAX_DECODED, MAX_CODEC_WORK);
+        }
 
         Self::new_with(initial_transform, bbox, cache, xref, settings, state, 0)
     }

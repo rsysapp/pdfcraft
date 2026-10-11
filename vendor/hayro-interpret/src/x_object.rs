@@ -454,6 +454,15 @@ fn decode_context<'a>(
         })
         .unwrap_or((obj.width, obj.height));
 
+    // Embed build: a codec's own size (JPEG, JPEG 2000, JBIG2) can be larger than the dictionary
+    // says, which is what was charged before decoding (`draw_image`): the rest is charged now, as
+    // pixels to convert (one unit per 64) and four bytes each to keep.
+    let declared = u64::from(obj.width).saturating_mul(u64::from(obj.height));
+    let extra = u64::from(width).saturating_mul(u64::from(height)).saturating_sub(declared);
+    if extra > 0 && !(crate::spend_allocation(extra.saturating_mul(4)) && crate::spend_work(extra / 64)) {
+        return None;
+    }
+
     let color_space = color_space
         .or_else(|| {
             decoded

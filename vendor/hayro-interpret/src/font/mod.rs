@@ -131,7 +131,11 @@ pub struct OutlineGlyph {
 impl OutlineGlyph {
     /// Return the outline of the glyph, assuming an upem value of 1000.
     pub fn outline(&self) -> BezPath {
-        self.font.outline_glyph(self.id, self.char_code)
+        let outline = self.font.outline_glyph(self.id, self.char_code);
+        // Embed build: loading an outline is work: sixteen units, and one per eight elements
+        // (`spend_work`); its elements are bounded by `MAX_OUTLINE_ELEMENTS`.
+        let _ = crate::context::spend_work(16 + outline.elements().len() as u64 / 8);
+        outline
     }
 
     /// Return the identifier of the glyph. You can use this to calculate the cache key
