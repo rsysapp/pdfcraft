@@ -173,6 +173,14 @@ impl<'a> SoftMask<'a> {
         self.0.obj_id
     }
 
+    /// Embed build: which setting of a mask this is. Each `gs` that sets a soft mask makes a new
+    /// one (its group, resources and transformation as they were then); restoring a graphics
+    /// state hands back the same one. Two masks have the same key only while both live, so a
+    /// device that interprets each mask once keeps the masks it has seen.
+    pub fn use_key(&self) -> usize {
+        Rc::as_ptr(&self.0) as usize
+    }
+
     /// Return the underlying mask type.
     pub fn mask_type(&self) -> MaskType {
         self.0.mask_type

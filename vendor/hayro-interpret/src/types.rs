@@ -46,6 +46,17 @@ impl<'a, 'b> StencilImage<'a, 'b> {
         }
     }
 
+    /// Embed build: the underlying stream object (the raw encoded mask data, undecoded), as
+    /// [`RasterImage::stream`] gives it for raster images.
+    pub fn stream(&self) -> &Stream<'_> {
+        self.image_xobject.stream()
+    }
+
+    /// Embed build: the paint the stencil is filled with, without decoding the mask.
+    pub fn paint(&self) -> &Paint<'a> {
+        &self.paint
+    }
+
     // These are hidden since clients are supposed to call get the
     // width/height from `LumaData` instead.
     #[doc(hidden)]

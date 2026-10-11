@@ -1,9 +1,10 @@
 //! Embed build: what a save inspector reads through hayro: the page count, each page's annotation
-//! count, its text (page content only) and an upright render of its content (no annotations,
-//! `/Rotate` ignored). Every answer is certain or an error: a glyph that gives no text, an
-//! interpreter warning (an unsupported font, an image that does not decode) or a renderer panic
-//! fails the call instead of being skipped, and [`ContentDocument::repaired`] says whether the
-//! parser had to rebuild the cross-reference data.
+//! count, the glyphs and images its content draws (page content only, see [`PageContent`]) and an
+//! upright render of its content (no annotations, `/Rotate` ignored). Every answer is certain or
+//! an error: a glyph that gives no text, an image that cannot be identified, an interpreter
+//! warning (an unsupported font, an image that does not decode) or a renderer panic fails the call
+//! instead of being skipped, and [`ContentDocument::repaired`] says whether the parser had to
+//! rebuild the cross-reference data.
 //!
 //! Work is bounded without a clock: each interpretation (a page's text, a page's render) may do at
 //! most the work budget given to [`ContentDocument::open`] (hayro's `work_budget`: operators,
@@ -13,11 +14,13 @@
 //! running out of it is the same. [`ContentDocument::work_spent`] totals the work done, decoding
 //! included, so a caller can bound a whole document too.
 
+use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use hayro::hayro_interpret::font::Glyph;
+use hayro::hayro_interpret::pattern::Pattern;
 use hayro::hayro_interpret::{
     BlendMode, ClipPath, Context, Device, GlyphDrawMode, Image, InterpreterCache, InterpreterSettings, InterpreterWarning, Paint, PathDrawMode,
     SoftMask, TransformExt, interpret_page, work_spent,
@@ -88,22 +91,148 @@ impl PageGlyphs {
     }
 }
 
-/// Records every glyph drawn with its text and its em box in user space.
-struct GlyphDevice {
+/// Where an image the interpreter drew comes from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImageSource {
+    /// An image XObject: its object number and generation, as hayro resolved it.
+    Object { num: u32, generation: u16 },
+    /// An inline image: its dictionary and its encoded data as hayro's content parser delimited
+    /// them (the data ends at the `EI` hayro took for its end).
+    Inline { dict: Arc<[u8]>, data: Arc<[u8]> },
+}
+
+/// One image hayro's interpreter drew: what the renderer is handed for it, in the same
+/// interpretation that renders the page. The placement is hayro's (its `q`/`Q`, `cm`, form
+/// `/Matrix`, …), not tracked beside it. What a clip hides of the image is not said: the whole
+/// image is placed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImageDraw {
+    pub source: ImageSource,
+    /// Image space (the unit square, (0, 0) at the image's lower left) to user space (PDF
+    /// points), `[a b c d e f]` as in a `cm`.
+    pub matrix: [f64; 6],
+    /// Drawn in a tiling pattern's cell, which repeats it over what the pattern paints: `matrix`
+    /// is in the cell's pattern space, not the page's.
+    pub tiled: bool,
+}
+
+/// What a page's content draws that a save inspector compares: its glyphs (the page's own
+/// content) and every image drawn (in the page's content, in form XObjects, in soft masks'
+/// groups and in tiling patterns' cells), in drawing order.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PageContent {
+    pub glyphs: PageGlyphs,
+    pub images: Vec<ImageDraw>,
+}
+
+/// Records, from hayro's interpretation, every glyph drawn with its text and its em box, and every
+/// image drawn with its source and placement, in user space.
+struct PageDevice<'a> {
     /// View space (where the interpreter draws) to user space.
     to_user: kurbo::Affine,
+    /// Whether glyphs are recorded: the page's own content, not what a soft mask's group or a
+    /// pattern's cell draws (those glyphs are not text on the page).
+    with_glyphs: bool,
+    /// Drawing a tiling pattern's cell.
+    tiled: bool,
     found: PageGlyphs,
     /// Glyphs drawn that gave no text (no Unicode value) or no usable box.
     unread: usize,
+    images: Vec<ImageDraw>,
+    /// Images drawn that could not be identified (an object number hayro cannot have read).
+    unidentified: usize,
+    /// Soft masks already interpreted (see `SoftMask::use_key`), kept so their keys stay theirs.
+    masks: Vec<SoftMask<'a>>,
+    mask_keys: HashSet<usize>,
+    /// Inline image bytes already copied, by where hayro holds them: one copy for the uses of an
+    /// inline image in a form drawn many times (checked byte for byte: an address can be reused).
+    inline: HashMap<(usize, usize), Arc<[u8]>>,
 }
 
-impl<'a> Device<'a> for GlyphDevice {
-    fn set_soft_mask(&mut self, _: Option<SoftMask<'a>>) {}
+impl<'a> PageDevice<'a> {
+    fn new(to_user: kurbo::Affine, with_glyphs: bool, tiled: bool) -> Self {
+        Self {
+            to_user,
+            with_glyphs,
+            tiled,
+            found: PageGlyphs::default(),
+            unread: 0,
+            images: Vec::new(),
+            unidentified: 0,
+            masks: Vec::new(),
+            mask_keys: HashSet::new(),
+            inline: HashMap::new(),
+        }
+    }
+
+    fn copied(&mut self, bytes: &[u8]) -> Arc<[u8]> {
+        let key = (bytes.as_ptr() as usize, bytes.len());
+        if let Some(found) = self.inline.get(&key)
+            && **found == *bytes
+        {
+            return found.clone();
+        }
+        let copy: Arc<[u8]> = Arc::from(bytes);
+        self.inline.insert(key, copy.clone());
+        copy
+    }
+
+    /// Interpret what another device draws for this one (a soft mask's group, a pattern's cell)
+    /// and keep the images it draws.
+    fn nested(&mut self, to_user: kurbo::Affine, tiled: bool, draw: impl FnOnce(&mut PageDevice<'a>)) {
+        let mut inner = PageDevice::new(to_user, false, tiled);
+        inner.mask_keys = std::mem::take(&mut self.mask_keys);
+        inner.masks = std::mem::take(&mut self.masks);
+        inner.inline = std::mem::take(&mut self.inline);
+        draw(&mut inner);
+        self.mask_keys = inner.mask_keys;
+        self.masks = inner.masks;
+        self.inline = inner.inline;
+        self.images.append(&mut inner.images);
+        self.unidentified = self.unidentified.saturating_add(inner.unidentified);
+    }
+
+    /// The images a tiling pattern's cell draws, once per paint that uses it.
+    fn paint(&mut self, paint: &Paint<'a>) {
+        if let Paint::Pattern(pattern) = paint
+            && let Pattern::Tiling(tiling) = &**pattern
+        {
+            // The cell's own space: its images are compared by identity, not placed on the page.
+            self.nested(kurbo::Affine::IDENTITY, true, |inner| {
+                let _ = tiling.interpret(inner, kurbo::Affine::IDENTITY, false);
+            });
+        }
+    }
+
+    /// The images a soft mask's group draws, once per setting of the mask.
+    fn mask(&mut self, mask: Option<SoftMask<'a>>) {
+        let Some(mask) = mask else { return };
+        if !self.mask_keys.insert(mask.use_key()) {
+            return;
+        }
+        let to_user = self.to_user;
+        self.nested(to_user, self.tiled, |inner| mask.interpret(inner));
+        self.masks.push(mask);
+    }
+}
+
+impl<'a> Device<'a> for PageDevice<'a> {
+    fn set_soft_mask(&mut self, mask: Option<SoftMask<'a>>) {
+        self.mask(mask);
+    }
     fn set_blend_mode(&mut self, _: BlendMode) {}
-    fn draw_path(&mut self, _: &BezPath, _: kurbo::Affine, _: &Paint<'a>, _: &PathDrawMode) {}
+    fn draw_path(&mut self, _: &BezPath, _: kurbo::Affine, paint: &Paint<'a>, _: &PathDrawMode) {
+        self.paint(paint);
+    }
     fn push_clip_path(&mut self, _: &ClipPath) {}
-    fn push_transparency_group(&mut self, _: f32, _: Option<SoftMask<'a>>, _: BlendMode) {}
-    fn draw_glyph(&mut self, glyph: &Glyph<'a>, transform: kurbo::Affine, glyph_transform: kurbo::Affine, _: &Paint<'a>, _: &GlyphDrawMode) {
+    fn push_transparency_group(&mut self, _: f32, mask: Option<SoftMask<'a>>, _: BlendMode) {
+        self.mask(mask);
+    }
+    fn draw_glyph(&mut self, glyph: &Glyph<'a>, transform: kurbo::Affine, glyph_transform: kurbo::Affine, paint: &Paint<'a>, _: &GlyphDrawMode) {
+        self.paint(paint);
+        if !self.with_glyphs {
+            return;
+        }
         let Some(unicode) = glyph.as_unicode() else {
             self.unread = self.unread.saturating_add(1);
             return;
@@ -133,7 +262,30 @@ impl<'a> Device<'a> for GlyphDevice {
         let end = u32::try_from(self.found.chars.len()).unwrap_or(u32::MAX);
         self.found.glyphs.push((end, [b.x0 as f32, b.y0 as f32, b.x1 as f32, b.y1 as f32]));
     }
-    fn draw_image(&mut self, _: Image<'a, '_>, _: kurbo::Affine) {}
+    fn draw_image(&mut self, image: Image<'a, '_>, transform: kurbo::Affine) {
+        let (width, height) = (f64::from(image.width()), f64::from(image.height()));
+        let stream = match &image {
+            Image::Raster(raster) => raster.stream().clone(),
+            Image::Stencil(stencil) => {
+                self.paint(stencil.paint());
+                stencil.stream().clone()
+            }
+        };
+        let source = match stream.dict().obj_id() {
+            Some(id) => match (u32::try_from(id.obj_number), u16::try_from(id.gen_number)) {
+                (Ok(num), Ok(generation)) => ImageSource::Object { num, generation },
+                _ => {
+                    self.unidentified = self.unidentified.saturating_add(1);
+                    return;
+                }
+            },
+            None => ImageSource::Inline { dict: self.copied(stream.dict().data()), data: self.copied(&stream.raw_data()) },
+        };
+        // hayro hands the device the transformation of the image's pixel grid (row 0 at the top):
+        // the unit square's is that after (u, v) ↦ (u · width, (1 − v) · height).
+        let unit = self.to_user * transform * kurbo::Affine::new([width, 0.0, 0.0, -height, 0.0, height]);
+        self.images.push(ImageDraw { source, matrix: unit.as_coeffs(), tiled: self.tiled });
+    }
     fn pop_clip_path(&mut self) {}
     fn pop_transparency_group(&mut self) {}
 }
@@ -238,10 +390,17 @@ impl ContentDocument {
         (self.warnings(), self.exhausted.load(Ordering::Relaxed))
     }
 
-    /// The glyphs the page draws (see [`PageGlyphs`]). Fails when a drawn glyph gives no text (no
-    /// Unicode mapping) or no usable box, on an interpreter warning, on a panic, when the parser
-    /// had to rebuild the cross-reference data, and past the work budget.
+    /// The glyphs the page draws (see [`PageGlyphs`]); [`ContentDocument::content`] without the
+    /// images.
     pub fn text(&self, page: usize) -> Result<PageGlyphs, ContentError> {
+        self.content(page).map(|content| content.glyphs)
+    }
+
+    /// The glyphs and images the page draws (see [`PageContent`]), from one interpretation.
+    /// Fails when a drawn glyph gives no text (no Unicode mapping) or no usable box, when a drawn
+    /// image cannot be identified, on an interpreter warning, on a panic, when the parser had to
+    /// rebuild the cross-reference data, and past the work budget.
+    pub fn content(&self, page: usize) -> Result<PageContent, ContentError> {
         let before = self.counts();
         let number = page.saturating_add(1);
         let extracted = catch_unwind(AssertUnwindSafe(|| {
@@ -254,11 +413,11 @@ impl ContentDocument {
             let (w, h) = p.render_dimensions();
             let cache = InterpreterCache::new();
             let mut ctx = Context::new(initial, kurbo::Rect::new(0.0, 0.0, f64::from(w), f64::from(h)), &cache, p.xref(), self.settings.clone());
-            let mut device = GlyphDevice { to_user: initial.inverse(), found: PageGlyphs::default(), unread: 0 };
+            let mut device = PageDevice::new(initial.inverse(), true, false);
             interpret_page(p, &mut ctx, &mut device);
-            Some(Ok((device.found, device.unread)))
+            Some(Ok((PageContent { glyphs: device.found, images: device.images }, device.unread, device.unidentified)))
         }));
-        let (found, unread) = match extracted {
+        let (content, unread, unidentified) = match extracted {
             Ok(Some(Ok(found))) => found,
             Ok(Some(Err(()))) => return Err(format!("page {number} has no usable page box").into()),
             Ok(None) => return Err(format!("page {number} does not exist").into()),
@@ -268,10 +427,13 @@ impl ContentDocument {
         if unread > 0 {
             return Err(format!("page {number}: {unread} glyph(s) have no text").into());
         }
+        if unidentified > 0 {
+            return Err(format!("page {number}: {unidentified} image(s) cannot be identified").into());
+        }
         if self.repaired() {
             return Err(ContentError::Unreadable("the file's cross-reference data is damaged".into()));
         }
-        Ok(found)
+        Ok(content)
     }
 
     /// The page box hayro renders upright (intersected crop box), in points: width, height.
