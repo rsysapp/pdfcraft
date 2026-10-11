@@ -1,7 +1,8 @@
 //! Embed build: which glyphs of a page are still there after an edit. A glyph is its name and its
 //! place: an edited glyph is the base glyph with the same name (its text, or for a glyph without
-//! a Unicode value its font and glyph ID) whose em box lies within [`POSITION_TOLERANCE`] on every
-//! side. Glyphs are paired one to one (a maximum matching, so a
+//! a Unicode value its font and glyph ID) and the same optional-content membership (the groups it
+//! is inside and whether it shows by default, R6b-29) whose em box lies within
+//! [`POSITION_TOLERANCE`] on every side. Glyphs are paired one to one (a maximum matching, so a
 //! glyph drawn twice at one place pairs twice), with no alignment by reading order: what is left
 //! over in the base was removed, what is left over in the edited page was added. A space drawn
 //! as a glyph counts like any other glyph.
@@ -53,6 +54,16 @@ fn distance(a: [f32; 4], b: [f32; 4]) -> f32 {
 
 /// Pair the glyphs of `edited` with those of `base`.
 pub(crate) fn pair(base: &Glyphs, edited: &Glyphs, budget: &mut Budget) -> Result<Pairing, Fail> {
+    pair_by(base, edited, true, budget)
+}
+
+/// Pair them by name and place alone, whatever optional content each is in: fewer glyphs left
+/// over than [`pair`] leaves means some changed only their membership.
+pub(crate) fn pair_ignoring_layers(base: &Glyphs, edited: &Glyphs, budget: &mut Budget) -> Result<Pairing, Fail> {
+    pair_by(base, edited, false, budget)
+}
+
+fn pair_by(base: &Glyphs, edited: &Glyphs, layers: bool, budget: &mut Budget) -> Result<Pairing, Fail> {
     // Base glyphs by the 1-point cell of their centre: a glyph within the tolerance of another
     // has its centre within half a point, so in the same or a neighbouring cell.
     let mut cells: HashMap<(i64, i64), Vec<u32>> = HashMap::new();
@@ -75,7 +86,7 @@ pub(crate) fn pair(base: &Glyphs, edited: &Glyphs, budget: &mut Budget) -> Resul
                 for &other in list {
                     budget.tick()?;
                     let Some((other_text, other_rect)) = base.glyph(other as usize) else { continue };
-                    if other_text == text && same_place(other_rect, rect) {
+                    if other_text == text && same_place(other_rect, rect) && (!layers || base.layer(other as usize) == edited.layer(index)) {
                         found.push((distance(other_rect, rect), other));
                     }
                 }

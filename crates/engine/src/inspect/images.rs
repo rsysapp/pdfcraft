@@ -13,7 +13,9 @@
 //!
 //! Uses are where hayro's interpreter drew each image (the interpretation the page render
 //! shows). Images drawn in a tiling pattern's cell repeat over what the pattern paints; they are
-//! compared by identity only, and any difference counts as a change outside the areas.
+//! compared by identity only, and any difference counts as a change outside the areas. An
+//! image's optional-content membership is part of its identity: one drawn in other optional
+//! content than the base's at its place is a change outside the areas (R6b-29).
 
 use std::collections::HashMap;
 use std::f64::consts::PI;
@@ -174,8 +176,16 @@ pub(crate) fn compare(
     budget: &mut Budget,
 ) -> Result<ImageOutcome, Fail> {
     let mut outcome = ImageOutcome::default();
-    // Images in pattern cells: by identity.
-    let tiled = |uses: &[ImageUse]| uses.iter().filter(|used| used.tiled).map(|used| used.digest).collect::<Vec<_>>();
+    // Images in pattern cells: by identity (with their optional-content membership, R6b-29).
+    let tiled = |uses: &[ImageUse]| {
+        uses.iter()
+            .filter(|used| used.tiled)
+            .map(|used| match &used.layer {
+                Some(layer) => super::structure::sha256(&[&used.digest, &layer.digest]),
+                None => used.digest,
+            })
+            .collect::<Vec<_>>()
+    };
     let (lost, gained) = differ(&tiled(base), &tiled(edited));
     if lost || gained {
         outcome.removed |= lost;
@@ -201,7 +211,7 @@ pub(crate) fn compare(
                 for &index in list {
                     let Some(candidate) = base.get(index).copied() else { continue };
                     if !taken.get(index).copied().unwrap_or(true)
-                        && (!same_image || candidate.digest == use_.digest)
+                        && (!same_image || (candidate.digest == use_.digest && candidate.layer == use_.layer))
                         && same_placement(&candidate.matrix, &use_.matrix)
                     {
                         return Some(index);
@@ -235,7 +245,9 @@ pub(crate) fn compare(
             *slot = true;
         }
         let Some(original) = base.get(index).copied() else { continue };
-        match replacement(original, used, files, areas, budget)? {
+        // Another membership in optional content is not a redaction, whatever the boxes cover.
+        let replaced = if original.layer == used.layer { replacement(original, used, files, areas, budget)? } else { Replaced::Outside };
+        match replaced {
             Replaced::Same => {}
             Replaced::Redacted => outcome.removed = true,
             Replaced::Outside => {

@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use pdfcraft_cos::{Dict, Document, Lexer, ObjRef, Object, Stream, XrefEntry, parse_indirect};
-use pdfcraft_render::content::{FormDraw, ImageDraw, ImageSource, ObjectPlace, PageContent, PageGlyphs, Resolved};
+use pdfcraft_render::content::{FormDraw, ImageDraw, ImageSource, LayerMark, ObjectPlace, PageContent, PageGlyphs, Resolved};
 
 use super::{Budget, Fail, MAX_PAGES};
 
@@ -118,6 +118,15 @@ pub(crate) struct PageFacts {
     pub forms: Vec<FormUse>,
     /// Each form hayro drew, where (for a rewrite's redaction check).
     pub form_draws: Vec<FormDraw>,
+    /// Each of `form_draws`' optional-content membership (R6b-29).
+    pub form_layers: Vec<Option<LayerFact>>,
+    /// The groups and membership dictionaries the page's content is inside that do not show by
+    /// default, as hayro names them (empty: the default view is the view of every layer): the
+    /// page is rendered at its default view too.
+    pub hidden_layers: Vec<(i32, i32)>,
+    /// Every group and membership dictionary the page's content is inside, as hayro names them
+    /// (empty: none): the page is rendered with all of them hidden too.
+    pub layer_objects: Vec<(i32, i32)>,
     /// The Type 3 fonts in the resources the content is drawn with (the page's, and each drawn
     /// form's, pattern's and mask group's own), each keyed with everything its glyph procedures
     /// draw (see `Reader::type3_key`).
@@ -138,6 +147,38 @@ pub(crate) struct PageFacts {
     pub size: (f32, f32),
     pub glyphs: Glyphs,
     pub fingerprint: Digest,
+}
+
+#[cfg(test)]
+impl PageFacts {
+    /// A page of the given glyphs and fingerprint, nothing else (for tests of the page pairing).
+    pub fn for_tests(glyphs: Glyphs, fingerprint: Digest) -> Self {
+        Self {
+            rotation: 0,
+            boxes: ([0.0, 0.0, 200.0, 300.0], None),
+            object: ObjRef::new(1, 0),
+            content: fingerprint,
+            resources: [0; 32],
+            other: [0; 32],
+            images: Vec::new(),
+            image_uses: Vec::new(),
+            required: Required::default(),
+            forms: Vec::new(),
+            form_draws: Vec::new(),
+            form_layers: Vec::new(),
+            hidden_layers: Vec::new(),
+            layer_objects: Vec::new(),
+            type3: BTreeSet::new(),
+            render_risk: None,
+            image_pixels: 0,
+            interpreted: 0,
+            annots: Vec::new(),
+            annots_in_array: 0,
+            size: (200.0, 300.0),
+            glyphs,
+            fingerprint,
+        }
+    }
 }
 
 /// One use of a form XObject in a page's content, as this scan reads it.
@@ -161,6 +202,9 @@ pub(crate) struct Glyphs {
     /// Glyph index → (the digest of its font's object, its glyph ID in the font), for the glyphs
     /// without text. The digest, not the object number: a rewrite renumbers objects.
     pub unnamed: HashMap<u32, (Digest, u32)>,
+    /// Glyph index → its optional-content membership, for the glyphs drawn inside optional
+    /// content: part of a glyph's identity (R6b-29).
+    pub layers: HashMap<u32, LayerFact>,
 }
 
 /// How a glyph is named: its text, or its font and glyph.
@@ -173,6 +217,11 @@ pub(crate) enum GlyphName<'a> {
 impl Glyphs {
     pub fn len(&self) -> usize {
         self.page.len()
+    }
+
+    /// Glyph `index`'s optional-content membership (`None`: it is not inside any).
+    pub fn layer(&self, index: usize) -> Option<&LayerFact> {
+        u32::try_from(index).ok().and_then(|index| self.layers.get(&index))
     }
 
     /// Glyph `index`'s name and em box.
@@ -245,6 +294,8 @@ pub(crate) struct ImageUse {
     pub tiled: bool,
     /// The image XObject (`None`: an inline image).
     pub image: Option<Arc<ImageInfo>>,
+    /// Its optional-content membership (R6b-29).
+    pub layer: Option<LayerFact>,
 }
 
 /// An image XObject, for a comparison of its samples.
@@ -1562,6 +1613,9 @@ impl<'d, 'b> Reader<'d, 'b> {
             required: drawn.required,
             forms: drawn.forms,
             form_draws: Vec::new(),
+            form_layers: Vec::new(),
+            hidden_layers: Vec::new(),
+            layer_objects: Vec::new(),
             type3: drawn.type3,
             interpreted: drawn.interpreted,
             annots,
@@ -1641,6 +1695,180 @@ impl<'d, 'b> Reader<'d, 'b> {
             annots.push(Annot { id, subtype, digest, tracked: !widget && !silent_popup, areas, bare, rect, link });
         }
         Ok((annots, in_array))
+    }
+
+    /// The document's default layer configuration (see [`LayerConfig`]).
+    fn layer_config(&mut self, catalog: &Dict) -> Result<Option<LayerConfig>, Fail> {
+        let Some(properties) = self.dict_of(catalog.get(b"OCProperties"), "/OCProperties")? else { return Ok(None) };
+        let mut problem = None;
+        let groups_of = |this: &mut Self, o: Option<&Object>, what: &str, problem: &mut Option<String>| -> Result<BTreeSet<ObjRef>, Fail> {
+            let mut out = BTreeSet::new();
+            for item in this.array_of(o, what)? {
+                match item {
+                    Object::Ref(r) => {
+                        out.insert(r);
+                    }
+                    _ => *problem = Some(format!("{what} holds something other than a reference")),
+                }
+            }
+            Ok(out)
+        };
+        let groups = groups_of(self, properties.get(b"OCGs"), "/OCGs", &mut problem)?;
+        let config = self.dict_of(properties.get(b"D"), "/OCProperties /D")?;
+        let Some(config) = config else {
+            return Ok(Some(LayerConfig {
+                groups,
+                base_off: false,
+                on: BTreeSet::new(),
+                off: BTreeSet::new(),
+                problem: Some("no default configuration (/D)".into()),
+            }));
+        };
+        let base_off = match config.get(b"BaseState").map(|state| self.resolve(state)).transpose()?.as_deref() {
+            None => false,
+            Some(Object::Name(name)) if name.as_slice() == b"ON" => false,
+            Some(Object::Name(name)) if name.as_slice() == b"OFF" => true,
+            Some(_) => {
+                problem = Some("a /BaseState other than /ON or /OFF".into());
+                false
+            }
+        };
+        let on = groups_of(self, config.get(b"ON"), "/ON", &mut problem)?;
+        let off = groups_of(self, config.get(b"OFF"), "/OFF", &mut problem)?;
+        if on.intersection(&off).next().is_some() {
+            problem = Some("a group both in /ON and in /OFF".into());
+        }
+        if !self.array_of(config.get(b"AS"), "/AS")?.is_empty() {
+            problem = Some("automatic states (/AS), which viewers apply each their own way".into());
+        }
+        if let Some(intent) = config.get(b"Intent")
+            && !self.only_view(intent)?
+        {
+            problem = Some("an /Intent other than /View".into());
+        }
+        Ok(Some(LayerConfig { groups, base_off, on, off, problem }))
+    }
+
+    /// Whether an `/Intent` is `/View` (or an array of just that).
+    fn only_view(&mut self, intent: &Object) -> Result<bool, Fail> {
+        Ok(match &*self.resolve(intent)? {
+            Object::Name(name) => name.as_slice() == b"View",
+            Object::Array(names) => !names.is_empty() && names.iter().all(|name| name.as_name() == Some(b"View".as_slice())),
+            _ => false,
+        })
+    }
+
+    /// One mark (see [`LayerMark`]) against the configuration: `None` when it is not optional
+    /// content (a property list of another kind, under another tag); else the group's or
+    /// membership dictionary's digest and whether it shows by default. Anything readers may
+    /// evaluate differently fails.
+    fn evaluate_mark(&mut self, mark: &LayerMark, config: Option<&LayerConfig>) -> Result<Option<(Digest, bool)>, Fail> {
+        let tagged_oc = mark.tag.as_deref().is_none_or(|tag| tag == b"OC");
+        if mark.inline {
+            return Err(unevaluable("a property list written in the content names optional content"));
+        }
+        let Some((num, generation)) = mark.object else {
+            return if tagged_oc { Err(unevaluable("optional content that is not an object of its own")) } else { Ok(None) };
+        };
+        let (Ok(num), Ok(generation)) = (u32::try_from(num), u16::try_from(generation)) else {
+            return Err(unevaluable("an object number no file has"));
+        };
+        let r = ObjRef::new(num, generation);
+        let obj = self.get(r)?;
+        let Object::Dict(dict) = &*obj else {
+            return if tagged_oc { Err(unevaluable("optional content that is not a dictionary")) } else { Ok(None) };
+        };
+        let kind = dict.name(b"Type").map(<[u8]>::to_vec);
+        let is_layer = matches!(kind.as_deref(), Some(b"OCG" | b"OCMD"));
+        if !tagged_oc {
+            // hayro hides content in a group named under another tag; other readers do not.
+            return if is_layer { Err(unevaluable("a group named by a marked-content tag other than /OC")) } else { Ok(None) };
+        }
+        let Some(config) = config else { return Err(unevaluable("optional content in a file without /OCProperties")) };
+        if let Some(problem) = &config.problem {
+            return Err(unevaluable(problem));
+        }
+        let visible = match kind.as_deref() {
+            Some(b"OCG") => self.group_visible(r, config)?,
+            Some(b"OCMD") => self.membership_visible(dict, config)?,
+            _ => return Err(unevaluable("a /OC that is neither a group nor a membership dictionary")),
+        };
+        Ok(Some((self.digest_ref(r)?.0, visible)))
+    }
+
+    /// Whether group `r` shows by default.
+    fn group_visible(&mut self, r: ObjRef, config: &LayerConfig) -> Result<bool, Fail> {
+        if !config.groups.contains(&r) {
+            return Err(unevaluable("a group not listed in /OCProperties /OCGs"));
+        }
+        let Object::Dict(group) = &*self.get(r)? else { return Err(unevaluable("a group that is not a dictionary")) };
+        if group.name(b"Type") != Some(b"OCG") {
+            return Err(unevaluable("a membership names something other than a group"));
+        }
+        if let Some(intent) = group.get(b"Intent")
+            && !self.only_view(intent)?
+        {
+            return Err(unevaluable("a group with an /Intent other than /View"));
+        }
+        Ok(if config.base_off { config.on.contains(&r) } else { !config.off.contains(&r) })
+    }
+
+    /// Whether content in membership dictionary `dict` shows by default: by its visibility
+    /// expression (`/VE`) where it has one, else by its policy (`/P`) over its groups.
+    fn membership_visible(&mut self, dict: &Dict, config: &LayerConfig) -> Result<bool, Fail> {
+        if let Some(expression) = dict.get(b"VE") {
+            return self.expression_visible(expression, config, 0);
+        }
+        let groups = match dict.get(b"OCGs") {
+            Some(Object::Ref(r)) if matches!(&*self.get(*r)?, Object::Dict(_)) => vec![Object::Ref(*r)],
+            other => self.array_of(other, "a membership's /OCGs")?,
+        };
+        if groups.is_empty() {
+            return Err(unevaluable("a membership dictionary with no groups"));
+        }
+        let mut shown = Vec::with_capacity(groups.len());
+        for group in groups {
+            let Object::Ref(r) = group else { return Err(unevaluable("a membership's /OCGs holds something other than a group")) };
+            shown.push(self.group_visible(r, config)?);
+        }
+        let policy = match dict.get(b"P").map(|p| self.resolve(p)).transpose()?.as_deref() {
+            None => b"AnyOn".to_vec(),
+            Some(Object::Name(name)) => name.clone(),
+            Some(_) => return Err(unevaluable("a membership policy that is not a name")),
+        };
+        Ok(match policy.as_slice() {
+            b"AllOn" => shown.iter().all(|on| *on),
+            b"AnyOn" => shown.iter().any(|on| *on),
+            b"AnyOff" => shown.iter().any(|on| !*on),
+            b"AllOff" => shown.iter().all(|on| !*on),
+            _ => return Err(unevaluable("an unknown membership policy")),
+        })
+    }
+
+    /// A visibility expression (ISO 32000-2 §8.11.2.2): `[/And …]`, `[/Or …]`, `[/Not x]` over
+    /// groups and expressions.
+    fn expression_visible(&mut self, expression: &Object, config: &LayerConfig, depth: usize) -> Result<bool, Fail> {
+        if depth > MAX_VISIBILITY_DEPTH {
+            return Err(unevaluable("a visibility expression nested too deep"));
+        }
+        if let Object::Ref(r) = expression
+            && let Object::Dict(_) = &*self.get(*r)?
+        {
+            return self.group_visible(*r, config);
+        }
+        let items = self.array_of(Some(expression), "a visibility expression")?;
+        let Some((operator, operands)) = items.split_first() else { return Err(unevaluable("an empty visibility expression")) };
+        let mut values = Vec::with_capacity(operands.len());
+        for operand in operands {
+            self.budget.tick()?;
+            values.push(self.expression_visible(operand, config, depth.saturating_add(1))?);
+        }
+        match (operator.as_name(), values.as_slice()) {
+            (Some(b"Not"), [value]) => Ok(!*value),
+            (Some(b"And"), values) if !values.is_empty() => Ok(values.iter().all(|value| *value)),
+            (Some(b"Or"), values) if !values.is_empty() => Ok(values.iter().any(|value| *value)),
+            _ => Err(unevaluable("a malformed visibility expression")),
+        }
     }
 
     /// An annotation's destination in this file and the entry that gives it: `/Dest`, or `/A`
@@ -2026,6 +2254,44 @@ pub(crate) struct Known {
     kept_until: usize,
     /// Streams whose data hayro read as the same bytes.
     agreed: BTreeSet<ObjRef>,
+    /// The document's default layer configuration (`None`: no `/OCProperties`).
+    layer_config: Option<LayerConfig>,
+    /// Each optional-content mark evaluated (see [`Known::layer`]).
+    marks: HashMap<LayerMark, Option<(Digest, bool)>>,
+}
+
+/// The document's default optional-content configuration (`/OCProperties /D`), as far as it
+/// can be evaluated: which groups exist, and which show.
+pub(crate) struct LayerConfig {
+    /// `/OCGs`: every group.
+    groups: BTreeSet<ObjRef>,
+    /// `/BaseState /OFF`: groups show only when listed in `/ON`.
+    base_off: bool,
+    on: BTreeSet<ObjRef>,
+    off: BTreeSet<ObjRef>,
+    /// Why the configuration cannot be evaluated (no `/D`, `/BaseState /Unchanged`, a group
+    /// both on and off, automatic states `/AS`, another intent than `/View`, entries that are
+    /// not groups): readers apply these each their own way.
+    problem: Option<String>,
+}
+
+/// The membership of content in optional content (R6b-29): the groups and membership
+/// dictionaries it is inside, outermost first, each by its digest (a rewrite renumbers them), and
+/// whether it shows in the document's default configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct LayerFact {
+    pub digest: Digest,
+    pub visible: bool,
+}
+
+/// A group or membership dictionary as hayro names it: number, generation.
+pub(crate) type LayerObject = (i32, i32);
+
+/// The deepest visibility expression (`/VE`) evaluated.
+const MAX_VISIBILITY_DEPTH: usize = 16;
+
+fn unevaluable(why: &str) -> Fail {
+    read_error(format!("optional content that cannot be evaluated against the document's /OCProperties: {why}"))
 }
 
 impl Known {
@@ -2041,6 +2307,59 @@ impl Known {
         let uses = draws.iter().map(|draw| reader.image_use(draw, &mut inline)).collect::<Result<Vec<_>, _>>();
         self.keep(reader);
         uses
+    }
+
+    /// The optional-content membership `marks` make (outermost first): `None` when none of them
+    /// is optional content; fails on any mark that cannot be evaluated against the document's
+    /// `/OCProperties` (see `Reader::evaluate_mark`). Content shows by default when every group
+    /// or membership dictionary it is inside shows.
+    pub fn layer(&mut self, doc: &Document, budget: &mut Budget, marks: &[LayerMark]) -> Result<Option<LayerFact>, Fail> {
+        let mut parts: Vec<u8> = Vec::new();
+        let mut visible = true;
+        let mut any = false;
+        for mark in marks {
+            let Some((digest, shows)) = self.mark(doc, budget, mark)? else { continue };
+            any = true;
+            visible &= shows;
+            parts.extend_from_slice(&digest);
+        }
+        Ok(any.then(|| LayerFact { digest: sha256(&[b"layers", &parts, &[u8::from(visible)]]), visible }))
+    }
+
+    /// Of `marks` (every mark met on a page), the groups and membership dictionaries that do not
+    /// show by default, and all of them, as hayro names them (for renders at the default state
+    /// and with every layer off; both empty: no optional content).
+    pub fn hidden_layers(&mut self, doc: &Document, budget: &mut Budget, marks: &[LayerMark]) -> Result<(Vec<LayerObject>, Vec<LayerObject>), Fail> {
+        let (mut hidden, mut all) = (Vec::new(), Vec::new());
+        for mark in marks {
+            let Some((_, shows)) = self.mark(doc, budget, mark)? else { continue };
+            // An evaluated mark always names its object.
+            let Some(object) = mark.object else { continue };
+            all.push(object);
+            if !shows {
+                hidden.push(object);
+            }
+        }
+        for list in [&mut hidden, &mut all] {
+            list.sort_unstable();
+            list.dedup();
+        }
+        Ok((hidden, all))
+    }
+
+    fn mark(&mut self, doc: &Document, budget: &mut Budget, mark: &LayerMark) -> Result<Option<(Digest, bool)>, Fail> {
+        if let Some(found) = self.marks.get(mark) {
+            return Ok(*found);
+        }
+        budget.tick()?;
+        let config = self.layer_config.take();
+        let mut reader = self.reader(doc, budget);
+        let found = reader.evaluate_mark(mark, config.as_ref());
+        self.keep(reader);
+        self.layer_config = config;
+        let found = found?;
+        self.marks.insert(mark.clone(), found);
+        Ok(found)
     }
 
     /// The digest of the object hayro names as a glyph's font (a glyph without text is named by
@@ -2325,7 +2644,7 @@ impl Reader<'_, '_> {
                 (digest, None)
             }
         };
-        Ok(ImageUse { digest, matrix: draw.matrix, tiled: draw.tiled, image })
+        Ok(ImageUse { digest, matrix: draw.matrix, tiled: draw.tiled, image, layer: None })
     }
 }
 
@@ -2439,6 +2758,7 @@ pub(crate) fn read(
         None => (BTreeMap::new(), None),
     };
     let layers = catalog.get(b"OCProperties").map(|layers| reader.digest(layers)).transpose()?;
+    let layer_config = reader.layer_config(&catalog)?;
     let page_index: HashMap<ObjRef, usize> = nodes.iter().enumerate().map(|(index, node)| (node.obj, index)).collect();
     let outline = reader.outline(&catalog, &page_index)?;
     let root = reader.dict_of(catalog.get(b"Outlines"), "/Outlines")?.unwrap_or_default();
@@ -2472,6 +2792,8 @@ pub(crate) fn read(
         misdeclared: reader.misdeclared,
         kept_until,
         agreed: BTreeSet::new(),
+        layer_config,
+        marks: HashMap::new(),
     };
     Ok((Structure { pages, fields, form, catalog: entries, layers, outline, outline_root, named_destinations, sections }, known))
 }

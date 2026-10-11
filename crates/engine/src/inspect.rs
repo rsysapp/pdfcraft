@@ -17,7 +17,11 @@
 //! - hayro interprets every optional-content layer as visible, whatever the document's
 //!   configuration says: which layers show is each viewer's choice (a Layers panel shows hidden
 //!   ones), and readers disagree on what marked content hides, so text, images and pixels are
-//!   compared in every layer;
+//!   compared in every layer; each glyph, image and form also carries the optional content it is
+//!   inside and whether it shows by default, evaluated here against `/OCProperties` (not as
+//!   hayro would), and optional content that cannot be evaluated so that every reader agrees
+//!   (a group named by another tag, missing from `/OCGs`, automatic states, no `/OCProperties`,
+//!   marked content unbalanced around it, …) is an error;
 //! - hayro reads every content stream it interprets to its end: one it stops reading early (an
 //!   operator after which it gives up, data it cannot parse) or cannot decode is an error, since
 //!   what follows would be checked by nothing; and it draws everything the content draws as
@@ -109,7 +113,9 @@ pub struct PageChanges {
     pub rotated: u32,
     pub inserted: u32,
     pub deleted: u32,
-    /// Pages found, unchanged, at another position.
+    /// Pages present in both files out of their order: the fewest of them that, moved, give the
+    /// edited file's order, whether they changed or not (a page paired by its content counts as
+    /// any other).
     pub moved: u32,
 }
 
@@ -145,8 +151,10 @@ pub struct AnnotationChanges {
 /// dictionary, by its content) and its glyph ID in the font. Glyphs in every optional-content
 /// layer count, shown by default or not. Pages where a base glyph has no edited glyph with the
 /// same name at the same place (text removed); pages where an edited glyph has no base glyph with
-/// the same name at the same place (text added: moved or new text). A redaction removes text and
-/// adds none.
+/// the same name at the same place (text added: moved or new text). A glyph's identity includes
+/// its optional-content membership: the groups and membership dictionaries it is inside and
+/// whether it shows by default, so a glyph moved into or out of a layer is removed and added. A
+/// redaction removes text and adds none.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TextChanges {
     pub pages_with_text_removed: u32,
@@ -202,8 +210,14 @@ pub struct ContentChanges {
     /// - every page, when the document's layer configuration (`/OCProperties`) changed: which
     ///   layers a viewer shows by default is not a redaction;
     /// - a page drawn with something hayro may render otherwise than other viewers (a blend mode
-    ///   other than `/Normal`, a transfer function, a knockout group), so that a change hayro's
-    ///   pixels do not show may show in another viewer.
+    ///   other than `/Normal`, a transfer function, a knockout group), on either side, so that a
+    ///   change hayro's pixels do not show may show in another viewer;
+    /// - a glyph, image or form in other optional content than at its place in the base, or shown
+    ///   otherwise by default (R6b-29), whatever the boxes cover;
+    /// - where content is in optional content: the page as it shows by default, or with every
+    ///   layer off, changed other than under the boxes (content moved into or out of a layer,
+    ///   or covered or uncovered by a layer's content, which the render of every layer cannot
+    ///   tell).
     pub pages_changed_outside_redactions: u32,
 }
 
@@ -327,6 +341,9 @@ pub(crate) struct Limits {
     pub image_bytes_each: usize,
     /// Image samples compared one by one.
     pub compared: u64,
+    /// The steps pairing changed pages by similarity may take (a feature counted, a shared
+    /// feature looked up for a page, a candidate pair weighed), in all.
+    pub pairing: u64,
 }
 
 impl Default for Limits {
@@ -348,6 +365,7 @@ impl Default for Limits {
             image_bytes: 1 << 30,
             image_bytes_each: 64 << 20,
             compared: 1 << 30,
+            pairing: 1 << 25,
         }
     }
 }
@@ -392,6 +410,7 @@ pub(crate) struct Budget {
     glyphs_left: usize,
     image_bytes_left: usize,
     compared_left: u64,
+    pairing_left: u64,
     ticks: u32,
     pub limits: Limits,
 }
@@ -410,6 +429,7 @@ impl Budget {
             glyphs_left: limits.glyphs,
             image_bytes_left: limits.image_bytes,
             compared_left: limits.compared,
+            pairing_left: limits.pairing,
             ticks: 0,
             limits,
         }
@@ -483,6 +503,12 @@ impl Budget {
     pub fn image_bytes(&mut self, bytes: usize) -> Result<(), Fail> {
         Self::take(&mut self.image_bytes_left, bytes)?;
         self.time()
+    }
+
+    /// A step of pairing changed pages (see [`Limits::pairing`]).
+    pub fn pairing(&mut self) -> Result<(), Fail> {
+        self.pairing_left = self.pairing_left.checked_sub(1).ok_or(Fail::TooComplex)?;
+        self.tick()
     }
 
     pub fn compared(&mut self, samples: usize) -> Result<(), Fail> {
@@ -658,13 +684,32 @@ fn read_side(bytes: &[u8], against: Option<(&[u8], &Structure, bool)>, placement
             let font = known.font_digest(&doc, budget, ObjRef::new(*num, *generation))?;
             unnamed.insert(*glyph, (font, *id));
         }
+        // Optional content (R6b-29): every mark the page met is evaluated against the document's
+        // configuration (or the page refused), and each glyph, image and form carries the
+        // membership it was drawn in.
+        let (hidden, objects) = known.hidden_layers(&doc, budget, &content.layer_marks)?;
+        if !objects.is_empty() && content.layers_unbalanced {
+            return Err(Fail::Read(format!(
+                "page {number}: marked content is not balanced in a content stream, so which content is in which layer is each reader's guess"
+            )));
+        }
+        let memberships = content.layers.iter().map(|marks| known.layer(&doc, budget, marks)).collect::<Result<Vec<_>, _>>()?;
+        let membership = |index: Option<u32>| index.and_then(|index| memberships.get(index as usize).copied().flatten());
+        page.hidden_layers = hidden;
+        page.layer_objects = objects;
+        let layers: HashMap<u32, structure::LayerFact> =
+            content.glyphs.layers.iter().filter_map(|(glyph, index)| membership(Some(*index)).map(|fact| (*glyph, fact))).collect();
         // Where each image is drawn is where hayro's interpretation (the one the render check
         // sees) drew it; `pdfcraft_cos` says which image it is.
         if placements {
             page.image_uses = known.image_uses(&doc, budget, &content.images)?;
+            for (used, draw) in page.image_uses.iter_mut().zip(&content.images) {
+                used.layer = membership(draw.layer);
+            }
+            page.form_layers = content.forms.iter().map(|form| membership(form.layer)).collect();
             page.form_draws = content.forms;
         }
-        page.glyphs = Glyphs { page: content.glyphs, unnamed };
+        page.glyphs = Glyphs { page: content.glyphs, unnamed, layers };
         page.fingerprint = structure::fingerprint(page);
     }
     // Every object `pdfcraft_cos` read (pages, resources, annotations, form fields, the outline,
@@ -765,7 +810,7 @@ fn features(page: &PageFacts, budget: &mut Budget) -> Result<HashMap<u64, u32>, 
         *slot = slot.saturating_add(1);
     };
     for index in 0..page.glyphs.len() {
-        budget.tick()?;
+        budget.pairing()?;
         let Some((name, rect)) = page.glyphs.glyph(index) else { return Err(Fail::Read("a glyph went missing".into())) };
         let mut hasher = std::hash::DefaultHasher::new();
         b'g'.hash(&mut hasher);
@@ -779,14 +824,14 @@ fn features(page: &PageFacts, budget: &mut Budget) -> Result<HashMap<u64, u32>, 
     }
     if page.image_uses.is_empty() {
         for digest in &page.images {
-            budget.tick()?;
+            budget.pairing()?;
             let mut hasher = std::hash::DefaultHasher::new();
             (b'i', digest).hash(&mut hasher);
             add(hasher.finish());
         }
     } else {
         for used in &page.image_uses {
-            budget.tick()?;
+            budget.pairing()?;
             let mut hasher = std::hash::DefaultHasher::new();
             (b'p', &used.digest, used.tiled).hash(&mut hasher);
             if used.matrix[4].is_finite() && used.matrix[5].is_finite() {
@@ -800,18 +845,24 @@ fn features(page: &PageFacts, budget: &mut Budget) -> Result<HashMap<u64, u32>, 
 
 /// A feature shared by more of the changed base pages than this tells none of them apart (a
 /// running header): it does not count toward any page's similarity.
-const MAX_SHARED_FEATURE: usize = 64;
+const MAX_SHARED_FEATURE: usize = 16;
+
+/// The most candidate pairs of changed pages weighed: each edited page shares features with at
+/// most [`MAX_SHARED_FEATURE`] base pages a feature, so this is reached only by pages built to
+/// look alike in groups.
+const MAX_CANDIDATE_PAIRS: usize = 1 << 20;
 
 /// The similarity of each changed base page to each changed edited page that shares content
-/// with it: (score, base page, edited page). The score is the features the two share, less the
-/// edited page's features the base page lacks (a redaction removes content and adds none).
+/// with it: (score, base page, edited page, the edited page's features the base page lacks). The
+/// score is the features the two share, less those the base page lacks (a redaction removes
+/// content and adds none).
 fn similarities(
     before: &[PageFacts],
     after: &[PageFacts],
     base_free: &[usize],
     edited_free: &[usize],
     budget: &mut Budget,
-) -> Result<Vec<(i64, usize, usize)>, Fail> {
+) -> Result<Vec<(i64, usize, usize, i64)>, Fail> {
     let mut index: HashMap<u64, Vec<(usize, u32)>> = HashMap::new();
     for &page in base_free {
         let Some(facts) = before.get(page) else { continue };
@@ -831,12 +882,13 @@ fn similarities(
                 continue;
             }
             for (page, base_count) in list {
-                budget.tick()?;
+                budget.pairing()?;
                 *shared.entry(*page).or_default() += i64::from((*count).min(*base_count));
             }
         }
         for (page, common) in shared {
-            out.push((common.saturating_sub(total.saturating_sub(common)), page, other));
+            let lacking = total.saturating_sub(common);
+            out.push((common.saturating_sub(lacking), page, other, lacking));
         }
     }
     Ok(out)
@@ -895,11 +947,9 @@ fn match_pages(before: &[PageFacts], after: &[PageFacts], changes: &mut PageChan
     let used_edited: BTreeSet<usize> = pairs.iter().map(|pair| pair.1).collect();
     let mut base_free: Vec<usize> = (0..before.len()).filter(|page| !used_base.contains(page)).collect();
     let mut edited_free: Vec<usize> = (0..after.len()).filter(|page| !used_edited.contains(page)).collect();
-    let mut moved = 0usize;
     base_free.retain(|&page| {
         let Some(position) = edited_free.iter().position(|&other| base_prints.get(page) == edited_prints.get(other)) else { return true };
         pairs.push((page, edited_free.remove(position)));
-        moved = moved.saturating_add(1);
         false
     });
     // Which gap between pages paired in order a page lies in.
@@ -910,13 +960,59 @@ fn match_pages(before: &[PageFacts], after: &[PageFacts], changes: &mut PageChan
     };
     let apart = |page: usize, other: usize| (said(page, other), slot_of_base(page).abs_diff(slot_of_edited(other)), page.abs_diff(other));
     let mut candidates = similarities(before, after, &base_free, &edited_free, budget)?;
+    if candidates.len() > MAX_CANDIDATE_PAIRS {
+        return Err(Fail::TooComplex);
+    }
     candidates.sort_by(|a, b| b.0.cmp(&a.0).then(apart(a.1, a.2).cmp(&apart(b.1, b.2))).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    candidates.dedup();
     let mut base_taken: BTreeSet<usize> = BTreeSet::new();
     let mut edited_taken: BTreeSet<usize> = BTreeSet::new();
-    for (_, page, other) in candidates {
-        budget.tick()?;
+    // Each candidate's score, by edited page and by base page, for telling pages apart.
+    let mut by_edited: HashMap<usize, Vec<(usize, i64, i64)>> = HashMap::new();
+    let mut by_base: HashMap<usize, Vec<(usize, i64, i64)>> = HashMap::new();
+    for &(score, page, other, lacking) in &candidates {
+        by_edited.entry(other).or_default().push((page, score, lacking));
+        by_base.entry(page).or_default().push((other, score, lacking));
+    }
+    for &(score, page, other, lacking) in &candidates {
+        budget.pairing()?;
         if base_taken.contains(&page) || edited_taken.contains(&other) {
             continue;
+        }
+        // The pairing must be certain: another page still free as alike as this one (within
+        // a margin), lacking no more of the other's content (so that one could be a redaction
+        // of the other as well), leaves which page became which to a guess, unless the
+        // destinations say which (and are then checked against it).
+        let margin = (score / 16).max(2);
+        let said = votes.pairs.get(&(page, other)).copied().unwrap_or(0) > 0;
+        let alike = |rival_score: i64, rival_lacking: i64| rival_score >= score.saturating_sub(margin) && rival_lacking <= lacking;
+        let rival_base = by_edited.get(&other).into_iter().flatten().find(|(rival, rival_score, rival_lacking)| {
+            *rival != page
+                && !base_taken.contains(rival)
+                && alike(*rival_score, *rival_lacking)
+                && (!said || votes.pairs.contains_key(&(*rival, other)))
+        });
+        let rival_edited = by_base.get(&page).into_iter().flatten().find(|(rival, rival_score, rival_lacking)| {
+            *rival != other
+                && !edited_taken.contains(rival)
+                && alike(*rival_score, *rival_lacking)
+                && (!said || votes.pairs.contains_key(&(page, *rival)))
+        });
+        if let Some((rival, ..)) = rival_base {
+            return Err(Fail::Read(format!(
+                "the pages cannot be told apart: base pages {} and {} are as alike to edited page {}",
+                page.saturating_add(1),
+                rival.saturating_add(1),
+                other.saturating_add(1)
+            )));
+        }
+        if let Some((rival, ..)) = rival_edited {
+            return Err(Fail::Read(format!(
+                "the pages cannot be told apart: edited pages {} and {} are as alike to base page {}",
+                other.saturating_add(1),
+                rival.saturating_add(1),
+                page.saturating_add(1)
+            )));
         }
         base_taken.insert(page);
         edited_taken.insert(other);
@@ -953,10 +1049,27 @@ fn match_pages(before: &[PageFacts], after: &[PageFacts], changes: &mut PageChan
         rotated: count(pairs.iter().filter(|(old, new)| before.get(*old).map(|p| p.rotation) != after.get(*new).map(|p| p.rotation)).count()),
         inserted: count(edited_free.len()),
         deleted: count(base_free.len()),
-        moved: count(moved),
+        moved: 0,
     };
     pairs.sort_unstable();
+    // Pages out of their order, whatever paired them (the same page elsewhere, or a changed page
+    // by similarity): the fewest that, moved, give the edited order.
+    let in_place = longest_increasing(&pairs.iter().map(|pair| pair.1).collect::<Vec<_>>());
+    changes.moved = count(pairs.len().saturating_sub(in_place));
     Ok(pairs)
+}
+
+/// The length of the longest strictly increasing subsequence of `values`.
+fn longest_increasing(values: &[usize]) -> usize {
+    let mut tails: Vec<usize> = Vec::new();
+    for &value in values {
+        let at = tails.partition_point(|tail| *tail < value);
+        match tails.get_mut(at) {
+            Some(slot) => *slot = value,
+            None => tails.push(value),
+        }
+    }
+    tails.len()
 }
 
 /// Whether an image of the multiset `a` is missing from the multiset `b`.
@@ -997,7 +1110,40 @@ impl Rasters {
     }
 }
 
+/// Whether glyphs or forms of the base page are on the edited page in other optional content
+/// (R6b-29): glyphs that pair by name and place but not with their membership (`pairing` paired
+/// them with it), or more forms drawn in some membership than the base page draws there (a
+/// redaction only removes forms). Images are compared with theirs (see `images`).
+fn layers_changed_for(base: &PageFacts, edited: &PageFacts, pairing: &glyphs::Pairing, budget: &mut Budget) -> Result<bool, Fail> {
+    if !(base.glyphs.layers.is_empty() && edited.glyphs.layers.is_empty()) {
+        let loose = glyphs::pair_ignoring_layers(&base.glyphs, &edited.glyphs, budget)?;
+        if loose.removed.len() < pairing.removed.len() {
+            return Ok(true);
+        }
+    }
+    let tally = |page: &PageFacts| {
+        let mut counts: BTreeMap<Option<structure::LayerFact>, usize> = BTreeMap::new();
+        for layer in &page.form_layers {
+            let count = counts.entry(*layer).or_default();
+            *count = count.saturating_add(1);
+        }
+        counts
+    };
+    let (in_base, in_edited) = (tally(base), tally(edited));
+    Ok(in_edited.iter().any(|(layer, count)| *count > in_base.get(layer).copied().unwrap_or(0)))
+}
+
+/// The page rendered as a viewer shows it by default: without the content inside `hidden`
+/// optional content (see [`PageFacts::hidden_layers`]).
+fn render_hiding(side: &Side, index: usize, hidden: &[(i32, i32)], budget: &mut Budget) -> Result<UprightRaster, Fail> {
+    render_with(side, index, hidden, budget)
+}
+
 fn render(side: &Side, index: usize, budget: &mut Budget) -> Result<UprightRaster, Fail> {
+    render_with(side, index, &[], budget)
+}
+
+fn render_with(side: &Side, index: usize, hidden: &[(i32, i32)], budget: &mut Budget) -> Result<UprightRaster, Fail> {
     budget.time()?;
     let page = side.structure.pages.get(index).ok_or_else(|| Fail::Read("a page went missing".into()))?;
     if page.image_pixels > budget.limits.page_image_pixels || page.interpreted > budget.limits.page_render_content {
@@ -1007,7 +1153,7 @@ fn render(side: &Side, index: usize, budget: &mut Budget) -> Result<UprightRaste
     budget.pixels(side_px.saturating_mul(side_px))?;
     budget.content(page.interpreted)?;
     let before = side.hayro.work_spent();
-    let raster = side.hayro.render_upright(index, budget.limits.render_side);
+    let raster = side.hayro.render_upright_hiding(index, budget.limits.render_side, hidden);
     budget.work(&side.hayro, before)?;
     raster.map_err(content_failure)
 }
@@ -1062,6 +1208,25 @@ fn compare_pages(
             } else {
                 (Vec::new(), false)
             };
+            // R6b-29. What the page shows by default, where some content is in a layer that is
+            // off, and with every layer off: the render of every layer cannot tell content moved
+            // into or out of a layer, or covered by a layer's content, from what was there.
+            if drawn_differently {
+                let views = [(&b.hidden_layers, &e.hidden_layers), (&b.layer_objects, &e.layer_objects)];
+                for (base_hidden, edited_hidden) in views {
+                    if outside || (base_hidden.is_empty() && edited_hidden.is_empty()) {
+                        continue;
+                    }
+                    let base_view = render_hiding(before, old, base_hidden, budget).map_err(|fail| fail.of(Role::Base))?;
+                    let edited_view = render_hiding(after, new, edited_hidden, budget).map_err(|fail| fail.of(Role::Edited))?;
+                    outside |= visual::redaction_boxes(&base_view, &edited_view).outside;
+                }
+            }
+            // A glyph, image or form now in other optional content (or shown otherwise by
+            // default) than it was: not a redaction, whatever the boxes cover.
+            if drawn_differently {
+                outside |= layers_changed_for(b, e, &pairing, budget).map_err(|fail| fail.of(Role::Edited))?;
+            }
             let mut areas = Areas::new(&boxes);
             // Every removed glyph by its centre, and every image at its own resolution.
             let glyphs_inside = pairing.removed.iter().all(|&index| {
@@ -1361,6 +1526,8 @@ mod conformance_tests;
 mod corpus_tests;
 #[cfg(test)]
 mod destination_tests;
+#[cfg(test)]
+mod layer_tests;
 #[cfg(test)]
 mod limit_tests;
 #[cfg(test)]

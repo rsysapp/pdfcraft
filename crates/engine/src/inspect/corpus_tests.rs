@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use super::*;
-use crate::{Edit, Session};
+use crate::{Edit, NewAnnotation, Session, Shape, Style};
 
 /// The repository's PDF samples (`git ls-files '*.pdf'`).
 const REPOSITORY_SAMPLES: [(&str, &[u8]); 2] = [
@@ -33,6 +33,12 @@ fn edit(base: &[u8], edits: Vec<Edit>) -> Vec<u8> {
     session.save_bytes(id).unwrap().as_ref().clone()
 }
 
+/// A sticky note added to page `page`.
+fn note(page: usize) -> Edit {
+    let shape = Shape::Note { at: [20.0, 20.0], icon: Default::default() };
+    Edit::AddAnnotation(NewAnnotation { page, style: Style::default_for(&shape), shape, contents: "Checked".into(), author: "Reviewer".into() })
+}
+
 /// Nothing changed but what `pages` says, the outline facts, and `removed` annotations (those
 /// of a deleted page).
 fn assert_only(name: &str, inspection: &Inspection, pages: PageChanges, removed: u32) {
@@ -43,8 +49,8 @@ fn assert_only(name: &str, inspection: &Inspection, pages: PageChanges, removed:
     assert_eq!(inspection.form_fields_changed, 0, "{name}: {inspection:?}");
 }
 
-/// Check one sample: unchanged, rotated, and (with two pages or more) a page deleted and a page
-/// moved. Returns a line describing what was found.
+/// Check one sample: unchanged, rotated, annotated, and (with two pages or more) a page deleted,
+/// a page moved, and a page deleted with a note added. Returns a line describing what was found.
 fn check(name: &str, bytes: &[u8]) -> String {
     let inspection = run(bytes, bytes).unwrap_or_else(|error| panic!("{name}, unchanged: {error:?}"));
     let count = inspection.pages.before;
@@ -55,7 +61,11 @@ fn check(name: &str, bytes: &[u8]) -> String {
         .unwrap_or_else(|error| panic!("{name}, rotated: {error:?}"));
     assert_only(name, &rotated, PageChanges { before: count, after: count, rotated: 1, ..PageChanges::default() }, 0);
     assert_eq!(rotated.outlines, OutlineChanges::default(), "{name}, rotated");
-    let mut line = format!("{name}: {count} page(s), clean; rotated: clean");
+    let annotated = run(bytes, &edit(bytes, vec![note(0)])).unwrap_or_else(|error| panic!("{name}, annotated: {error:?}"));
+    assert_eq!(annotated.annotations, AnnotationChanges { comments: 1, ..AnnotationChanges::default() }, "{name}: {annotated:?}");
+    assert_eq!((annotated.content, annotated.text, annotated.pages.rotated), (ContentChanges::default(), TextChanges::default(), 0), "{name}");
+    assert_eq!((annotated.outlines, annotated.destinations), (OutlineChanges::default(), DestinationChanges::default()), "{name}");
+    let mut line = format!("{name}: {count} page(s), clean; rotated: clean; annotated: 1 comment");
     if count >= 2 {
         let last = count as usize - 1;
         let deleted = run(bytes, &edit(bytes, vec![Edit::DeletePages { pages: vec![0] }]))
@@ -71,9 +81,14 @@ fn check(name: &str, bytes: &[u8]) -> String {
         assert_eq!(moved.content, ContentChanges::default(), "{name}: {moved:?}");
         assert_eq!(moved.text, TextChanges::default(), "{name}: {moved:?}");
         assert_eq!(moved.outlines.titles_changed + moved.outlines.added + moved.outlines.removed, 0, "{name}: {moved:?}");
+        let both = run(bytes, &edit(bytes, vec![Edit::DeletePages { pages: vec![0] }, note(0)]))
+            .unwrap_or_else(|error| panic!("{name}, first page deleted and a note added: {error:?}"));
+        assert_eq!(both.pages, PageChanges { before: count, after: count - 1, deleted: 1, ..PageChanges::default() }, "{name}: {both:?}");
+        assert_eq!(both.annotations, AnnotationChanges { comments: 1, removed: annotations, ..AnnotationChanges::default() }, "{name}: {both:?}");
+        assert_eq!((both.content, both.text), (ContentChanges::default(), TextChanges::default()), "{name}: {both:?}");
         line.push_str(&format!(
-            "; first page deleted: accepted ({annotations} annotation(s) gone with it), {:?}; last page moved first: accepted ({} moved), {:?}",
-            deleted.outlines, moved.pages.moved, moved.outlines
+            "; first page deleted: accepted ({annotations} annotation(s) gone with it), {:?}, {:?}; last page moved first: accepted ({} moved), {:?}, {:?}; first page deleted and a note added: accepted, {:?}",
+            deleted.outlines, deleted.destinations, moved.pages.moved, moved.outlines, moved.destinations, both.outlines
         ));
     }
     line

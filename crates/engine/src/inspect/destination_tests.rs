@@ -75,6 +75,18 @@ const HELVETICA: &str = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
 /// `annots(i)`. The catalog (1) has `catalog` entries; with `outline`, an outline (3) has an
 /// entry per page (30 + i) titled "Page i+1" going there. `extra` objects are added as given.
 fn pages(n: usize, catalog: &str, outline: bool, annots: impl Fn(usize) -> String, extra: &[(u32, String)]) -> Vec<u8> {
+    pages_drawing(n, catalog, outline, annots, extra, |i| format!("BT /F1 24 Tf 20 150 Td (Page {}) Tj ET", i + 1))
+}
+
+/// [`pages`], page `i` drawing `content(i)`.
+fn pages_drawing(
+    n: usize,
+    catalog: &str,
+    outline: bool,
+    annots: impl Fn(usize) -> String,
+    extra: &[(u32, String)],
+    content: impl Fn(usize) -> String,
+) -> Vec<u8> {
     let mut objects: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
     let outlines = if outline { "/Outlines 3 0 R" } else { "" };
     objects.insert(1, format!("<< /Type /Catalog /Pages 2 0 R {outlines} {catalog} >>").into_bytes());
@@ -87,7 +99,7 @@ fn pages(n: usize, catalog: &str, outline: bool, annots: impl Fn(usize) -> Strin
             format!("<< /Type /Page /Parent 2 0 R /Contents {} 0 R /Resources << /Font << /F1 {HELVETICA} >> >> {} >>", 20 + i, annots(i))
                 .into_bytes(),
         );
-        objects.insert(20 + i as u32, stream("", format!("BT /F1 24 Tf 20 150 Td (Page {}) Tj ET", i + 1).as_bytes()));
+        objects.insert(20 + i as u32, stream("", content(i).as_bytes()));
         if outline {
             let links = match (i, n - 1 - i) {
                 (0, 0) => "".to_string(),
@@ -203,6 +215,123 @@ fn a_changed_page_pairs_with_the_base_page_it_shares_most_with() {
     assert_eq!(inspection.pages, PageChanges { before: 2, after: 1, deleted: 1, ..PageChanges::default() }, "{inspection:?}");
     assert_eq!(inspection.text, TextChanges { pages_with_text_removed: 1, pages_with_text_added: 0 }, "{inspection:?}");
     assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{inspection:?}");
+}
+
+// ── scan item: a pairing that is not certain is refused ─────────────────────────────────────
+
+/// "Page n", and on page `redacted` a box over "e n" instead (by hand, as a redactor that
+/// removes only what its box covers would write it).
+fn numbered(redacted: usize) -> impl Fn(usize) -> String {
+    move |i| {
+        if i == redacted {
+            "BT /F1 24 Tf 20 150 Td (Pag) Tj ET\n0 g 63 140 37 35 re f".to_string()
+        } else {
+            format!("BT /F1 24 Tf 20 150 Td (Page {}) Tj ET", i + 1)
+        }
+    }
+}
+
+#[test]
+fn pages_that_cannot_be_told_apart_are_refused_unless_a_destination_says() {
+    // Four pages; page 4's number redacted and page 1 deleted. What is left of page 4 ("Pag")
+    // could as well be what is left of page 1: on fd434a2 the first page that could be its
+    // redaction (page 1) was taken.
+    let plain = pages(4, "", false, |_| String::new(), &[]);
+    let edited = session(&pages_drawing(4, "", false, |_| String::new(), &[], numbered(3)), vec![Edit::DeletePages { pages: vec![0] }]);
+    assert!(refused(run(&plain, &edited)).contains("cannot be told apart"));
+    // With an outline whose entry for page 4 now goes to the third page (and page 1's entry
+    // to none), the destinations say which: accepted, and checked against that pairing.
+    let base = pages(4, "", true, |_| String::new(), &[]);
+    let edited = session(&pages_drawing(4, "", true, |_| String::new(), &[], numbered(3)), vec![Edit::DeletePages { pages: vec![0] }]);
+    let inspection = run(&base, &edited).unwrap();
+    assert_eq!(inspection.pages, PageChanges { before: 4, after: 3, deleted: 1, ..PageChanges::default() }, "{inspection:?}");
+    assert_eq!((inspection.content.pages_changed_outside_redactions, inspection.redaction_areas.len()), (0, 1), "{inspection:?}");
+    assert_eq!(inspection.redaction_areas.first().map(|area| area.0), Some(3), "{inspection:?}");
+    assert_eq!(inspection.outlines.destinations_changed, 4, "{inspection:?}");
+}
+
+/// Two pages: "Terms" and `first`, then "Terms", `second` (in 12-point Helvetica).
+fn two_pages(first: &str, second: &str) -> Vec<u8> {
+    let page = |extra: &str| format!("BT /F1 12 Tf 20 250 Td (Terms of supply) Tj ET\n{extra}");
+    let (first, second) = (page(first), page(second));
+    pages_drawing(2, "", false, |_| String::new(), &[], move |i| if i == 0 { first.clone() } else { second.clone() })
+}
+
+const CLAUSE_X: &str = "BT /F1 12 Tf 20 150 Td (Seller is liable) Tj ET";
+const CLAUSE_X_BOX: &str = "0 g 18 145 95 17 re f";
+
+#[test]
+fn a_page_replaced_by_a_copy_of_another_is_refused() {
+    // Base: page 1 "Terms", page 2 "Terms" and a clause. Edited (a rewrite): both pages are
+    // page 2 with its clause redacted. Either could be page 1 with a box over nothing, or page 2
+    // redacted: on fd434a2 page 1 was taken for the first, page 2 for the second, and the copy
+    // passed as a redaction.
+    let base = two_pages("", CLAUSE_X);
+    let copied = two_pages(CLAUSE_X_BOX, CLAUSE_X_BOX);
+    assert!(refused(run(&base, &copied)).contains("cannot be told apart"));
+    // One page redacted in place is certain.
+    let redacted = two_pages("", CLAUSE_X_BOX);
+    let inspection = run(&base, &redacted).unwrap();
+    assert_eq!((inspection.content.pages_changed_outside_redactions, inspection.redaction_areas.len()), (0, 1), "{inspection:?}");
+}
+
+#[test]
+fn near_identical_pages_swapped_are_reported_moved() {
+    // Page 2 is page 1 and a clause. A rewrite redacts the clause and puts page 2 first: the
+    // pages changed order, which fd434a2 did not report (only pages unchanged elsewhere were
+    // moves).
+    let base = two_pages("", CLAUSE_X);
+    let swapped = {
+        let page = |extra: &str| format!("BT /F1 12 Tf 20 250 Td (Terms of supply) Tj ET\n{extra}");
+        let (first, second) = (page(CLAUSE_X_BOX), page(""));
+        pages_drawing(2, "", false, |_| String::new(), &[], move |i| if i == 0 { first.clone() } else { second.clone() })
+    };
+    let inspection = run(&base, &swapped).unwrap();
+    assert_eq!(inspection.pages, PageChanges { before: 2, after: 2, moved: 1, ..PageChanges::default() }, "{inspection:?}");
+    assert_eq!(inspection.redaction_areas.first().map(|area| area.0), Some(1), "{inspection:?}");
+}
+
+#[test]
+fn pairing_two_thousand_near_identical_pages_is_bounded() {
+    use std::time::{Duration, Instant};
+    // Glyph `g` of 40 on a page: the same text at the same places on every page, and the
+    // page's own number.
+    let page = |own: usize, shared: &dyn Fn(usize) -> char, glyphs: usize| {
+        let mut out = structure::Glyphs::default();
+        for g in 0..glyphs {
+            let (x, y) = ((g % 30) as f32 * 6.0, 10.0 + (g / 30) as f32 * 12.0);
+            out.page.chars.push(shared(g));
+            out.page.glyphs.push((out.page.chars.len() as u32, [x, y, x + 6.0, y + 12.0]));
+        }
+        for (k, c) in format!("{own:04}").chars().enumerate() {
+            out.page.chars.push(c);
+            out.page.glyphs.push((out.page.chars.len() as u32, [20.0 + k as f32 * 6.0, 580.0, 26.0 + k as f32 * 6.0, 592.0]));
+        }
+        out
+    };
+    let pairs_of = |shared: &dyn Fn(usize, usize) -> char, glyphs: usize| {
+        let facts = |tag: &[u8]| -> Vec<PageFacts> {
+            (0..MAX_PAGES).map(|i| PageFacts::for_tests(page(i, &|g| shared(i, g), glyphs), structure::sha256(&[tag, &i.to_le_bytes()]))).collect()
+        };
+        let (base, edited) = (facts(b"base"), facts(b"edited"));
+        let mut budget = Budget::new(Limits::default());
+        let mut changes = PageChanges::default();
+        let started = Instant::now();
+        let result = match_pages(&base, &edited, &mut changes, &Votes::default(), &mut budget);
+        (result, changes, started.elapsed())
+    };
+    // Every page the same 40 glyphs but for its number: each pairs with its own.
+    let (result, changes, took) = pairs_of(&|_, g| char::from(b'a' + (g % 26) as u8), 40);
+    let pairs = result.map_err(|error| format!("{error:?}")).unwrap();
+    assert!(pairs.iter().all(|(old, new)| old == new) && pairs.len() == MAX_PAGES, "{changes:?}");
+    assert_eq!(changes.moved, 0);
+    assert!(took < Duration::from_secs(10), "{took:?}");
+    // Pages alike in groups of sixteen, with many glyphs each (every feature shared by sixteen
+    // pages, the most that still counts): the pairing's work is bounded, and past it the
+    // inspection is too complex.
+    let (result, _, took) = pairs_of(&|i, g| char::from_u32(0x4E00 + (i / 16) as u32 * 1_200 + g as u32).unwrap_or('x'), 1_200);
+    assert!(matches!(result, Err(Fail::TooComplex)), "not too complex");
+    assert!(took < Duration::from_secs(10), "{took:?}");
 }
 
 // ── R6b-32: named destinations and links follow their pages ─────────────────────────────────

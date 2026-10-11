@@ -326,15 +326,20 @@ fn an_image_in_optional_content_that_is_off_is_drawn_and_compared() {
         ("marked as off", "/OFF [6 0 R]", "/OC /L BDC", "", vec![]),
         ("off by the base state", "/BaseState /OFF", "/OC /L BDC", "", vec![]),
         ("an image whose /OC is off", "/OFF [6 0 R]", "", "/OC 6 0 R", vec![]),
-        // Readers disagree on these: hayro alone hid them before it drew every layer.
+        ("a membership dictionary with a visibility expression", "/OFF [6 0 R]", "/OC /M BDC", "", vec![membership.clone()]),
+        // Readers disagree on these (hayro alone hid them): refused, as optional content that
+        // cannot be evaluated (R6b-29), here in the base.
         ("a group named by a tag other than /OC", "/OFF [6 0 R]", "/Span /L BDC", "", vec![]),
-        ("a membership dictionary with a visibility expression", "/OFF [6 0 R]", "/OC /M BDC", "", vec![membership]),
         ("a group with an automatic state", "/OFF [6 0 R] /AS [<< /Event /View /OCGs [6 0 R] /Category [/View] >>]", "/OC /L BDC", "", vec![]),
     ];
     for (case, config, begin, oc, extra) in cases {
         let (open, close) = if begin.is_empty() { ("", "") } else { (begin, "EMC") };
         let file = |pixels: &[u8], word: &str| layered(config, &format!("{open} {DRAW_IMAGE} {close}\n{word}"), grey(16, 16, pixels, oc), &extra);
         let base = file(&pixels, WORD);
+        if case.contains("tag other than") || case.contains("automatic state") {
+            assert!(matches!(run(&base, &base), Err(InspectError::Base(message)) if message.contains("cannot be evaluated")), "{case}");
+            continue;
+        }
         let inspection = run(&base, &base).unwrap_or_else(|error| panic!("{case}: {error:?}"));
         assert_eq!(inspection.content, ContentChanges::default(), "{case}");
         // A viewer's Layers panel shows it: compared like any image.
@@ -608,6 +613,12 @@ fn text_added_where_hayro_alone_hid_it_is_seen() {
         let base = layer_page(listed, config, WORD);
         assert_eq!(run(&base, &base).unwrap().content, ContentChanges::default(), "{case}");
         let edited = layer_page(listed, config, &format!("{WORD_BOX}\n{begin} {} EMC", text(20, 200, "Secret")));
+        // Since R6b-29 each but the visibility expression is optional content that cannot be
+        // evaluated against the configuration: refused outright.
+        if !case.contains("visibility expression") {
+            assert!(edited_error(run(&base, &edited)).contains("cannot be evaluated"), "{case}");
+            continue;
+        }
         let inspection = run(&base, &edited).unwrap_or_else(|error| panic!("{case}: {error:?}"));
         assert_eq!(inspection.text.pages_with_text_added, 1, "{case}: {inspection:?}");
         assert_eq!(inspection.content.pages_changed_outside_redactions, 1, "{case}: {inspection:?}");
@@ -644,9 +655,12 @@ fn an_image_in_a_group_off_but_not_listed_in_ocgs_is_compared() {
             &[grey(16, 16, pixels, ""), b"<< /Type /OCG /Name (Layer) >>".to_vec()],
         )
     };
+    // A group missing from /OCGs is shown by some readers and hidden by others: refused since
+    // R6b-29 (here, in the base).
     let base = file(&pixels, WORD);
-    let inspection = run(&base, &file(&changed, WORD_BOX)).unwrap();
-    assert_eq!(inspection.content.pages_changed_outside_redactions, 1, "{inspection:?}");
+    assert!(
+        matches!(run(&base, &file(&changed, WORD_BOX)), Err(InspectError::Base(message)) if message.contains("not listed in /OCProperties /OCGs"))
+    );
 }
 
 #[test]
