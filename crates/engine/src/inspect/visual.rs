@@ -298,3 +298,108 @@ pub(crate) fn area_filled(base: &UprightRaster, edited: &UprightRaster, area: [f
     }
     fill.is_some() && covered_something
 }
+
+/// A comparison render reduced to blocks of [`BLOCK`] × [`BLOCK`] pixels, for pairing changed
+/// pages that share no glyph or image (R6b-38): each block's mean luminance, in quarters of a
+/// level, and whether it holds a pixel of a redaction fill.
+pub(crate) struct Thumb {
+    width: u32,
+    height: u32,
+    columns: usize,
+    rows: usize,
+    mean: Vec<u16>,
+    filled: Vec<bool>,
+}
+
+/// The side of a [`Thumb`]'s blocks, in render pixels: more than [`EDGE`], so that a changed
+/// pixel's fill lies in its block or a neighbouring one. A 1,600-pixel render gives about 124
+/// blocks a side.
+pub(crate) const BLOCK: usize = 13;
+
+impl Thumb {
+    /// The bytes it holds, for the pairing's memory bound.
+    pub fn bytes(&self) -> usize {
+        self.mean.len().saturating_mul(3)
+    }
+
+    /// Its blocks.
+    pub fn blocks(&self) -> usize {
+        self.mean.len()
+    }
+}
+
+#[cfg(test)]
+impl Thumb {
+    /// A render's blocks that tell page `id` from any other page, for tests of the pairing.
+    pub fn for_tests(id: usize) -> Self {
+        let columns = usize::BITS as usize;
+        let mean = (0..columns).map(|bit| if id >> bit & 1 == 1 { 800 } else { 0 }).collect();
+        Thumb { width: 100, height: 100, columns, rows: 1, mean, filled: vec![false; columns] }
+    }
+}
+
+/// The render reduced to a [`Thumb`].
+pub(crate) fn thumb(raster: &UprightRaster) -> Thumb {
+    let (width, height) = (raster.width as usize, raster.height as usize);
+    let columns = width.div_ceil(BLOCK);
+    let rows = height.div_ceil(BLOCK);
+    let blocks = columns.saturating_mul(rows);
+    // Luminance in thousandths of a level, summed per block.
+    let mut sums = vec![0u64; blocks];
+    let mut counts = vec![0u64; blocks];
+    let mut filled = vec![false; blocks];
+    for y in 0..height {
+        for x in 0..width {
+            let index = y.saturating_mul(width).saturating_add(x);
+            let block = (y / BLOCK).saturating_mul(columns).saturating_add(x / BLOCK);
+            let Some(pixel) = channels(raster, index) else { continue };
+            let (r, g, b) = (pixel.first(), pixel.get(1), pixel.get(2));
+            let (Some(r), Some(g), Some(b)) = (r, g, b) else { continue };
+            let luminance = u64::from(*r) * 299 + u64::from(*g) * 587 + u64::from(*b) * 114;
+            if let (Some(sum), Some(count)) = (sums.get_mut(block), counts.get_mut(block)) {
+                *sum = sum.saturating_add(luminance);
+                *count = count.saturating_add(1);
+            }
+            if colour(raster, index).is_some_and(|c| REDACTION_FILLS.contains(&c))
+                && let Some(slot) = filled.get_mut(block)
+            {
+                *slot = true;
+            }
+        }
+    }
+    // Quarters of a level (at most 1,020), rounded down.
+    let mean = sums.iter().zip(&counts).map(|(sum, count)| if *count == 0 { 0 } else { (sum.saturating_mul(4) / 1_000 / count) as u16 }).collect();
+    Thumb { width: raster.width, height: raster.height, columns, rows, mean, filled }
+}
+
+/// How many blocks of `base` and `edited` certainly differ (their mean luminance by more than
+/// [`NOISE`]) with no redaction fill of the edited render in them or beside them; `None` when the
+/// renders' sizes differ. Zero is necessary for [`redaction_boxes`] to find nothing outside the
+/// boxes: a mean differing by more than `NOISE` means a pixel whose luminance, so one of whose
+/// channels, differs by more than `NOISE`, and every such pixel lies within [`EDGE`] pixels of a
+/// box made of the fill's pixels, in its block or a neighbouring one. So an edited page could be
+/// a redaction of a base page only where this is zero.
+pub(crate) fn unexplained(base: &Thumb, edited: &Thumb) -> Option<usize> {
+    if base.width != edited.width || base.height != edited.height || base.mean.len() != edited.mean.len() {
+        return None;
+    }
+    // Rounding down loses less than a quarter of a level on each side.
+    let threshold = u16::from(NOISE) * 4 + 1;
+    let near_fill = |row: usize, column: usize| {
+        (row.saturating_sub(1)..=row.saturating_add(1).min(edited.rows.saturating_sub(1))).any(|r| {
+            (column.saturating_sub(1)..=column.saturating_add(1).min(edited.columns.saturating_sub(1)))
+                .any(|c| edited.filled.get(r.saturating_mul(edited.columns).saturating_add(c)).copied().unwrap_or(false))
+        })
+    };
+    let mut count = 0usize;
+    for (block, (a, b)) in base.mean.iter().zip(&edited.mean).enumerate() {
+        if a.abs_diff(*b) <= threshold {
+            continue;
+        }
+        let (row, column) = (block / edited.columns.max(1), block % edited.columns.max(1));
+        if !near_fill(row, column) {
+            count = count.saturating_add(1);
+        }
+    }
+    Some(count)
+}

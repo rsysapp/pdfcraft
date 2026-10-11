@@ -177,13 +177,20 @@ fn a_redaction_and_an_earlier_page_deleted_pair_by_content() {
         assert_eq!(inspection.redaction_areas.len(), 1, "{case}: {inspection:?}");
         assert_eq!(inspection.outlines, OutlineChanges { destinations_changed: destinations, ..OutlineChanges::default() }, "{case}: {inspection:?}");
     }
-    // Without an outline, the same edits pair the redacted page with its base page too.
+    // Without an outline nothing tells them apart: the redaction leaves page 4 showing what a
+    // redaction of page 1 would show (a box over its only line), so which was deleted is a
+    // guess. Position alone paired them until R6b-38; their renders now say they could each be
+    // the page left, and the save fails.
     let plain = pages(4, "", false, |_| String::new(), &[]);
     let mut edits = redact_number(3);
     edits.push(Edit::DeletePages { pages: vec![0] });
+    assert!(refused(run(&plain, &session(&plain, edits))).contains("cannot be told apart"));
+    // A redaction that leaves the page's own line tells it apart: paired with its base page.
+    let mut edits =
+        vec![annotation(3, Shape::Redact { quads: vec![rect_quad([16.0, 40.0, 100.0, 100.0])], overlay: String::new(), look: Default::default() })];
+    edits.extend([Edit::ApplyRedactions { pages: None }, Edit::DeletePages { pages: vec![0] }]);
     let inspection = run(&plain, &session(&plain, edits)).unwrap();
     assert_eq!((inspection.pages.deleted, inspection.content.pages_changed_outside_redactions), (1, 0), "{inspection:?}");
-    assert_eq!(inspection.redaction_areas.first().map(|area| area.0), Some(3), "{inspection:?}");
 }
 
 #[test]
@@ -291,37 +298,46 @@ fn near_identical_pages_swapped_are_reported_moved() {
     assert_eq!(inspection.redaction_areas.first().map(|area| area.0), Some(1), "{inspection:?}");
 }
 
+/// Page `own`'s glyphs, as far as pairing goes: `glyphs` glyphs (glyph `g` is `shared(g)`, at
+/// the same place on every page), and the page's own number.
+fn synthetic_glyphs(own: usize, shared: &dyn Fn(usize) -> char, glyphs: usize) -> structure::Glyphs {
+    let mut out = structure::Glyphs::default();
+    for g in 0..glyphs {
+        let (x, y) = ((g % 30) as f32 * 6.0, 10.0 + (g / 30) as f32 * 12.0);
+        out.page.chars.push(shared(g));
+        out.page.glyphs.push((out.page.chars.len() as u32, [x, y, x + 6.0, y + 12.0]));
+    }
+    for (k, c) in format!("{own:04}").chars().enumerate() {
+        out.page.chars.push(c);
+        out.page.glyphs.push((out.page.chars.len() as u32, [20.0 + k as f32 * 6.0, 580.0, 26.0 + k as f32 * 6.0, 592.0]));
+    }
+    out
+}
+
+/// Pair 2,000 changed base pages with 2,000 changed edited pages, page `i` on both sides drawing
+/// glyph `g` as `shared(i, g)`: the pairs, the page changes and how long it took.
+fn pair_synthetic(shared: &dyn Fn(usize, usize) -> char, glyphs: usize, limits: Limits) -> (Result<Pairs, Fail>, PageChanges, std::time::Duration) {
+    let facts = |tag: &[u8]| -> Vec<PageFacts> {
+        (0..MAX_PAGES)
+            .map(|i| PageFacts::for_tests(synthetic_glyphs(i, &|g| shared(i, g), glyphs), structure::sha256(&[tag, &i.to_le_bytes()])))
+            .collect()
+    };
+    let (base, edited) = (facts(b"base"), facts(b"edited"));
+    let mut budget = Budget::new(limits);
+    let mut changes = PageChanges::default();
+    let started = std::time::Instant::now();
+    // Each page's render, as far as pairing goes: page `i`'s own (its number differs).
+    let mut thumbs = |_: bool, index: usize, _: &mut Budget| -> Result<visual::Thumb, Fail> { Ok(visual::Thumb::for_tests(index)) };
+    let result = match_pages(&base, &edited, &mut changes, &Votes::default(), &mut thumbs, &mut budget);
+    (result, changes, started.elapsed())
+}
+
 #[test]
 fn pairing_two_thousand_near_identical_pages_is_bounded() {
-    use std::time::{Duration, Instant};
-    // Glyph `g` of 40 on a page: the same text at the same places on every page, and the
-    // page's own number.
-    let page = |own: usize, shared: &dyn Fn(usize) -> char, glyphs: usize| {
-        let mut out = structure::Glyphs::default();
-        for g in 0..glyphs {
-            let (x, y) = ((g % 30) as f32 * 6.0, 10.0 + (g / 30) as f32 * 12.0);
-            out.page.chars.push(shared(g));
-            out.page.glyphs.push((out.page.chars.len() as u32, [x, y, x + 6.0, y + 12.0]));
-        }
-        for (k, c) in format!("{own:04}").chars().enumerate() {
-            out.page.chars.push(c);
-            out.page.glyphs.push((out.page.chars.len() as u32, [20.0 + k as f32 * 6.0, 580.0, 26.0 + k as f32 * 6.0, 592.0]));
-        }
-        out
-    };
-    let pairs_of = |shared: &dyn Fn(usize, usize) -> char, glyphs: usize| {
-        let facts = |tag: &[u8]| -> Vec<PageFacts> {
-            (0..MAX_PAGES).map(|i| PageFacts::for_tests(page(i, &|g| shared(i, g), glyphs), structure::sha256(&[tag, &i.to_le_bytes()]))).collect()
-        };
-        let (base, edited) = (facts(b"base"), facts(b"edited"));
-        let mut budget = Budget::new(Limits::default());
-        let mut changes = PageChanges::default();
-        let started = Instant::now();
-        let result = match_pages(&base, &edited, &mut changes, &Votes::default(), &mut budget);
-        (result, changes, started.elapsed())
-    };
-    // Every page the same 40 glyphs but for its number: each pairs with its own.
-    let (result, changes, took) = pairs_of(&|_, g| char::from(b'a' + (g % 26) as u8), 40);
+    use std::time::Duration;
+    // Every page the same 40 glyphs but for its number: each pairs with its own (by its render:
+    // every glyph is shared by more pages than tells them apart).
+    let (result, changes, took) = pair_synthetic(&|_, g| char::from(b'a' + (g % 26) as u8), 40, Limits::default());
     let pairs = result.map_err(|error| format!("{error:?}")).unwrap();
     assert!(pairs.iter().all(|(old, new)| old == new) && pairs.len() == MAX_PAGES, "{changes:?}");
     assert_eq!(changes.moved, 0);
@@ -329,9 +345,36 @@ fn pairing_two_thousand_near_identical_pages_is_bounded() {
     // Pages alike in groups of sixteen, with many glyphs each (every feature shared by sixteen
     // pages, the most that still counts): the pairing's work is bounded, and past it the
     // inspection is too complex.
-    let (result, _, took) = pairs_of(&|i, g| char::from_u32(0x4E00 + (i / 16) as u32 * 1_200 + g as u32).unwrap_or('x'), 1_200);
+    let (result, _, took) =
+        pair_synthetic(&|i, g| char::from_u32(0x4E00 + (i / 16) as u32 * 1_200 + g as u32).unwrap_or('x'), 1_200, Limits::default());
     assert!(matches!(result, Err(Fail::TooComplex)), "not too complex");
     assert!(took < Duration::from_secs(10), "{took:?}");
+}
+
+/// Glyph `g` of page `i` in pages built so that each shares one glyph with about 600 others
+/// (each glyph with 15 others, a different 15 for each glyph): about a million candidate pairs.
+fn spread(i: usize, g: usize) -> char {
+    let multiplier = [1usize, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79][g % 20] + 2 * (g / 20) * 83;
+    let group = (i * multiplier % MAX_PAGES) / 16;
+    char::from_u32(0x4E00 + (g * 200 + group) as u32).unwrap_or('x')
+}
+
+#[test]
+fn the_pairing_s_working_memory_is_charged_to_its_bound() {
+    // The minor item of the follow-up 3 review: about a million candidate pairs were weighed in
+    // some 220 MB that no bound charged. The same pairing, charged: within the default bound
+    // (64 MiB) it is too complex; with room for it, it completes, each page with its own.
+    use std::time::Duration;
+    let (result, _, took) = pair_synthetic(&spread, 40, Limits::default());
+    assert!(matches!(result, Err(Fail::TooComplex)), "not too complex: {:?}", result.map(|pairs| pairs.len()));
+    assert!(took < Duration::from_secs(10), "{took:?}");
+    let roomy = Limits { pairing_bytes: usize::MAX, pairing: u64::MAX, ..Limits::default() };
+    let (result, _, _) = pair_synthetic(&spread, 40, roomy);
+    let pairs = result.map_err(|error| format!("{error:?}")).unwrap();
+    assert!(pairs.iter().all(|(old, new)| old == new) && pairs.len() == MAX_PAGES);
+    // A budget that cannot hold one base page's features stops at once.
+    let tiny = Limits { pairing_bytes: 1_000, ..Limits::default() };
+    assert!(matches!(pair_synthetic(&spread, 40, tiny).0, Err(Fail::TooComplex)));
 }
 
 // ── R6b-32: named destinations and links follow their pages ─────────────────────────────────

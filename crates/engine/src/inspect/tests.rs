@@ -1255,6 +1255,57 @@ fn a_real_image_redaction_is_accepted() {
     assert_eq!(inspection.redaction_areas.len(), 1);
 }
 
+/// Scanned pages (`/Im1`, `/Im2`, … over each whole page, 400 × 600 Flate grey pixels), page `i`
+/// showing a texture with dark "lines" placed by `textures[i]`: what tells scans apart.
+fn scans(textures: &[usize]) -> Vec<u8> {
+    let (width, height) = (400usize, 600usize);
+    let images: Vec<Vec<u8>> = textures
+        .iter()
+        .map(|&seed| {
+            let mut pixels = texture(width, height);
+            for line in 0..6 {
+                let y = 40 + (seed * 37 + line * 89) % 500;
+                fill_pixels(&mut pixels, width, (40 + seed * 13 % 60, 300 + seed * 7 % 60), (y, y + 12), 30);
+            }
+            grey_flate(width, height, &pixels)
+        })
+        .collect();
+    let pages: Vec<PageSpec> = (0..textures.len()).map(|i| scan_page(i + 1)).collect();
+    pages_pdf(&pages, &images)
+}
+
+#[test]
+fn a_scan_redacted_with_an_earlier_page_deleted_pairs_by_its_render() {
+    // R6b-38, the reviewer's I-B (`l_image_redactions`): the redactor codes the redacted image
+    // again, so the redacted page shares no glyph or image with any page; on e91797d it paired by
+    // position with the deleted page, and the save was refused (`outside 1`). It pairs now by
+    // its render at a low resolution, outside the area the edit filled.
+    let redact_page = |page: usize| vec![annotation(page, redact([40.0, 40.0, 100.0, 100.0])), Edit::ApplyRedactions { pages: None }];
+    // (case, pages, page redacted, page deleted)
+    for (case, count, redacted, deleted) in [
+        ("2 pages: redact 2, delete 1", 2, 1, Some(0)),
+        ("3 pages: redact 2, delete 1", 3, 1, Some(0)),
+        ("redact 2 only", 2, 1, None),
+        ("redact 1, delete 2", 2, 0, Some(1)),
+        ("redact 3, delete 1", 3, 2, Some(0)),
+    ] {
+        let base = scans(&(1..=count).collect::<Vec<_>>());
+        let mut edits = redact_page(redacted);
+        edits.extend(deleted.map(|page| Edit::DeletePages { pages: vec![page] }));
+        let inspection = run(&base, &session_edit(base.clone(), edits)).unwrap_or_else(|error| panic!("{case}: {error:?}"));
+        assert_eq!(inspection.pages.deleted, u32::from(deleted.is_some()), "{case}: {inspection:?}");
+        assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{case}: {inspection:?}");
+        assert_eq!(inspection.redaction_areas.len(), 1, "{case}: {inspection:?}");
+        let page = redacted + 1 - usize::from(deleted.is_some_and(|deleted| deleted < redacted));
+        assert_eq!(inspection.redaction_areas.first().map(|area| area.0 as usize), Some(page), "{case}: {inspection:?}");
+    }
+    // Two pages that show the same scan: which one is left cannot be told, so the save fails.
+    let base = scans(&[4, 4]);
+    let mut edits = redact_page(1);
+    edits.push(Edit::DeletePages { pages: vec![0] });
+    assert!(edited_error(run(&base, &session_edit(base.clone(), edits))).contains("cannot be told apart"));
+}
+
 fn jpeg_grey(width: u32, height: u32, pixels: &[u8], quality: u8) -> Vec<u8> {
     let mut out = Vec::new();
     image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality).encode(pixels, width, height, image::ExtendedColorType::L8).unwrap();

@@ -348,8 +348,13 @@ pub(crate) struct Limits {
     /// Image samples compared one by one.
     pub compared: u64,
     /// The steps pairing changed pages by similarity may take (a feature counted, a shared
-    /// feature looked up for a page, a candidate pair weighed), in all.
+    /// feature looked up for a page, a candidate pair weighed, a sixty-fourth of the blocks of
+    /// two page renders compared), in all.
     pub pairing: u64,
+    /// The working memory pairing changed pages may hold at once (feature tables, the index of
+    /// the base pages' features, candidate pairs, page renders reduced to blocks), estimated
+    /// from above, in bytes.
+    pub pairing_bytes: usize,
 }
 
 impl Default for Limits {
@@ -372,6 +377,7 @@ impl Default for Limits {
             image_bytes_each: 64 << 20,
             compared: 1 << 30,
             pairing: 1 << 25,
+            pairing_bytes: 64 << 20,
         }
     }
 }
@@ -417,6 +423,8 @@ pub(crate) struct Budget {
     image_bytes_left: usize,
     compared_left: u64,
     pairing_left: u64,
+    /// The pairing's working memory held now (see [`Limits::pairing_bytes`]).
+    pairing_held: usize,
     ticks: u32,
     pub limits: Limits,
 }
@@ -436,6 +444,7 @@ impl Budget {
             image_bytes_left: limits.image_bytes,
             compared_left: limits.compared,
             pairing_left: limits.pairing,
+            pairing_held: 0,
             ticks: 0,
             limits,
         }
@@ -517,6 +526,22 @@ impl Budget {
         self.tick()
     }
 
+    /// The pairing takes `bytes` more working memory (see [`Limits::pairing_bytes`]).
+    pub fn pairing_hold(&mut self, bytes: usize) -> Result<(), Fail> {
+        self.pairing_held = self.pairing_held.saturating_add(bytes);
+        if self.pairing_held > self.limits.pairing_bytes { Err(Fail::TooComplex) } else { Ok(()) }
+    }
+
+    /// The pairing gives back `bytes` of working memory.
+    pub fn pairing_release(&mut self, bytes: usize) {
+        self.pairing_held = self.pairing_held.saturating_sub(bytes);
+    }
+
+    /// The pairing is over: it holds nothing.
+    fn pairing_done(&mut self) {
+        self.pairing_held = 0;
+    }
+
     pub fn compared(&mut self, samples: usize) -> Result<(), Fail> {
         self.compared_left = self.compared_left.checked_sub(samples as u64).ok_or(Fail::TooComplex)?;
         self.tick()
@@ -560,7 +585,12 @@ fn compare(base: &[u8], edited: &[u8], limits: Limits) -> Result<Inspection, Ins
     // changed pages equally alike, which went where.
     let outline_pairs = outline::pair(&before.structure.outline, &after.structure.outline, &mut budget).map_err(edited_fail)?;
     let votes = Votes::new(&before.structure, &after.structure, &outline_pairs);
-    let pairs = match_pages(&before.structure.pages, &after.structure.pages, &mut inspection.pages, &votes, &mut budget).map_err(edited_fail)?;
+    // Pages that share no glyph or image are paired by their renders (R6b-38).
+    let mut thumbs = |edited: bool, index: usize, budget: &mut Budget| {
+        render(if edited { &after } else { &before }, index, budget).map(|raster| visual::thumb(&raster))
+    };
+    let pairs =
+        match_pages(&before.structure.pages, &after.structure.pages, &mut inspection.pages, &votes, &mut thumbs, &mut budget).map_err(edited_fail)?;
     // Destinations are judged through the pages' pairing: one may follow its page, nothing more.
     let followed: BTreeMap<usize, usize> = pairs.iter().copied().collect();
     if before.structure.outline_root != after.structure.outline_root {
@@ -808,8 +838,18 @@ fn in_order(a: &[Digest], b: &[Digest]) -> Pairs {
 /// The cells are coarse on purpose: a rewrite that sets kept text a little off still leaves most
 /// glyphs in their cells. Only which pages pair rests on this; the comparison that follows is
 /// exact.
+/// Bytes a feature table holds per feature counted (a `HashMap<u64, u32>` entry and its control
+/// byte, at most half full after a resize), from above. The caller releases
+/// [`feature_bytes`] of the table when it drops it.
+const FEATURE_BYTES: usize = 48;
+
+fn feature_bytes(page: &PageFacts) -> usize {
+    page.glyphs.len().saturating_add(page.image_uses.len().max(page.images.len())).saturating_mul(FEATURE_BYTES)
+}
+
 fn features(page: &PageFacts, budget: &mut Budget) -> Result<HashMap<u64, u32>, Fail> {
     use std::hash::{Hash, Hasher};
+    budget.pairing_hold(feature_bytes(page))?;
     let cell = |value: f64| (value / 4.0).floor() as i64;
     let mut out: HashMap<u64, u32> = HashMap::new();
     let mut add = |key: u64| {
@@ -870,12 +910,21 @@ fn similarities(
     edited_free: &[usize],
     budget: &mut Budget,
 ) -> Result<Vec<(i64, usize, usize, i64)>, Fail> {
+    // The index of the base pages' features: per feature a table entry and a list, per base
+    // page sharing it a list item (lists at most half full), held until the pairing ends.
     let mut index: HashMap<u64, Vec<(usize, u32)>> = HashMap::new();
     for &page in base_free {
         let Some(facts) = before.get(page) else { continue };
-        for (key, count) in features(facts, budget)? {
-            index.entry(key).or_default().push((page, count));
+        let found = features(facts, budget)?;
+        for (key, count) in found {
+            budget.pairing_hold(INDEX_ITEM_BYTES)?;
+            let list = index.entry(key).or_default();
+            if list.is_empty() {
+                budget.pairing_hold(INDEX_KEY_BYTES)?;
+            }
+            list.push((page, count));
         }
+        budget.pairing_release(feature_bytes(facts));
     }
     let mut out = Vec::new();
     for &other in edited_free {
@@ -883,6 +932,7 @@ fn similarities(
         let found = features(facts, budget)?;
         let total: i64 = found.values().map(|count| i64::from(*count)).sum();
         let mut shared: BTreeMap<usize, i64> = BTreeMap::new();
+        let mut shared_bytes = 0usize;
         for (key, count) in &found {
             let Some(list) = index.get(key) else { continue };
             if list.len() > MAX_SHARED_FEATURE {
@@ -890,16 +940,36 @@ fn similarities(
             }
             for (page, base_count) in list {
                 budget.pairing()?;
-                *shared.entry(*page).or_default() += i64::from((*count).min(*base_count));
+                let slot = shared.entry(*page).or_insert_with(|| {
+                    shared_bytes = shared_bytes.saturating_add(SHARED_BYTES);
+                    0
+                });
+                *slot += i64::from((*count).min(*base_count));
             }
         }
+        budget.pairing_hold(shared_bytes)?;
         for (page, common) in shared {
             let lacking = total.saturating_sub(common);
+            budget.pairing_hold(CANDIDATE_BYTES)?;
             out.push((common.saturating_sub(lacking), page, other, lacking));
         }
+        budget.pairing_release(shared_bytes.saturating_add(feature_bytes(facts)));
     }
     Ok(out)
 }
+
+/// Bytes the index of the base pages' features holds per feature (a table entry with its
+/// list's header and control byte, the table at most half full) and per item of a list (at
+/// most half full), from above.
+const INDEX_KEY_BYTES: usize = 80;
+const INDEX_ITEM_BYTES: usize = 32;
+/// Bytes a base page sharing features with an edited page holds while that page is weighed (a
+/// B-tree entry, its nodes at most half full), from above.
+const SHARED_BYTES: usize = 48;
+/// Bytes a candidate pair holds until the pairing ends: its place in the candidates (at most
+/// half full, and as much again to sort them) and in the tables by edited and by base page (at
+/// most half full, with their tables' entries), from above.
+const CANDIDATE_BYTES: usize = 64 + 32 + 2 * 48 + 2 * 16;
 
 /// What the documents' destinations say about where pages went: an outline entry (paired by its
 /// title) or a named destination (by its name) going to base page `b` and now to edited page `e`
@@ -941,11 +1011,91 @@ impl Votes {
 /// Pair the pages: identical pages in order, then identical pages elsewhere (moved), then the
 /// changed pages by content similarity (R6b-31: the glyphs and images they share, at their
 /// places; see [`similarities`]), the most similar first; position decides only between equally
-/// similar pages (and pairs pages that share nothing): a page between the same two pages paired
-/// in order first, then the nearest. Before position, between equally similar pages and for
-/// pages that share nothing, what the destinations say ([`Votes`]). What is left was inserted
-/// or deleted.
-fn match_pages(before: &[PageFacts], after: &[PageFacts], changes: &mut PageChanges, votes: &Votes, budget: &mut Budget) -> Result<Pairs, Fail> {
+/// similar pages: a page between the same two pages paired in order first, then the nearest.
+/// Before position, between equally similar pages and for pages that share nothing, what the
+/// destinations say ([`Votes`]). Pages that share nothing and no destination paired, by their
+/// renders (R6b-38, [`pair_by_renders`]); pages that could be a redaction of no other, by
+/// position. What is left was inserted or deleted. The pairing's work and working memory are
+/// bounded ([`Limits::pairing`], [`Limits::pairing_bytes`]).
+fn match_pages(
+    before: &[PageFacts],
+    after: &[PageFacts],
+    changes: &mut PageChanges,
+    votes: &Votes,
+    thumbs: &mut Thumbs<'_>,
+    budget: &mut Budget,
+) -> Result<Pairs, Fail> {
+    let pairs = match_pages_holding(before, after, changes, votes, thumbs, budget);
+    budget.pairing_done();
+    pairs
+}
+
+/// A page's render reduced to blocks (see [`visual::Thumb`]): of the edited file's page when the
+/// flag is set, else of the base's.
+type Thumbs<'a> = dyn FnMut(bool, usize, &mut Budget) -> Result<visual::Thumb, Fail> + 'a;
+
+/// Pair changed pages that neither glyphs and images nor destinations paired by their renders
+/// (R6b-38): an edited page pairs with the one base page it could be a redaction of, outside the
+/// areas its redaction fills cover (see [`visual::unexplained`]). Another base page it could as
+/// well be a redaction of, or another edited page that could as well be one of that base page,
+/// leaves which page became which to a guess: an error. Pages that could be a redaction of none
+/// are left (they are not redactions of each other, whichever pairs).
+fn pair_by_renders(base_free: &[usize], edited_free: &[usize], thumbs: &mut Thumbs<'_>, budget: &mut Budget) -> Result<Pairs, Fail> {
+    if base_free.is_empty() || edited_free.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut render = |edited: bool, pages: &[usize], budget: &mut Budget| -> Result<Vec<(usize, visual::Thumb)>, Fail> {
+        let mut out = Vec::with_capacity(pages.len());
+        for &page in pages {
+            let thumb = thumbs(edited, page, budget)?;
+            budget.pairing_hold(thumb.bytes())?;
+            out.push((page, thumb));
+        }
+        Ok(out)
+    };
+    let base = render(false, base_free, budget)?;
+    let edited = render(true, edited_free, budget)?;
+    let mut plausible: Pairs = Vec::new();
+    let (mut by_base, mut by_edited): (HashMap<usize, usize>, HashMap<usize, usize>) = (HashMap::new(), HashMap::new());
+    for (other, edited_thumb) in &edited {
+        for (page, base_thumb) in &base {
+            for _ in 0..=edited_thumb.blocks() / 64 {
+                budget.pairing()?;
+            }
+            if visual::unexplained(base_thumb, edited_thumb) != Some(0) {
+                continue;
+            }
+            budget.pairing_hold(CANDIDATE_BYTES)?;
+            if let Some(rival) = by_edited.insert(*other, *page) {
+                return Err(Fail::Read(format!(
+                    "the pages cannot be told apart: base pages {} and {} could each be what edited page {} shows",
+                    rival.saturating_add(1),
+                    page.saturating_add(1),
+                    other.saturating_add(1)
+                )));
+            }
+            if let Some(rival) = by_base.insert(*page, *other) {
+                return Err(Fail::Read(format!(
+                    "the pages cannot be told apart: edited pages {} and {} could each be what base page {} became",
+                    rival.saturating_add(1),
+                    other.saturating_add(1),
+                    page.saturating_add(1)
+                )));
+            }
+            plausible.push((*page, *other));
+        }
+    }
+    Ok(plausible)
+}
+
+fn match_pages_holding(
+    before: &[PageFacts],
+    after: &[PageFacts],
+    changes: &mut PageChanges,
+    votes: &Votes,
+    thumbs: &mut Thumbs<'_>,
+    budget: &mut Budget,
+) -> Result<Pairs, Fail> {
     let base_prints: Vec<Digest> = before.iter().map(|page| page.fingerprint).collect();
     let edited_prints: Vec<Digest> = after.iter().map(|page| page.fingerprint).collect();
     let anchors = in_order(&base_prints, &edited_prints);
@@ -1027,8 +1177,9 @@ fn match_pages(before: &[PageFacts], after: &[PageFacts], changes: &mut PageChan
     }
     base_free.retain(|page| !base_taken.contains(page));
     edited_free.retain(|page| !edited_taken.contains(page));
-    // Pages that share nothing with any other: as the destinations went, then in order within
-    // the same gap (pages a destination says were deleted last), then in order.
+    // Pages that share nothing with any other: as the destinations went, then by their renders,
+    // then (what could be a redaction of nothing) in order within the same gap (pages a
+    // destination says were deleted last), then in order.
     let mut positional = Vec::new();
     let mut voted: Vec<(&(usize, usize), &u32)> = votes.pairs.iter().collect();
     voted.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
@@ -1038,6 +1189,12 @@ fn match_pages(before: &[PageFacts], after: &[PageFacts], changes: &mut PageChan
             base_free.retain(|free| *free != page);
             edited_free.retain(|free| *free != other);
         }
+    }
+    // Then by their renders (R6b-38); what could be a redaction of nothing, by position.
+    for (page, other) in pair_by_renders(&base_free, &edited_free, thumbs, budget)? {
+        positional.push((page, other));
+        base_free.retain(|free| *free != page);
+        edited_free.retain(|free| *free != other);
     }
     base_free.sort_by_key(|page| (votes.deleted.get(page).copied().unwrap_or(0), *page));
     for &page in &base_free {
