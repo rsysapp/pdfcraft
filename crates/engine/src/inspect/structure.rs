@@ -37,6 +37,147 @@ const BACK_REFERENCES: [&[u8]; 3] = [b"Parent", b"P", b"Popup"];
 /// Page-dictionary entries compared on their own (or resolved through inheritance).
 const PAGE_OWN_KEYS: [&[u8]; 7] = [b"Parent", b"Annots", b"Rotate", b"Contents", b"Resources", b"MediaBox", b"CropBox"];
 
+// ── Every key of every dictionary drawn, by kind (the completeness audit) ───────────────────
+//
+// Each key of a dictionary the comparison reads is (a) compared, (b) ignored, for a stated
+// reason, or (c) any change to it is a change: a key in neither of a kind's lists below is (c),
+// so a key unknown here can never pass unseen. In an appended update every dictionary below is
+// compared whole (a page's entries, its resources and everything they reach, by digest: any
+// change is reported). In a rewrite a page's content is judged by its renders, glyphs and
+// images, which compare what hayro draws: a (c) key of a dictionary a changed page draws with
+// (one hayro does not apply, which another viewer may) makes the page a render risk, so the
+// page counts outside the redactions on either side; text for assistive technology and copying
+// in property lists may be taken away, never added or changed (see [`PageFacts::text`]); the
+// page dictionary's own (c) entries must stay as they were (see [`PageFacts::entries`]).
+
+/// Page entries ignored (b): what no viewer draws on the page (`/Type`; `/LastModified`,
+/// `/PieceInfo`, `/Metadata`: an application's data and the XMP packet, which a sanitising
+/// rewrite removes; `/StructParents`: the tags' link, compared with the structure tree; `/ID`,
+/// `/PZ`, `/Tabs`, `/B`, `/Dur`, `/Trans`, `/PresSteps`: navigation, zoom, tab order, article
+/// beads and presentation timing). Every other entry not in [`PAGE_OWN_KEYS`] is (c).
+const PAGE_IGNORED: [&[u8]; 12] =
+    [b"Type", b"LastModified", b"PieceInfo", b"Metadata", b"StructParents", b"ID", b"PZ", b"Tabs", b"B", b"Dur", b"Trans", b"PresSteps"];
+/// Page entries a rewrite may remove (and only remove): its actions (`/AA`) and its thumbnail
+/// (`/Thumb`, which would show the page as it was); an editor's sanitising removes them.
+const PAGE_REMOVABLE: [&[u8]; 2] = [b"AA", b"Thumb"];
+
+/// The keys of each kind of dictionary a page draws with that its renders, glyphs and images
+/// compare (a: hayro draws by them), or that are compared on their own (a), or ignored (b, with
+/// the reason in the kind's comment). Any other key is (c).
+fn drawn_keys(kind: &[u8]) -> &'static [&'static [u8]] {
+    match kind {
+        // A resource dictionary's categories hayro looks things up in; `/ProcSet` (b) is
+        // obsolete and no viewer reads it.
+        b"Resources" => &[b"Font", b"XObject", b"ExtGState", b"Pattern", b"Shading", b"ColorSpace", b"Properties", b"ProcSet"],
+        // A font: what draws and names its glyphs (glyph shapes in the renders, text and place
+        // in the glyphs).
+        b"Font" => &[
+            b"Type",
+            b"Subtype",
+            b"BaseFont",
+            b"FirstChar",
+            b"LastChar",
+            b"Widths",
+            b"FontDescriptor",
+            b"Encoding",
+            b"ToUnicode",
+            b"DescendantFonts",
+            b"CIDSystemInfo",
+            b"DW",
+            b"W",
+            b"DW2",
+            b"W2",
+            b"CIDToGIDMap",
+            b"FontBBox",
+            b"FontMatrix",
+            b"CharProcs",
+            b"Resources",
+            b"Name",
+        ],
+        // A graphics state: what hayro applies (blend modes and transfer functions are render
+        // risks, see `state_risk`). Overprint, halftones, black generation and undercolour
+        // removal are (c): hayro ignores them, other viewers may not.
+        b"ExtGState" => &[
+            b"Type", b"LW", b"LC", b"LJ", b"ML", b"D", b"RI", b"FL", b"SM", b"SA", b"BM", b"SMask", b"CA", b"ca", b"AIS", b"TK", b"Font", b"TR",
+            b"TR2",
+        ],
+        // A form XObject: what draws it (its optional content is evaluated, see `Known::layer`);
+        // ignored (b): its application data, metadata, tags' link, name, prepress (`/OPI`) and
+        // measurement data, which no viewer draws. `/Ref` (a reference XObject) is (c).
+        b"Form" => &[
+            b"Type",
+            b"Subtype",
+            b"FormType",
+            b"BBox",
+            b"Matrix",
+            b"Resources",
+            b"Group",
+            b"OC",
+            b"Filter",
+            b"DecodeParms",
+            b"Length",
+            b"DL",
+            b"Metadata",
+            b"PieceInfo",
+            b"LastModified",
+            b"StructParent",
+            b"StructParents",
+            b"Name",
+            b"OPI",
+            b"Measure",
+            b"PtData",
+        ],
+        b"Pattern" => &[
+            b"Type",
+            b"PatternType",
+            b"PaintType",
+            b"TilingType",
+            b"BBox",
+            b"XStep",
+            b"YStep",
+            b"Resources",
+            b"Matrix",
+            b"Shading",
+            b"ExtGState",
+            b"Filter",
+            b"DecodeParms",
+            b"Length",
+            b"DL",
+        ],
+        b"Shading" => &[
+            b"ShadingType",
+            b"ColorSpace",
+            b"Background",
+            b"BBox",
+            b"AntiAlias",
+            b"Coords",
+            b"Domain",
+            b"Function",
+            b"Extend",
+            b"Matrix",
+            b"Decode",
+            b"BitsPerCoordinate",
+            b"BitsPerComponent",
+            b"BitsPerFlag",
+            b"VerticesPerRow",
+            b"Filter",
+            b"DecodeParms",
+            b"Length",
+            b"DL",
+        ],
+        // A marked-content property list: optional content's entries are evaluated (see
+        // `Reader::evaluate_mark`); `/MCID` (b) links it to the structure tree, compared on its
+        // own. Its text for assistive technology and copying is kept as text (see
+        // [`STRUCT_TEXT_KEYS`]).
+        b"Properties" => &[b"Type", b"OCGs", b"P", b"VE", b"Name", b"Intent", b"Usage", b"MCID"],
+        _ => &[],
+    }
+}
+
+/// Text for assistive technology and copying in a property list a page draws with: the key and
+/// its value's digest.
+pub(crate) type DrawnText = (Vec<u8>, Digest);
+
 /// Catalog entries the document-level check leaves out; a change to any other entry (actions,
 /// names, page labels, permissions, …) fails the inspection, since no fact reports it.
 /// - `/Pages`, `/AcroForm`, `/OCProperties`, `/Outlines`, `/Dests`: compared on their own (pages,
@@ -125,6 +266,14 @@ pub(crate) struct PageFacts {
     /// The optional content the page's content is inside (R6b-36): a changed page is rendered
     /// in every combination of its groups' states.
     pub layers: PageLayers,
+    /// The text for assistive technology and copying in the property lists the page draws with
+    /// (`/ActualText`, `/Alt`, `/E`, `/Lang`, `/T`), counted: a rewrite may take some away, never
+    /// add or change any.
+    pub text: BTreeMap<DrawnText, u32>,
+    /// The page dictionary's own entries (not in [`PAGE_OWN_KEYS`] or [`PAGE_IGNORED`]), by
+    /// their values' digests: in a rewrite they must be the same, but for [`PAGE_REMOVABLE`]
+    /// ones removed.
+    pub entries: BTreeMap<Vec<u8>, Digest>,
     /// The Type 3 fonts in the resources the content is drawn with (the page's, and each drawn
     /// form's, pattern's and mask group's own), each keyed with everything its glyph procedures
     /// draw (see `Reader::type3_key`).
@@ -165,6 +314,8 @@ impl PageFacts {
             form_draws: Vec::new(),
             form_layers: Vec::new(),
             layers: PageLayers::default(),
+            text: BTreeMap::new(),
+            entries: BTreeMap::new(),
             type3: BTreeSet::new(),
             render_risk: None,
             image_pixels: 0,
@@ -282,6 +433,10 @@ pub(crate) enum NameSource {
     Names,
 }
 
+/// The named destinations by name, and the name tree's nodes' other entries (see
+/// `Reader::named_destinations`).
+type NamedDestinations = (BTreeMap<NamedKey, Destination>, Vec<(Vec<u8>, Digest)>);
+
 /// The most nodes and entries a name tree may have.
 const MAX_NAME_TREE_ENTRIES: usize = 100_000;
 
@@ -366,6 +521,9 @@ pub(crate) struct Structure {
     pub sections: Vec<Section>,
     /// The structure tree (see [`StructFacts`]).
     pub structure_tree: StructFacts,
+    /// The named destinations' tree nodes' entries other than `/Kids`, `/Names` and `/Limits`,
+    /// in the tree's order: no fact reports them, so they may not change.
+    pub name_tree_keys: Vec<(Vec<u8>, Digest)>,
     /// The stream objects read whose `/Length` is not their data's (both readers read the same
     /// data), each with the offset the cross-reference data names for it: in the base, the only
     /// objects an appended update may keep with such a length (see [`Tolerated`]).
@@ -405,6 +563,9 @@ pub(crate) fn catalog_change(before: &Structure, after: &Structure, base_kept: b
 pub(crate) struct StructFacts {
     pub text: BTreeMap<(Vec<u8>, Vec<u8>), u32>,
     pub digest: Digest,
+    /// The same without the text and the marked-content kids: what a rewrite may not change
+    /// (a redaction takes away text and the marked content it removed).
+    pub shape: Digest,
 }
 
 /// The entries of a structure element that hold text for assistive technology and copying.
@@ -468,6 +629,8 @@ enum Item {
     /// Any other resource named: a font (`Tf`), a shading (`sh`), a colour space (`cs`, `CS`),
     /// a property list (`BDC`, `DP`); the resource dictionary's key, and the name.
     Named(&'static [u8], Vec<u8>),
+    /// A property list written in the content (`BDC`, `DP`).
+    Properties(Dict),
 }
 
 /// A transformation matrix `[a b c d e f]` (ISO 32000-2 §8.3.3).
@@ -513,6 +676,8 @@ struct Drawn {
     /// differently in each).
     patterns: BTreeSet<(ObjRef, bool, bool)>,
     masks: BTreeSet<(ObjRef, bool, bool)>,
+    /// See [`PageFacts::text`].
+    text: BTreeMap<DrawnText, u32>,
 }
 
 fn require(required: &mut Required, key: ImageKey, patterned: bool) {
@@ -1116,6 +1281,8 @@ impl<'d, 'b> Reader<'d, 'b> {
         // The last operand, and the one before it, when they are names.
         let mut name: Option<Vec<u8>> = None;
         let mut before: Option<Vec<u8>> = None;
+        // The last operand, when it is a dictionary (an inline property list).
+        let mut dict: Option<Dict> = None;
         let mut items = Vec::new();
         loop {
             self.budget.tick()?;
@@ -1128,8 +1295,13 @@ impl<'d, 'b> Reader<'d, 'b> {
                     return Err(unreadable("no progress"));
                 }
                 before = name.take();
+                dict = None;
                 name = match operand {
                     Object::Name(n) => Some(n),
+                    Object::Dict(d) => {
+                        dict = Some(d);
+                        None
+                    }
                     _ => None,
                 };
                 continue;
@@ -1172,12 +1344,17 @@ impl<'d, 'b> Reader<'d, 'b> {
                     };
                     if let Some(resource) = name.take() {
                         items.push(Item::Named(kind, resource));
+                    } else if kind == b"Properties"
+                        && let Some(list) = dict.take()
+                    {
+                        items.push(Item::Properties(list));
                     }
                 }
                 _ => {}
             }
             name = None;
             before = None;
+            dict = None;
         }
         Ok(Scan { digest: sha256(&[data]), items, len: data.len() })
     }
@@ -1285,7 +1462,23 @@ impl<'d, 'b> Reader<'d, 'b> {
         for item in items {
             self.budget.uses()?;
             match item {
-                Item::Named(..) => {}
+                Item::Named(kind, name) => {
+                    let kind: &'static [u8] = match *kind {
+                        b"Font" => b"Font",
+                        b"Shading" => b"Shading",
+                        b"Properties" => b"Properties",
+                        // Colour spaces are names or arrays: what they mean, hayro draws.
+                        _ => continue,
+                    };
+                    if let Some(entry) = self.resource_entry(chain, kind, name)? {
+                        match &*self.resolve(&entry)? {
+                            Object::Dict(dict) => self.note_keys(kind, dict, drawn)?,
+                            Object::Stream(stream) => self.note_keys(kind, &stream.dict, drawn)?,
+                            _ => {}
+                        }
+                    }
+                }
+                Item::Properties(list) => self.note_keys(b"Properties", list, drawn)?,
                 Item::Inline(digest, pixels) => {
                     drawn.images.push(*digest);
                     drawn.pixels = drawn.pixels.saturating_add(*pixels);
@@ -1314,6 +1507,8 @@ impl<'d, 'b> Reader<'d, 'b> {
                             let scan = self.form_content(r, stream)?;
                             let key = self.form_key(r, stream)?;
                             self.group_risk(&stream.dict, drawn)?;
+                            self.note_keys(b"Form", &stream.dict, drawn)?;
+                            self.note_resources(stream.dict.get(b"Resources"), drawn)?;
                             let placed = !at.patterned && !at.masked;
                             drawn.forms.push(FormUse { obj: r, key, placed });
                             if placed {
@@ -1332,12 +1527,21 @@ impl<'d, 'b> Reader<'d, 'b> {
                     let obj = self.get(r)?;
                     // Shading patterns (dictionaries) draw no images, but may set a graphics
                     // state; a tiling pattern is a stream.
-                    if let Object::Dict(pattern) = &*obj
-                        && let Some(state) = self.dict_of(pattern.get(b"ExtGState"), "a pattern's /ExtGState")?
-                    {
-                        self.state_risk(&state, drawn)?;
+                    if let Object::Dict(pattern) = &*obj {
+                        self.note_keys(b"Pattern", pattern, drawn)?;
+                        if let Some(state) = self.dict_of(pattern.get(b"ExtGState"), "a pattern's /ExtGState")? {
+                            self.state_risk(&state, drawn)?;
+                            self.note_keys(b"ExtGState", &state, drawn)?;
+                        }
+                        match pattern.get(b"Shading").map(|shading| self.resolve(shading)).transpose()?.as_deref() {
+                            Some(Object::Dict(shading)) => self.note_keys(b"Shading", shading, drawn)?,
+                            Some(Object::Stream(shading)) => self.note_keys(b"Shading", &shading.dict, drawn)?,
+                            _ => {}
+                        }
                     }
                     let Object::Stream(stream) = &*obj else { continue };
+                    self.note_keys(b"Pattern", &stream.dict, drawn)?;
+                    self.note_resources(stream.dict.get(b"Resources"), drawn)?;
                     if stream.dict.int(b"PatternType") != Some(1) || !drawn.patterns.insert((r, at.patterned, at.masked)) {
                         continue;
                     }
@@ -1355,6 +1559,7 @@ impl<'d, 'b> Reader<'d, 'b> {
                         && let Some(state) = self.dict_of(Some(&entry), "a graphics state")?
                     {
                         self.state_risk(&state, drawn)?;
+                        self.note_keys(b"ExtGState", &state, drawn)?;
                     }
                     let Some(group) = self.soft_mask_group(chain, name)? else { continue };
                     if !drawn.masks.insert((group, at.patterned, at.masked)) {
@@ -1368,6 +1573,8 @@ impl<'d, 'b> Reader<'d, 'b> {
                     let scan = self.form_content(group, stream)?;
                     let key = self.form_key(group, stream)?;
                     self.group_risk(&stream.dict, drawn)?;
+                    self.note_keys(b"Form", &stream.dict, drawn)?;
+                    self.note_resources(stream.dict.get(b"Resources"), drawn)?;
                     drawn.forms.push(FormUse { obj: group, key, placed: false });
                     drawn.interpreted = drawn.interpreted.saturating_add(scan.len);
                     let (inner, key) = self.inner_chain(stream.dict.get(b"Resources"), "a soft mask's /Resources", chain, &at.chain)?;
@@ -1406,6 +1613,36 @@ impl<'d, 'b> Reader<'d, 'b> {
                     return Ok(());
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Check the keys of `dict` (a dictionary of `kind` the page draws with, see
+    /// [`drawn_keys`]): a key neither compared nor ignored makes the page a render risk; a
+    /// property list's text for assistive technology and copying is kept.
+    fn note_keys(&mut self, kind: &'static [u8], dict: &Dict, drawn: &mut Drawn) -> Result<(), Fail> {
+        let known = drawn_keys(kind);
+        for (key, value) in dict.iter() {
+            self.budget.tick()?;
+            if kind == b"Properties" && STRUCT_TEXT_KEYS.contains(&key.as_slice()) {
+                let digest = self.digest(value)?;
+                let slot = drawn.text.entry((key.clone(), digest)).or_default();
+                *slot = slot.saturating_add(1);
+            } else if !known.contains(&key.as_slice()) && drawn.render_risk.is_none() {
+                drawn.render_risk = Some(format!(
+                    "/{} in a {} dictionary, which this comparison does not know",
+                    String::from_utf8_lossy(key),
+                    String::from_utf8_lossy(kind)
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Reader::note_keys`] for a resource dictionary (`resources`, resolved).
+    fn note_resources(&mut self, resources: Option<&Object>, drawn: &mut Drawn) -> Result<(), Fail> {
+        if let Some(resources) = self.dict_of(resources, "/Resources")? {
+            self.note_keys(b"Resources", &resources, drawn)?;
         }
         Ok(())
     }
@@ -1539,7 +1776,7 @@ impl<'d, 'b> Reader<'d, 'b> {
                 Item::State(name) => (b"ExtGState", name),
                 Item::Named(kind, name) => (kind, name),
                 // Its data is the procedure's own.
-                Item::Inline(..) => continue,
+                Item::Inline(..) | Item::Properties(..) => continue,
             };
             parts.extend_from_slice(&(kind.len() as u64).to_le_bytes());
             parts.extend_from_slice(kind);
@@ -1634,6 +1871,13 @@ impl<'d, 'b> Reader<'d, 'b> {
             other.set(b"CropBox".to_vec(), crop.clone());
         }
         let other = self.digest(&Object::Dict(other))?;
+        let mut entries = BTreeMap::new();
+        for (key, value) in node.dict.iter() {
+            if PAGE_OWN_KEYS.contains(&key.as_slice()) || PAGE_IGNORED.contains(&key.as_slice()) {
+                continue;
+            }
+            entries.insert(key.clone(), self.digest(value)?);
+        }
         // Resources: every level a lookup can reach, nearest first; empty levels change nothing.
         let mut chain = Vec::new();
         let mut levels = Vec::new();
@@ -1649,6 +1893,9 @@ impl<'d, 'b> Reader<'d, 'b> {
         let scan = self.page_content(&node.dict)?;
         let mut drawn = Drawn { interpreted: scan.len, ..Drawn::default() };
         self.group_risk(&node.dict, &mut drawn)?;
+        for level in &chain {
+            self.note_keys(b"Resources", level, &mut drawn)?;
+        }
         self.type3_fonts(&chain, &resources, &mut drawn)?;
         self.draw(&scan.items, &chain, Context { depth: 0, patterned: false, masked: false, chain: resources }, &mut drawn)?;
         drawn.images.sort_unstable();
@@ -1661,6 +1908,8 @@ impl<'d, 'b> Reader<'d, 'b> {
             resources,
             other,
             images: drawn.images,
+            text: drawn.text,
+            entries,
             image_pixels: drawn.pixels,
             render_risk: drawn.render_risk,
             image_uses: Vec::new(),
@@ -1756,7 +2005,10 @@ impl<'d, 'b> Reader<'d, 'b> {
         let Some(root) = self.dict_of(catalog.get(b"StructTreeRoot"), "/StructTreeRoot")? else { return Ok(StructFacts::default()) };
         let mut facts = StructFacts::default();
         let mut parts: Vec<u8> = Vec::new();
-        parts.extend_from_slice(&self.digest_without(&root, &[b"K", b"ParentTree", b"ParentTreeNextKey", b"IDTree"])?);
+        let mut shape: Vec<u8> = Vec::new();
+        let root_digest = self.digest_without(&root, &[b"K", b"ParentTree", b"ParentTreeNextKey", b"IDTree"])?;
+        parts.extend_from_slice(&root_digest);
+        shape.extend_from_slice(&root_digest);
         let mut seen: BTreeSet<ObjRef> = BTreeSet::new();
         // (kid, depth), depth first in the tree's order.
         let mut todo: Vec<(Object, usize)> = root.get(b"K").cloned().map(|kid| (kid, 0)).into_iter().collect();
@@ -1790,6 +2042,10 @@ impl<'d, 'b> Reader<'d, 'b> {
                     }
                     parts.push(b'{');
                     parts.extend_from_slice(&self.digest_without(element, &[b"K", b"P", b"Pg", b"Obj"])?);
+                    shape.push(b'{');
+                    let mut left_out: Vec<&[u8]> = vec![b"K", b"P", b"Pg", b"Obj"];
+                    left_out.extend(STRUCT_TEXT_KEYS);
+                    shape.extend_from_slice(&self.digest_without(element, &left_out)?);
                     if let Some(kids) = element.get(b"K") {
                         todo.push((kids.clone(), depth.saturating_add(1)));
                     }
@@ -1799,6 +2055,7 @@ impl<'d, 'b> Reader<'d, 'b> {
             }
         }
         facts.digest = sha256(&[b"structure", &parts]);
+        facts.shape = sha256(&[b"structure shape", &shape]);
         Ok(facts)
     }
 
@@ -2186,8 +2443,12 @@ impl Reader<'_, '_> {
     /// (by `/Limits`, in order, or all of it), so a tree they could resolve differently is
     /// refused: keys out of order or named twice, `/Limits` that do not bound what a node holds,
     /// a node with both `/Kids` and `/Names` or with neither, a key that is not a string.
-    fn named_destinations(&mut self, catalog: &Dict, pages: &HashMap<ObjRef, usize>) -> Result<BTreeMap<NamedKey, Destination>, Fail> {
+    ///
+    /// A node's entries other than `/Kids`, `/Names` and `/Limits` are returned too, by their
+    /// values' digests in the tree's order (no viewer reads them; any change to them is a change).
+    fn named_destinations(&mut self, catalog: &Dict, pages: &HashMap<ObjRef, usize>) -> Result<NamedDestinations, Fail> {
         let mut out = BTreeMap::new();
+        let mut keys = Vec::new();
         if let Some(dests) = self.dict_of(catalog.get(b"Dests"), "/Dests")? {
             for (name, value) in dests.iter() {
                 self.budget.tick()?;
@@ -2198,7 +2459,7 @@ impl Reader<'_, '_> {
         let names = self.dict_of(catalog.get(b"Names"), "/Names")?.unwrap_or_default();
         if let Some(tree) = names.get(b"Dests") {
             let mut entries = Vec::new();
-            self.name_node(tree, 0, true, &mut BTreeSet::new(), &mut entries)?;
+            self.name_node(tree, 0, true, &mut BTreeSet::new(), &mut entries, &mut keys)?;
             if entries.windows(2).any(|pair| pair.first().map(|entry| &entry.0) >= pair.get(1).map(|entry| &entry.0)) {
                 return Err(read_error("the named destinations' tree has keys out of order or named twice"));
             }
@@ -2208,7 +2469,7 @@ impl Reader<'_, '_> {
                 out.insert((NameSource::Names, name), destination);
             }
         }
-        Ok(out)
+        Ok((out, keys))
     }
 
     /// One node of a name tree and everything under it, its entries appended to `out` in order.
@@ -2219,6 +2480,7 @@ impl Reader<'_, '_> {
         root: bool,
         seen: &mut BTreeSet<ObjRef>,
         out: &mut Vec<(Vec<u8>, Object)>,
+        keys: &mut Vec<(Vec<u8>, Digest)>,
     ) -> Result<(), Fail> {
         self.budget.tick()?;
         if depth > MAX_TREE_DEPTH {
@@ -2230,12 +2492,18 @@ impl Reader<'_, '_> {
             return Err(read_error("a name tree loops"));
         }
         let Object::Dict(dict) = &*self.resolve(node)? else { return Err(read_error("a name tree node is not a dictionary")) };
+        for (key, value) in dict.iter() {
+            if !matches!(key.as_slice(), b"Kids" | b"Names" | b"Limits") {
+                let digest = self.digest(value)?;
+                keys.push((key.clone(), digest));
+            }
+        }
         let start = out.len();
         match (dict.get(b"Kids"), dict.get(b"Names")) {
             (Some(_), Some(_)) => return Err(read_error("a name tree node has both /Kids and /Names")),
             (Some(kids), None) => {
                 for kid in self.array_of(Some(kids), "a name tree's /Kids")? {
-                    self.name_node(&kid, depth.saturating_add(1), false, seen, out)?;
+                    self.name_node(&kid, depth.saturating_add(1), false, seen, out, keys)?;
                 }
             }
             (None, Some(names)) => {
@@ -3004,7 +3272,7 @@ pub(crate) fn read(
     let outline = reader.outline(&catalog, &page_index)?;
     let root = reader.dict_of(catalog.get(b"Outlines"), "/Outlines")?.unwrap_or_default();
     let outline_root = reader.digest_without(&root, &[b"Type", b"First", b"Last", b"Count"])?;
-    let named_destinations = reader.named_destinations(&catalog, &page_index)?;
+    let (named_destinations, name_tree_keys) = reader.named_destinations(&catalog, &page_index)?;
     let mut entries = BTreeMap::new();
     for (key, value) in catalog.iter() {
         if CATALOG_REPORTED.contains(&key.as_slice()) {
@@ -3049,8 +3317,22 @@ pub(crate) fn read(
             named_destinations,
             sections,
             structure_tree,
+            name_tree_keys,
             misdeclared: BTreeSet::new(),
         },
         known,
     ))
+}
+
+/// Whether, in a rewrite, a page's text in property lists or its own entries changed other than
+/// as a rewrite may change them (see [`PageFacts::text`], [`PageFacts::entries`]).
+pub(crate) fn page_keys_changed(base: &PageFacts, edited: &PageFacts) -> bool {
+    if edited.text.iter().any(|(entry, count)| base.text.get(entry).is_none_or(|was| count > was)) {
+        return true;
+    }
+    let kept = base.entries.iter().all(|(key, value)| match edited.entries.get(key) {
+        Some(now) => now == value,
+        None => PAGE_REMOVABLE.contains(&key.as_slice()),
+    });
+    !kept || edited.entries.keys().any(|key| !base.entries.contains_key(key))
 }

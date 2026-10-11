@@ -688,3 +688,104 @@ fn the_version_mark_info_and_metadata_are_compared() {
     let edited = update_section(&base, &[(1, catalog.as_bytes())], prev, "");
     assert!(matches!(inspect(&base, &edited, InspectLimits::default()), Err(InspectError::Edited(_))));
 }
+
+/// The dictionaries of [`with_every_dictionary`], by name: (name, object number).
+const DICTIONARIES: [(&str, u32); 12] = [
+    ("catalog", 1),
+    ("page", 3),
+    ("resources", 5),
+    ("font", 6),
+    ("form XObject", 7),
+    ("graphics state", 8),
+    ("pattern", 9),
+    ("annotation", 10),
+    ("shading", 11),
+    ("outline item", 21),
+    ("name tree", 22),
+    ("form field", 30),
+];
+
+/// One page drawing with a font, a form XObject, a graphics state, a shading pattern and a
+/// shading, with an annotation, a form field, an outline item and a named destination, and a
+/// word (`boxed`: a black box over it instead). Dictionary `zz` (an object number, see
+/// [`DICTIONARIES`]) has an entry no comparison knows, `/Zz 1`.
+fn with_every_dictionary(boxed: bool, zz: Option<u32>) -> Vec<u8> {
+    let extra = |num: u32| if zz == Some(num) { " /Zz 1" } else { "" };
+    let content = format!(
+        "q /GS gs 0 G 10 10 m 30 10 l S Q\n/Fm Do\nq 20 100 60 30 re W n /Sh sh Q\nq /Pattern cs /P1 scn 100 100 60 30 re f Q\n{}\n{}",
+        String::from_utf8(text("Alpha")).unwrap(),
+        if boxed { "0 g 146 14 16 18 re f" } else { "BT /F1 12 Tf 150 20 Td (X) Tj ET" }
+    );
+    let function = "<< /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >>";
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, format!("<< /Type /Catalog /Pages 2 0 R /Outlines 20 0 R /Names << /Dests 22 0 R >> /AcroForm << /Fields [30 0 R] >>{} >>", extra(1)).into_bytes()),
+        (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 300] >>".to_vec()),
+        (3, format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources 5 0 R /Annots [10 0 R 30 0 R]{} >>", extra(3)).into_bytes()),
+        (4, stream("", content.as_bytes())),
+        (
+            5,
+            format!("<< /Font << /F1 6 0 R >> /XObject << /Fm 7 0 R >> /ExtGState << /GS 8 0 R >> /Pattern << /P1 9 0 R >> /Shading << /Sh 11 0 R >>{} >>", extra(5))
+                .into_bytes(),
+        ),
+        (6, format!("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica{} >>", extra(6)).into_bytes()),
+        (7, stream(&format!("/Type /XObject /Subtype /Form /BBox [0 0 200 300]{}", extra(7)), b"0 0 1 rg 20 250 20 20 re f")),
+        (8, format!("<< /Type /ExtGState /LW 2{} >>", extra(8)).into_bytes()),
+        (9, format!("<< /Type /Pattern /PatternType 2 /Shading 12 0 R{} >>", extra(9)).into_bytes()),
+        (10, format!("<< /Type /Annot /Subtype /Square /Rect [120 200 180 260] /C [1 0 0]{} >>", extra(10)).into_bytes()),
+        (11, format!("<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 200 0] /Function {function}{} >>", extra(11)).into_bytes()),
+        (12, format!("<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 200 0] /Function {function} >>").into_bytes()),
+        (20, b"<< /Type /Outlines /First 21 0 R /Last 21 0 R /Count 1 >>".to_vec()),
+        (21, format!("<< /Title (Terms) /Parent 20 0 R /Dest [3 0 R /Fit]{} >>", extra(21)).into_bytes()),
+        (22, format!("<< /Names [(terms) [3 0 R /Fit]]{} >>", extra(22)).into_bytes()),
+        (30, format!("<< /FT /Tx /T (name) /V (Sari) /Type /Annot /Subtype /Widget /Rect [20 40 120 60] /P 3 0 R{} >>", extra(30)).into_bytes()),
+    ];
+    let mut b = Builder::new();
+    for (num, body) in &objects {
+        b.object(*num, body);
+    }
+    let rows = b.offsets.clone();
+    b.finish(31, &rows, "")
+}
+
+#[test]
+fn an_unknown_key_in_any_dictionary_is_refused_or_reported() {
+    // The completeness audit: every key of every dictionary the comparison reads is compared,
+    // ignored for a stated reason, or any change to it is a change. A key nobody listed, added
+    // to each kind of dictionary, in a rewrite (with a redaction) and in an appended update.
+    let base = with_every_dictionary(false, None);
+    let clean = inspect(&base, &base, InspectLimits::default()).unwrap();
+    assert_eq!(clean, Inspection { base_kept: true, pages: PageChanges { before: 1, after: 1, ..PageChanges::default() }, ..Inspection::default() });
+    let redacted = inspect(&base, &with_every_dictionary(true, None), InspectLimits::default()).unwrap();
+    assert_eq!((redacted.content.pages_changed_outside_redactions, redacted.redaction_areas.len()), (0, 1), "{redacted:?}");
+    // Refused, or a change reported.
+    let caught = |result: Result<Inspection, InspectError>| match result {
+        Err(InspectError::Edited(_)) => true,
+        Ok(inspection) => {
+            inspection.content.pages_with_content_changed > 0
+                || inspection.content.pages_changed_outside_redactions > 0
+                || inspection.form_fields_changed > 0
+                || inspection.annotations != AnnotationChanges::default()
+        }
+        Err(_) => false,
+    };
+    let prev = Some(last_section(&base));
+    for (name, num) in DICTIONARIES {
+        let rewrite = with_every_dictionary(true, Some(num));
+        assert!(
+            caught(inspect(&base, &rewrite, InspectLimits::default())),
+            "{name}, in a rewrite: {:?}",
+            inspect(&base, &rewrite, InspectLimits::default())
+        );
+        // The same object in an appended update: its body as the rewrite has it.
+        let marked = with_every_dictionary(false, Some(num));
+        let start = object_offset(&marked, num);
+        let body_start = start + format!("{num} 0 obj\n").len();
+        let end = body_start + marked[body_start..].windows(8).position(|w| w == b"\nendobj\n").unwrap();
+        let appended = update_section(&base, &[(num, &marked[body_start..end])], prev, "");
+        assert!(
+            caught(inspect(&base, &appended, InspectLimits::default())),
+            "{name}, appended: {:?}",
+            inspect(&base, &appended, InspectLimits::default())
+        );
+    }
+}

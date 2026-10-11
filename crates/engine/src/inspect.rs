@@ -217,8 +217,15 @@ pub struct ContentChanges {
     /// - every page, when the document's layer configuration (`/OCProperties`) changed: which
     ///   layers a viewer shows by default is not a redaction;
     /// - a page drawn with something hayro may render otherwise than other viewers (a blend mode
-    ///   other than `/Normal`, a transfer function, a knockout group), on either side, so that a
-    ///   change hayro's pixels do not show may show in another viewer;
+    ///   other than `/Normal`, a transfer function, a knockout group, or a key no comparison
+    ///   knows in a font, graphics state, form, pattern, shading, property list or resource
+    ///   dictionary it draws with), on either side, so that a change hayro's pixels do not show
+    ///   may show in another viewer;
+    /// - a page entry no fact reports (any but its content, resources, boxes, rotation,
+    ///   annotations and what no viewer draws) added, removed or changed, but for its actions
+    ///   (`/AA`) and thumbnail (`/Thumb`) removed; text for assistive technology and copying in
+    ///   a property list it draws with (`/ActualText`, `/Alt`, `/E`, `/Lang`, `/T`) added or
+    ///   changed;
     /// - a glyph, image or form in other optional content than at its place in the base, or shown
     ///   otherwise by default (R6b-29), whatever the boxes cover;
     /// - where content is in optional content: the page in any combination of the states of the
@@ -583,13 +590,18 @@ fn compare(base: &[u8], edited: &[u8], limits: Limits) -> Result<Inspection, Ins
     if let Some(key) = structure::catalog_change(&before.structure, &after.structure, base_kept) {
         return Err(InspectError::Edited(format!("the document's /{key} changed, which this comparison does not report")));
     }
+    if before.structure.name_tree_keys != after.structure.name_tree_keys {
+        return Err(InspectError::Edited("an entry of the named destinations' tree changed, which this comparison does not report".into()));
+    }
     // The structure tree: an appended update leaves it as it was; a rewrite may only take text
-    // away from it (a redaction cleans the tags of what it removed), never add or change any.
+    // and marked content away from it (a redaction cleans the tags of what it removed), never
+    // add or change text, nor change anything else in it.
     let (tags_before, tags_after) = (&before.structure.structure_tree, &after.structure.structure_tree);
     let tags_changed = if base_kept {
         tags_before != tags_after
     } else {
-        tags_after.text.iter().any(|(entry, count)| tags_before.text.get(entry).is_none_or(|was| count > was))
+        tags_before.shape != tags_after.shape
+            || tags_after.text.iter().any(|(entry, count)| tags_before.text.get(entry).is_none_or(|was| count > was))
     };
     if tags_changed {
         return Err(InspectError::Edited("the structure tree's text or tags changed, which this comparison does not report".into()));
@@ -1513,9 +1525,11 @@ fn compare_pages(
                 outside |= layer_views_differ(before, after, (old, new), budget)?;
             }
             // A glyph, image or form now in other optional content (or shown otherwise by
-            // default) than it was: not a redaction, whatever the boxes cover.
+            // default) than it was: not a redaction, whatever the boxes cover. Nor is text for
+            // assistive technology added or changed, or a page entry no fact reports changed.
             if drawn_differently {
                 outside |= layers_changed_for(b, e, &pairing, budget).map_err(|fail| fail.of(Role::Edited))?;
+                outside |= structure::page_keys_changed(b, e);
             }
             let mut areas = Areas::new(&boxes);
             // Every removed glyph by its centre, and every image at its own resolution.
