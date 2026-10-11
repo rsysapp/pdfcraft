@@ -458,12 +458,12 @@ fn refused_against(base: &[u8], file: &[u8]) -> String {
 fn files_both_readers_read_alike_are_not_refused() {
     // A second definition of object 4 that the table does not list; a hybrid file whose table
     // lists page 3 (stale or not) where its cross-reference stream also does, or marks it free.
-    for (case, file) in [
-        ("unlisted second definition", one_number_twice()),
-        ("hybrid, table first", stale_offset_beside_an_object_stream()),
-        ("hybrid, free in table", stale_page_free_in_table()),
-    ] {
-        assert!(inspect(&sound(), &file, InspectLimits::default()).is_ok(), "{case}");
+    // The readers agree on each; as rewrites, the hybrid files are refused only for carrying the
+    // stale page and its content, which nothing reaches (R6b-48).
+    assert!(inspect(&sound(), &one_number_twice(), InspectLimits::default()).is_ok());
+    for (case, file) in [("hybrid, table first", stale_offset_beside_an_object_stream()), ("hybrid, free in table", stale_page_free_in_table())] {
+        let message = refused(&file);
+        assert!(message.contains("nothing reaches"), "{case}: {message}");
     }
 }
 
@@ -654,7 +654,9 @@ fn the_version_mark_info_and_metadata_are_compared() {
         ("another version", "/Version /2.0 /MarkInfo << /Marked true >> /Metadata 6 0 R", "Agreement", false),
         ("marked otherwise", "/Version /1.7 /MarkInfo << /Marked true /Suspects true >> /Metadata 6 0 R", "Agreement", false),
     ] {
-        let result = inspect(&base, &file(true, catalog, title), InspectLimits::default());
+        // The metadata removed leaves it null: a rewrite carries nothing nothing reaches (R6b-48).
+        let edited = if catalog.contains("/Metadata") { file(true, catalog, title) } else { tagged(true, catalog, &[b"null"]) };
+        let result = inspect(&base, &edited, InspectLimits::default());
         match (accepted, result) {
             (true, Ok(inspection)) => assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{case}"),
             (false, Err(InspectError::Edited(message))) => assert!(message.contains("changed"), "{case}: {message}"),
@@ -993,8 +995,12 @@ fn removable(boxed: bool, catalog: &str, page: &str, span: &str, element: &str) 
     let content = format!("/Span << /MCID 0 {span} >> BDC\n{}\nEMC\n{last}", String::from_utf8(text("Alpha")).unwrap());
     b.object(4, &stream("", content.as_bytes()));
     b.object(5, b"null");
-    b.object(6, &stream("/Type /Metadata /Subtype /XML", b"<x:xmpmeta xmlns:x='adobe:ns:meta/'/>"));
-    b.object(7, &stream("/Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", b"\xff"));
+    // What the catalog or the page no longer names is null: a rewrite carries nothing nothing
+    // reaches (R6b-48).
+    let xmp = stream("/Type /Metadata /Subtype /XML", b"<x:xmpmeta xmlns:x='adobe:ns:meta/'/>");
+    b.object(6, if catalog.contains("/Metadata") { &xmp } else { b"null" });
+    let thumbnail = stream("/Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", b"\xff");
+    b.object(7, if page.contains("/Thumb") { &thumbnail } else { b"null" });
     b.object(8, b"<< /Type /StructTreeRoot /K 9 0 R >>");
     b.object(9, format!("<< /S /Figure /P 8 0 R /Pg 3 0 R /K 0 {element} >>").as_bytes());
     let rows = b.offsets.clone();
@@ -1577,4 +1583,96 @@ fn objects_the_readers_could_take_differently_fail_closed() {
     let mut tail = base.clone();
     tail.extend_from_slice(b"6 0 obj\n<< /Title (Tail) >>\nendobj\n");
     assert!(info("unlisted tail", &tail).is_empty(), "read by neither");
+}
+
+// ── R6b-48: a rewrite carries nothing nothing reaches ───────────────────────────────────────
+
+/// [`tagged`]'s boxed rewrite written with a cross-reference stream, its page and content in the
+/// file and, in an object stream, the catalog, the page tree and `extra` (objects 6…), each
+/// listed.
+fn rewrite_with_object_stream(extra: &[&str]) -> Vec<u8> {
+    let mut b = Builder::new();
+    b.object(3, format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R {RESOURCES} >>").as_bytes());
+    b.object(4, &stream("", &[text("Alpha"), b"\n0 g 146 14 16 18 re f".to_vec()].concat()));
+    let mut members: Vec<(u32, String)> =
+        vec![(1, "<< /Type /Catalog /Pages 2 0 R >>".into()), (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 300] >>".into())];
+    members.extend(extra.iter().enumerate().map(|(i, body)| (6 + i as u32, (*body).to_string())));
+    let mut header = String::new();
+    let mut bodies = String::new();
+    for (num, body) in &members {
+        header.push_str(&format!("{num} {} ", bodies.len()));
+        bodies.push_str(body);
+        bodies.push(' ');
+    }
+    let container = 6 + extra.len() as u32;
+    b.object(container, &stream(&format!("/Type /ObjStm /N {} /First {}", members.len(), header.len()), format!("{header}{bodies}").as_bytes()));
+    let xref_num = container + 1;
+    let at = b.out.len();
+    let row = |kind: u8, field: usize, extra: u16| {
+        let mut out = vec![kind];
+        out.extend_from_slice(&u32::try_from(field).unwrap().to_be_bytes());
+        out.extend_from_slice(&extra.to_be_bytes());
+        out
+    };
+    let mut entries = row(0, 0, 65535);
+    for num in 1..xref_num {
+        entries.extend(match members.iter().position(|(member, _)| *member == num) {
+            Some(index) => row(2, container as usize, index as u16),
+            None if num == 5 => row(0, 0, 0),
+            None => row(1, b.offsets[&num], 0),
+        });
+    }
+    entries.extend(row(1, at, 0));
+    b.object(xref_num, &stream(&format!("/Type /XRef /Size {} /W [1 4 2] /Root 1 0 R", xref_num + 1), &entries));
+    b.out.extend_from_slice(format!("startxref\n{at}\n%%EOF\n").as_bytes());
+    b.out
+}
+
+#[test]
+fn a_rewrite_carrying_what_nothing_reaches_is_refused() {
+    // R6b-48: 1d93b91 accepted a redaction whose file still held the unredacted original, as an
+    // object nothing reaches: no viewer shows it, any tool reading the file finds it.
+    let base = tagged(false, "", &[]);
+    let original = stream("", b"BT /F1 12 Tf 150 20 Td (X) Tj ET");
+    assert_eq!(inspect(&base, &tagged(true, "", &[]), InspectLimits::default()).unwrap().content.pages_changed_outside_redactions, 0);
+    let message = match inspect(&base, &tagged(true, "", &[&original]), InspectLimits::default()) {
+        Err(InspectError::Edited(message)) => message,
+        other => panic!("an orphan object: {other:?}"),
+    };
+    assert!(message.contains("holds object 6, which nothing reaches"), "{message}");
+    // In an object stream: the same, and its object stream reached only through what it holds.
+    let clean = rewrite_with_object_stream(&[]);
+    assert_eq!(inspect(&base, &clean, InspectLimits::default()).unwrap().content.pages_changed_outside_redactions, 0);
+    let message = match inspect(&base, &rewrite_with_object_stream(&["<< /Original (BT /F1 12 Tf 150 20 Td (X) Tj ET) >>"]), InspectLimits::default())
+    {
+        Err(InspectError::Edited(message)) => message,
+        other => panic!("an orphan in an object stream: {other:?}"),
+    };
+    assert!(message.contains("holds object 6, which nothing reaches"), "{message}");
+    // An earlier section's objects, superseded: carried too.
+    let page = format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R {RESOURCES} >>");
+    let boxed = tagged(true, "", &[]);
+    let prev = Some(last_section(&boxed));
+    let message = match inspect(&base, &update_section(&boxed, &[(3, page.as_bytes())], prev, ""), InspectLimits::default()) {
+        Err(InspectError::Edited(message)) => message,
+        other => panic!("two sections: {other:?}"),
+    };
+    assert!(message.contains("cross-reference sections"), "{message}");
+}
+
+#[test]
+fn the_session_s_redaction_reaches_everything_it_writes() {
+    use crate::{Edit, NewAnnotation, Session, Shape, Style, rect_quad};
+    let base = tagged(false, "", &[]);
+    let mark = Shape::Redact { quads: vec![rect_quad([140.0, 10.0, 170.0, 40.0])], overlay: String::new(), look: Default::default() };
+    let mut session = Session::new().with_clock(|| 1_700_000_000);
+    session.set_keep_document_information(true);
+    let id = session.open("base.pdf", None, std::sync::Arc::new(base.clone()), None).unwrap();
+    let note = NewAnnotation { page: 0, style: Style::default_for(&mark), shape: mark, contents: String::new(), author: "Sari".into() };
+    session.apply(id, Edit::AddAnnotation(note)).unwrap();
+    session.apply(id, Edit::ApplyRedactions { pages: None }).unwrap();
+    let inspection = inspect(&base, &session.save_bytes(id).unwrap(), InspectLimits::default()).unwrap();
+    assert!(!inspection.base_kept, "{inspection:?}");
+    assert_eq!(inspection.text.pages_with_text_removed, 1, "{inspection:?}");
+    assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{inspection:?}");
 }

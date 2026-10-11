@@ -60,6 +60,10 @@
 //!   draw, and annotation appearances (a form or appearance that changed must lie wholly under
 //!   the boxes; a Type 3 font may not change); a form drawn exactly once is part of its page's
 //!   glyphs, images and pixels, and judged by them;
+//! - a rewrite carries nothing nothing reaches: it has one cross-reference section, and every
+//!   object it lists (but for its own cross-reference stream and null objects) is reached from
+//!   the trailer's `/Root` or `/Info` through references, an object stream through what it
+//!   holds (R6b-48);
 //! - work is bounded (pages, decoded bytes, hashed bytes, rendered pixels, nesting, a deadline),
 //!   and exceeding a bound is [`InspectError::TooComplex`].
 
@@ -662,6 +666,10 @@ struct Side {
     hayro: ContentDocument,
     /// The file again, for decoding images a rewrite replaced.
     images: Images,
+    /// R6b-48: why a rewrite carries an object nothing reaches (see
+    /// `check_rewrite_reachable`), reported once every other fact is established, so that a
+    /// file refused for another reason says that reason.
+    unreached: Option<String>,
 }
 
 /// The whole comparison, with every bound.
@@ -754,6 +762,9 @@ fn compare(base: &[u8], edited: &[u8], limits: Limits) -> Result<Inspection, Ins
     compare_pages(&before, &after, &pairs, base_kept, layers_changed, &mut budget, &mut rasters, &mut inspection)?;
     inspection.redaction_areas.sort_by(|(page_a, a), (page_b, b)| page_a.cmp(page_b).then(b[3].total_cmp(&a[3])).then(a[0].total_cmp(&b[0])));
     (inspection.annotations, inspection.destinations.links) = compare_annotations(&before, &after, &pairs, base_kept, &mut budget, &mut rasters)?;
+    if let Some(message) = after.unreached {
+        return Err(InspectError::Edited(message));
+    }
     Ok(inspection)
 }
 
@@ -888,7 +899,7 @@ fn read_side(bytes: &[u8], against: Option<(&[u8], &Structure, bool)>, placement
     if hayro.page_count() != structure.pages.len() {
         return Err(Fail::Read(format!("readers disagree on the page count ({} or {})", structure.pages.len(), hayro.page_count())));
     }
-    let mut side = Side { structure, hayro, images: Images::new(shared) };
+    let mut side = Side { structure, hayro, images: Images::new(shared), unreached: None };
     for (index, (page, (content, page_data))) in side.structure.pages.iter_mut().zip(contents).enumerate() {
         budget.time()?;
         let number = index.saturating_add(1);
@@ -1004,6 +1015,14 @@ fn read_side(bytes: &[u8], against: Option<(&[u8], &Structure, bool)>, placement
     if let Some((base_bytes, _, true)) = against {
         check_update_read(&doc, base_bytes, &side.structure.sections, &known, budget)?;
     }
+    // R6b-48: a rewrite carries nothing that is neither drawn nor referenced.
+    if let Some((_, _, false)) = against {
+        side.unreached = match check_rewrite_reachable(&doc, &side.structure.sections, budget) {
+            Ok(()) => None,
+            Err(Fail::Read(message)) => Some(message),
+            Err(other) => return Err(other),
+        };
+    }
     if placements {
         structure::retain_shared_forms(&mut side.structure.pages);
     }
@@ -1043,6 +1062,72 @@ fn check_update_read(
             Some(pdfcraft_cos::XrefEntry::InFile { offset, .. }) if section_offsets.contains(&offset) => {}
             Some(pdfcraft_cos::XrefEntry::InFile { .. } | pdfcraft_cos::XrefEntry::InStream { .. }) => {
                 return Err(Fail::Read(format!("the update writes object {num}, which nothing this comparison reports reads")));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// R6b-48: every object a rewrite holds must be reachable from the trailer's `/Root` or `/Info`
+/// through references (an object stream through the objects stored in it), but for its own
+/// cross-reference streams and objects that are null; and a rewrite has one cross-reference section, so no earlier
+/// section's objects are carried, superseded, beside the ones read. Anything else could hold
+/// what the rewrite took away (the unredacted original as an object nothing reaches), which no
+/// fact would report. Each object visited counts toward the objects bound.
+fn check_rewrite_reachable(doc: &Document, sections: &[structure::Section], budget: &mut Budget) -> Result<(), Fail> {
+    if sections.len() != 1 {
+        return Err(Fail::Read(format!(
+            "the rewrite has {} cross-reference sections, so it carries objects of an earlier one nothing reaches",
+            sections.len()
+        )));
+    }
+    let section_offsets: BTreeSet<u64> = sections.iter().map(|section| section.offset).collect();
+    let mut reached: BTreeSet<u32> = BTreeSet::new();
+    let mut todo: Vec<pdfcraft_cos::Object> = [&b"Root"[..], b"Info"].iter().filter_map(|key| doc.trailer().get(key).cloned()).collect();
+    while let Some(object) = todo.pop() {
+        budget.tick()?;
+        match object {
+            pdfcraft_cos::Object::Ref(r) => {
+                if !reached.insert(r.num) {
+                    continue;
+                }
+                budget.object()?;
+                // An object that cannot be read is read as null by every fact; nothing to follow.
+                if let Ok(found) = doc.try_get(r.num) {
+                    todo.push((*found).clone());
+                }
+            }
+            pdfcraft_cos::Object::Array(items) => todo.extend(items),
+            pdfcraft_cos::Object::Dict(dict) => todo.extend(dict.iter().map(|(_, value)| value.clone())),
+            pdfcraft_cos::Object::Stream(stream) => todo.extend(stream.dict.iter().map(|(_, value)| value.clone())),
+            _ => {}
+        }
+    }
+    // Object streams holding a reached object are reached through it.
+    let mut containers: BTreeSet<u32> = BTreeSet::new();
+    for num in doc.object_numbers() {
+        budget.tick()?;
+        if let Some(pdfcraft_cos::XrefEntry::InStream { stream, .. }) = doc.xref_entry(num)
+            && reached.contains(&num)
+        {
+            containers.insert(stream);
+        }
+    }
+    for num in doc.object_numbers() {
+        budget.tick()?;
+        if reached.contains(&num) || containers.contains(&num) {
+            continue;
+        }
+        // A null object carries nothing.
+        if doc.try_get(num).is_ok_and(|object| matches!(*object, pdfcraft_cos::Object::Null)) {
+            continue;
+        }
+        match doc.xref_entry(num) {
+            // The rewrite's own cross-reference stream.
+            Some(pdfcraft_cos::XrefEntry::InFile { offset, .. }) if section_offsets.contains(&offset) => {}
+            Some(pdfcraft_cos::XrefEntry::InFile { .. } | pdfcraft_cos::XrefEntry::InStream { .. }) => {
+                return Err(Fail::Read(format!("the rewrite holds object {num}, which nothing reaches from its catalog or document information")));
             }
             _ => {}
         }

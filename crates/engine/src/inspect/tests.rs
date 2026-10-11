@@ -1015,7 +1015,8 @@ fn letter_pdf(content: &[u8], resources: &str, objects: &[Vec<u8>]) -> Vec<u8> {
     let mut bodies = vec![
         b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
         format!("<< /Type /Pages /Kids [{first} 0 R] /Count 1 /MediaBox [0 0 612 792] >>").into_bytes(),
-        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        // Unused: null, as a rewrite may carry nothing nothing reaches (R6b-48).
+        b"null".to_vec(),
     ];
     bodies.extend(objects.iter().cloned());
     bodies.push(format!("<< /Type /Page /Parent 2 0 R /Contents {} 0 R /Resources << {resources} >> >>", first + 1).into_bytes());
@@ -1199,7 +1200,7 @@ fn a_glyph_whose_ink_lies_outside_its_em_box_is_refused_by_the_render() {
         pdf(&[
             b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
             b"<< /Type /Pages /Kids [6 0 R] /Count 1 /MediaBox [0 0 200 300] >>".to_vec(),
-            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+            b"null".to_vec(),
             font.clone(),
             glyph.clone(),
             b"<< /Type /Page /Parent 2 0 R /Contents 7 0 R /Resources << /Font << /T3 4 0 R >> >> >>".to_vec(),

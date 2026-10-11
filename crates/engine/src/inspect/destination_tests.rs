@@ -139,6 +139,16 @@ fn session(base: &[u8], edits: Vec<Edit>) -> Vec<u8> {
     session.save_bytes(id).unwrap().as_ref().clone()
 }
 
+/// [`session`], written whole (one cross-reference section, only what is reached: a rewrite).
+fn session_whole(base: &[u8], edits: Vec<Edit>) -> Vec<u8> {
+    let mut session = Session::new().with_clock(|| 1_700_000_000);
+    let id = session.open("base.pdf", None, Arc::new(base.to_vec()), None).unwrap();
+    for edit in edits {
+        session.apply(id, edit).unwrap();
+    }
+    session.save_full_bytes(id).unwrap().as_ref().clone()
+}
+
 fn annotation(page: usize, shape: Shape) -> Edit {
     Edit::AddAnnotation(NewAnnotation { page, style: Style::default_for(&shape), shape, contents: String::new(), author: "Sari".into() })
 }
@@ -249,7 +259,7 @@ fn pages_that_cannot_be_told_apart_are_refused_unless_a_destination_says() {
     // With an outline whose entry for page 4 now goes to the third page (and page 1's entry
     // to none), the destinations say which: accepted, and checked against that pairing.
     let base = pages(4, "", true, |_| String::new(), &[]);
-    let edited = session(&pages_drawing(4, "", true, |_| String::new(), &[], numbered(3)), vec![Edit::DeletePages { pages: vec![0] }]);
+    let edited = session_whole(&pages_drawing(4, "", true, |_| String::new(), &[], numbered(3)), vec![Edit::DeletePages { pages: vec![0] }]);
     let inspection = run(&base, &edited).unwrap();
     assert_eq!(inspection.pages, PageChanges { before: 4, after: 3, deleted: 1, ..PageChanges::default() }, "{inspection:?}");
     assert_eq!((inspection.content.pages_changed_outside_redactions, inspection.redaction_areas.len()), (0, 1), "{inspection:?}");
