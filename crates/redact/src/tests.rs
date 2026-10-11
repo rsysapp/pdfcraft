@@ -455,3 +455,79 @@ fn tags_lose_what_redaction_removed() {
     assert_eq!(public.get(b"K").and_then(Object::as_int), Some(1));
     assert!(public.get(b"ActualText").is_some(), "untouched content keeps its tags");
 }
+
+/// The page's content after applying, decoded and joined.
+fn page_content(doc: &Document) -> String {
+    let page = doc.get(pdfcraft_cos::ObjRef::new(3, 0)).as_dict().cloned().unwrap();
+    let list: Vec<Object> = match page.get(b"Contents").cloned().unwrap() {
+        Object::Array(items) => items,
+        other => vec![other],
+    };
+    list.iter()
+        .map(|item| match &*doc.resolve(item) {
+            Object::Stream(s) => String::from_utf8_lossy(&s.decoded().unwrap()).into_owned(),
+            _ => String::new(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn spans_lose_the_text_standing_for_what_redaction_removed() {
+    // Embed build (R6b-47): a span whose glyphs were removed, and every level around it, lose
+    // /ActualText, /Alt and /E, written in the content or named in the resources; a span left
+    // whole keeps its own.
+    let content = b"/Div <</ActualText (SECRET Public)>> BDC /Span <</ActualText (SECRET) /Alt (the secret) /E (SECRET) /Lang (en)>> BDC BT /F1 10 Tf 10 200 Td (SECRET) Tj ET EMC \
+/Span /Named BDC BT /F1 10 Tf 10 150 Td (CLASSIFIED) Tj ET EMC /Span <</ActualText (Public)>> BDC BT /F1 10 Tf 10 100 Td (Public) Tj ET EMC EMC";
+    let mut doc =
+        one_page(content, "/Properties << /Named 7 0 R /Other << /ActualText (Other) >> >>", vec![b"<< /ActualText (CLASSIFIED) >>".to_vec()]);
+    mark(&mut doc, 0, &[[5.0, 145.0, 120.0, 212.0]], "");
+    let report = apply(&mut doc, None).unwrap();
+    assert_eq!(report.tags, 3, "the outer level, the inline span and the named one");
+    let after = page_content(&doc);
+    assert!(!after.contains("SECRET") && !after.contains("the secret") && !after.contains("CLASSIFIED"), "{after}");
+    assert!(after.contains("/Lang (en)") && after.contains("/ActualText (Public)"), "{after}");
+    let named = doc.get(pdfcraft_cos::ObjRef::new(7, 0)).as_dict().cloned().unwrap();
+    assert!(named.get(b"ActualText").is_none(), "the named list loses it where it is");
+}
+
+#[test]
+fn a_named_list_written_in_the_resources_loses_its_text_there() {
+    let content = b"/Span /Named BDC BT /F1 10 Tf 10 200 Td (SECRET) Tj ET EMC /Span /Kept BDC BT /F1 10 Tf 10 100 Td (Public) Tj ET EMC";
+    let mut doc = one_page(content, "/Properties << /Named << /ActualText (SECRET) >> /Kept << /ActualText (Public) >> >>", vec![]);
+    mark(&mut doc, 0, &[[5.0, 195.0, 60.0, 212.0]], "");
+    apply(&mut doc, None).unwrap();
+    let page = doc.get(pdfcraft_cos::ObjRef::new(3, 0)).as_dict().cloned().unwrap();
+    let resources = doc.resolve(page.get(b"Resources").unwrap()).as_dict().cloned().unwrap();
+    let properties = doc.resolve(resources.get(b"Properties").unwrap()).as_dict().cloned().unwrap();
+    let list = |name: &[u8]| doc.resolve(properties.get(name).unwrap()).as_dict().cloned().unwrap();
+    assert!(list(b"Named").get(b"ActualText").is_none());
+    assert!(list(b"Kept").get(b"ActualText").is_some());
+}
+
+#[test]
+fn ancestors_and_named_marked_content_lose_their_text_too() {
+    // Embed build (R6b-47): the section around the paragraph whose content changed loses its
+    // text as well; a named property list's MCID counts; a paragraph naming no page is this
+    // page's.
+    let content = b"/P /MC0 BDC BT /F1 10 Tf 10 200 Td (SECRET) Tj ET EMC /P <</MCID 1>> BDC BT /F1 10 Tf 10 100 Td (Public) Tj ET EMC";
+    let mut doc = pdf(vec![
+        b"<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 7 0 R /MarkInfo << /Marked true >> >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /StructParents 0 /Resources << /Font << /F1 5 0 R >> /Properties << /MC0 << /MCID 0 >> >> >> >>".to_vec(),
+        stream("", content),
+        FONT.replace("95 0 R", "6 0 R").into_bytes(),
+        widths(),
+        b"<< /Type /StructTreeRoot /K 8 0 R >>".to_vec(),
+        b"<< /S /Sect /P 7 0 R /Alt (A section about the SECRET) /K [9 0 R 10 0 R] >>".to_vec(),
+        b"<< /S /P /P 8 0 R /ActualText (SECRET) /K 0 >>".to_vec(),
+        b"<< /S /P /P 8 0 R /ActualText (Public) /K 1 >>".to_vec(),
+    ]);
+    mark(&mut doc, 0, &[[5.0, 195.0, 60.0, 212.0]], "");
+    let report = apply(&mut doc, None).unwrap();
+    assert_eq!(report.tags, 2, "the paragraph and its section");
+    let element = |num: u32| doc.get(pdfcraft_cos::ObjRef::new(num, 0)).as_dict().cloned().unwrap();
+    assert!(element(8).get(b"Alt").is_none() && element(8).get(b"K").is_some(), "the section keeps its kids");
+    assert!(element(9).get(b"ActualText").is_none());
+    assert!(element(10).get(b"ActualText").is_some());
+}

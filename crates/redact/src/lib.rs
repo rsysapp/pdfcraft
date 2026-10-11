@@ -20,6 +20,8 @@ mod image;
 mod interp;
 pub mod patterns;
 pub mod sanitize;
+// Embed build: spans lose the text standing for what a redaction removed (R6b-47).
+mod spans;
 mod tags;
 #[cfg(test)]
 mod tests;
@@ -104,7 +106,8 @@ pub struct Report {
     pub forms_removed: usize,
     pub annotations: usize,
     pub fields: usize,
-    /// Structure elements that lost alternate/actual text or emptied marked content.
+    /// Structure elements that lost alternate/actual text or emptied marked content, and (Embed
+    /// build) marked-content spans that lost theirs.
     pub tags: usize,
 }
 
@@ -291,6 +294,12 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
             let mut scope = Scope::new(&rects, Mode::Apply, &mut report);
             process(doc, &mut scope, &data, &resources, pdfcraft_content::Matrix::IDENTITY)
         };
+        // Embed build: named property lists whose spans' content changed lose the text standing
+        // for it, where they are (R6b-47).
+        let resources = match crate::spans::strip_named(doc, &resources, &out.properties)? {
+            Some(rewritten) => rewritten,
+            None => resources,
+        };
         let mut new_list = list.clone();
         let mut changed = false;
         for (i, new) in out.streams.into_iter().enumerate() {
@@ -324,7 +333,9 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
             // Tags must not keep what the page no longer shows.
             let after = doc.get(page.obj).as_dict().cloned().unwrap_or_default();
             let (_, new_data) = page_streams(doc, &after, pi)?;
-            let (changed_ids, empty_ids) = tags::touched(&data.join(&b'\n'), &new_data.join(&b'\n'));
+            // Embed build: with the MCIDs of the property lists named in the resources (R6b-47).
+            let named = tags::named_mcids(doc, &after.get(b"Resources").and_then(|r| doc.resolve(r).as_dict().cloned()).unwrap_or_default());
+            let (changed_ids, empty_ids) = tags::touched(&data.join(&b'\n'), &new_data.join(&b'\n'), &named);
             report.tags += tags::clean(doc, page.obj, &changed_ids, &empty_ids)?;
         }
 

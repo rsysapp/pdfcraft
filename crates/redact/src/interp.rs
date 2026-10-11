@@ -56,6 +56,9 @@ pub(crate) struct Output {
     pub xobjects: Vec<(Vec<u8>, ObjRef)>,
     /// Glyphs / inline images still overlapping a region (verify mode).
     pub residue: usize,
+    /// Embed build: property lists named in the scope's `/Properties` whose spans' content
+    /// changed: they lose the text standing for it (`spans::strip_named`, R6b-47).
+    pub properties: Vec<Vec<u8>>,
 }
 
 pub(crate) struct Scope<'a> {
@@ -244,6 +247,9 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
         }
     }
 
+    // Embed build: the operators as they were, for the spans whose content changes (R6b-47).
+    let original: Vec<Vec<Op>> = if scope.mode == Mode::Apply { pieces.clone() } else { Vec::new() };
+    let mut rewritten: Vec<(Vec<Op>, bool)> = Vec::with_capacity(pieces.len());
     for (piece, mut changed) in pieces.into_iter().zip(rewrite) {
         let mut ops: Vec<Op> = Vec::with_capacity(piece.len());
         for op in piece {
@@ -451,6 +457,18 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
         if !path.is_empty() {
             ops.append(&mut path);
         }
+        rewritten.push((ops, changed));
+    }
+    // Embed build: a span whose glyphs (or anything else) the redaction changed no longer
+    // carries text standing for them: its /ActualText, /Alt and /E would spell out the removed
+    // words for copying and assistive technology (R6b-47).
+    if scope.mode == Mode::Apply && rewritten.iter().any(|(_, changed)| *changed) {
+        let properties = res_dict(doc, resources, b"Properties");
+        let (stripped, named) = crate::spans::strip_changed(doc, &original, &mut rewritten, &properties);
+        scope.report.tags += stripped;
+        out.properties = named;
+    }
+    for (ops, changed) in rewritten {
         out.streams.push(changed.then(|| serialize_ops(&ops)));
     }
     out
@@ -611,6 +629,25 @@ fn xobject(
             scope.depth += 1;
             let inner = process(doc, scope, &[data], &res, fctm);
             scope.depth -= 1;
+            // Embed build: the form's named property lists whose spans changed lose their text
+            // (R6b-47); written in its resources, those are written again below.
+            let mut own_changed = false;
+            let mut res = res;
+            if !inner.properties.is_empty() && scope.mode == Mode::Apply {
+                match crate::spans::strip_named(doc, &res, &inner.properties) {
+                    Ok(Some(new)) => {
+                        res = new;
+                        own_changed = true;
+                    }
+                    Ok(None) => {}
+                    // The text could not be taken away: the form goes, as a form that cannot be
+                    // read does.
+                    Err(_) => {
+                        scope.report.forms_removed += 1;
+                        return Some(None);
+                    }
+                }
+            }
             scope.fonts = saved_fonts;
             out.residue += inner.residue;
             if scope.mode == Mode::Verify {
@@ -622,6 +659,9 @@ fn xobject(
             }
             let mut dict = s.dict.clone();
             dict.remove(b"Length");
+            if own_changed && inner.xobjects.is_empty() {
+                dict.set(b"Resources".to_vec(), Object::Dict(res.clone()));
+            }
             if !inner.xobjects.is_empty() {
                 let mut res = res;
                 let mut xo = res_dict(doc, &res, b"XObject");

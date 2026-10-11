@@ -2,15 +2,17 @@
 //!
 //! Marked content (MCIDs) that applying redactions changed is found by comparing each MCID's
 //! operators before and after. Elements owning such content lose their alternate text, actual
-//! text and expansion (which may spell out the removed words); references to marked content that
-//! is now empty are dropped from the element.
+//! text and expansion (which may spell out the removed words), and so do their ancestors, whose
+//! text stands for their descendants' content too (Embed build, R6b-47); references to marked
+//! content that is now empty are dropped from the element.
 
 use std::collections::{HashMap, HashSet};
 
 use pdfcraft_cos::{Dict, Document, ObjRef, Object};
 
-/// Each MCID's operators (serialized), and whether anything is still drawn inside it.
-fn by_mcid(data: &[u8]) -> HashMap<i64, (Vec<u8>, bool)> {
+/// Each MCID's operators (serialized), and whether anything is still drawn inside it. `named`:
+/// the MCIDs of the property lists named in the resources.
+fn by_mcid(data: &[u8], named: &HashMap<Vec<u8>, i64>) -> HashMap<i64, (Vec<u8>, bool)> {
     let mut out: HashMap<i64, (Vec<u8>, bool)> = HashMap::new();
     let mut stack: Vec<Option<i64>> = Vec::new();
     for op in pdfcraft_content::parse(data).ops {
@@ -18,6 +20,8 @@ fn by_mcid(data: &[u8]) -> HashMap<i64, (Vec<u8>, bool)> {
             b"BDC" => {
                 let id = match op.operands.get(1) {
                     Some(Object::Dict(d)) => d.get(b"MCID").and_then(Object::as_int),
+                    // Embed build: a list named in the resources has its MCID there (R6b-47).
+                    Some(Object::Name(name)) => named.get(name).copied(),
                     _ => None,
                 };
                 if let Some(id) = id {
@@ -55,9 +59,10 @@ fn by_mcid(data: &[u8]) -> HashMap<i64, (Vec<u8>, bool)> {
     out
 }
 
-/// The MCIDs whose content changed between `before` and `after`, and those left empty.
-pub(crate) fn touched(before: &[u8], after: &[u8]) -> (HashSet<i64>, HashSet<i64>) {
-    let (b, a) = (by_mcid(before), by_mcid(after));
+/// The MCIDs whose content changed between `before` and `after`, and those left empty. `named`:
+/// the MCIDs of the property lists named in the resources (see [`named_mcids`]).
+pub(crate) fn touched(before: &[u8], after: &[u8], named: &HashMap<Vec<u8>, i64>) -> (HashSet<i64>, HashSet<i64>) {
+    let (b, a) = (by_mcid(before, named), by_mcid(after, named));
     let mut changed = HashSet::new();
     let mut empty = HashSet::new();
     for (id, (ops, _)) in &b {
@@ -79,12 +84,27 @@ pub(crate) fn touched(before: &[u8], after: &[u8]) -> (HashSet<i64>, HashSet<i64
     (changed, empty)
 }
 
+/// Embed build: the MCID of each property list named in `resources`' `/Properties` (R6b-47).
+pub(crate) fn named_mcids(doc: &Document, resources: &Dict) -> HashMap<Vec<u8>, i64> {
+    let properties = resources.get(b"Properties").map(|properties| doc.resolve(properties));
+    let Some(properties) = properties.as_deref().and_then(Object::as_dict) else { return HashMap::new() };
+    properties
+        .iter()
+        .filter_map(|(name, list)| {
+            doc.resolve(list).as_dict().and_then(|list| list.get(b"MCID")).and_then(Object::as_int).map(|mcid| (name.clone(), mcid))
+        })
+        .collect()
+}
+
 fn mcid_of(o: &Object, page: Option<ObjRef>, target: ObjRef) -> Option<i64> {
+    // Embed build: a kid no element names a page for is taken as the page's (a reader may),
+    // and a marked-content reference into a form XObject (`/Stm`) is the form's, not the
+    // page's (R6b-47).
     match o {
-        Object::Int(n) if page == Some(target) => Some(*n),
-        Object::Dict(m) if m.name(b"Type") == Some(b"MCR") => {
+        Object::Int(n) if page.is_none_or(|page| page == target) => Some(*n),
+        Object::Dict(m) if m.name(b"Type") == Some(b"MCR") && !m.contains(b"Stm") => {
             let pg = m.get(b"Pg").and_then(Object::as_ref).or(page);
-            (pg == Some(target)).then(|| m.get(b"MCID").and_then(Object::as_int)).flatten()
+            pg.is_none_or(|pg| pg == target).then(|| m.get(b"MCID").and_then(Object::as_int)).flatten()
         }
         _ => None,
     }
@@ -102,13 +122,14 @@ pub(crate) fn clean(doc: &mut Document, page: ObjRef, changed: &HashSet<i64>, em
     else {
         return Ok(0);
     };
-    // Indirect elements with the page they inherit.
-    let mut todo: Vec<(Object, Option<ObjRef>)> = root.get(b"K").map(|k| vec![(k.clone(), None)]).unwrap_or_default();
+    // Indirect elements with the page they inherit, and (Embed build) the element they are in.
+    let mut todo: Vec<(Object, Option<ObjRef>, Option<ObjRef>)> = root.get(b"K").map(|k| vec![(k.clone(), None, None)]).unwrap_or_default();
     let mut seen = HashSet::new();
+    let mut parents: HashMap<ObjRef, ObjRef> = HashMap::new();
     let mut hits: Vec<(ObjRef, Dict, Option<ObjRef>)> = Vec::new();
-    while let Some((k, pg)) = todo.pop() {
+    while let Some((k, pg, parent)) = todo.pop() {
         match k {
-            Object::Array(a) => todo.extend(a.into_iter().map(|x| (x, pg))),
+            Object::Array(a) => todo.extend(a.into_iter().map(|x| (x, pg, parent))),
             Object::Ref(r) => {
                 if !seen.insert(r) || seen.len() > 2_000_000 {
                     continue;
@@ -116,6 +137,9 @@ pub(crate) fn clean(doc: &mut Document, page: ObjRef, changed: &HashSet<i64>, em
                 let Some(d) = doc.get(r).as_dict().cloned() else { continue };
                 if !d.contains(b"S") {
                     continue;
+                }
+                if let Some(parent) = parent {
+                    parents.insert(r, parent);
                 }
                 let pg = d.get(b"Pg").and_then(Object::as_ref).or(pg);
                 let kids: Vec<Object> = match d.get(b"K") {
@@ -126,12 +150,37 @@ pub(crate) fn clean(doc: &mut Document, page: ObjRef, changed: &HashSet<i64>, em
                 if kids.iter().any(|x| mcid_of(x, pg, page).is_some_and(|m| changed.contains(&m))) {
                     hits.push((r, d.clone(), pg));
                 }
-                todo.extend(kids.into_iter().map(|x| (x, pg)));
+                todo.extend(kids.into_iter().map(|x| (x, pg, Some(r))));
             }
             _ => {}
         }
     }
+    // Embed build: the ancestors of an element whose content changed lose the text standing for
+    // it too (R6b-47); each once, their kids as they are.
+    let mut ancestors: Vec<ObjRef> = Vec::new();
+    let mut done: HashSet<ObjRef> = hits.iter().map(|(r, _, _)| *r).collect();
+    for (r, _, _) in &hits {
+        let mut at = *r;
+        while let Some(parent) = parents.get(&at).copied() {
+            if !done.insert(parent) {
+                break;
+            }
+            ancestors.push(parent);
+            at = parent;
+        }
+    }
     let mut n = 0;
+    for r in ancestors {
+        let has_text = doc.get(r).as_dict().is_some_and(|e| [&b"Alt"[..], b"ActualText", b"E"].iter().any(|key| e.contains(key)));
+        if has_text {
+            doc.update_dict(r, |e| {
+                for key in [&b"Alt"[..], b"ActualText", b"E"] {
+                    e.remove(key);
+                }
+            })?;
+            n += 1;
+        }
+    }
     for (r, d, pg) in hits {
         let kids = d.get(b"K").cloned();
         doc.update_dict(r, |e| {
