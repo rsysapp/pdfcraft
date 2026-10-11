@@ -21,7 +21,9 @@
 //!   inside and whether it shows by default, evaluated here against `/OCProperties` (not as
 //!   hayro would), and optional content that cannot be evaluated so that every reader agrees
 //!   (a group named by another tag, missing from `/OCGs`, automatic states, no `/OCProperties`,
-//!   marked content unbalanced around it, …) is an error;
+//!   marked content unbalanced around it, a group with `/Usage` on a changed page, …) is an
+//!   error; a changed page of a rewrite is compared in every combination of its layers' states
+//!   (at most 64);
 //! - hayro reads every content stream it interprets to its end: one it stops reading early (an
 //!   operator after which it gives up, data it cannot parse) or cannot decode is an error, since
 //!   what follows would be checked by nothing; and it draws everything the content draws as
@@ -215,10 +217,13 @@ pub struct ContentChanges {
     ///   change hayro's pixels do not show may show in another viewer;
     /// - a glyph, image or form in other optional content than at its place in the base, or shown
     ///   otherwise by default (R6b-29), whatever the boxes cover;
-    /// - where content is in optional content: the page as it shows by default, or with every
-    ///   layer off, changed other than under the boxes (content moved into or out of a layer,
-    ///   or covered or uncovered by a layer's content, which the render of every layer cannot
-    ///   tell).
+    /// - where content is in optional content: the page in any combination of the states of the
+    ///   groups its content depends on (the default view and every layer off among them; more
+    ///   than [`MAX_VIEW_GROUPS`] groups is [`InspectError::TooComplex`]) changed other than
+    ///   under the boxes (content moved into or out of a layer, or covered or uncovered by a
+    ///   layer's content, which the render of every layer cannot tell; R6b-36). A changed page
+    ///   whose content is in a group with `/Usage` fails the inspection: readers apply it
+    ///   differently.
     pub pages_changed_outside_redactions: u32,
 }
 
@@ -689,16 +694,15 @@ fn read_side(bytes: &[u8], against: Option<(&[u8], &Structure, bool)>, placement
         // Optional content (R6b-29): every mark the page met is evaluated against the document's
         // configuration (or the page refused), and each glyph, image and form carries the
         // membership it was drawn in.
-        let (hidden, objects) = known.hidden_layers(&doc, budget, &content.layer_marks)?;
-        if !objects.is_empty() && content.layers_unbalanced {
+        let layers = known.page_layers(&doc, budget, &content.layer_marks)?;
+        if !layers.marks.is_empty() && content.layers_unbalanced {
             return Err(Fail::Read(format!(
                 "page {number}: marked content is not balanced in a content stream, so which content is in which layer is each reader's guess"
             )));
         }
         let memberships = content.layers.iter().map(|marks| known.layer(&doc, budget, marks)).collect::<Result<Vec<_>, _>>()?;
         let membership = |index: Option<u32>| index.and_then(|index| memberships.get(index as usize).copied().flatten());
-        page.hidden_layers = hidden;
-        page.layer_objects = objects;
+        page.layers = layers;
         let layers: HashMap<u32, structure::LayerFact> =
             content.glyphs.layers.iter().filter_map(|(glyph, index)| membership(Some(*index)).map(|fact| (*glyph, fact))).collect();
         // Where each image is drawn is where hayro's interpretation (the one the render check
@@ -1136,8 +1140,42 @@ fn layers_changed_for(base: &PageFacts, edited: &PageFacts, pairing: &glyphs::Pa
     Ok(in_edited.iter().any(|(layer, count)| *count > in_base.get(layer).copied().unwrap_or(0)))
 }
 
-/// The page rendered as a viewer shows it by default: without the content inside `hidden`
-/// optional content (see [`PageFacts::hidden_layers`]).
+/// The most optional-content groups a changed page in a rewrite may depend on: it is compared in
+/// every combination of their states, 2^6 = 64 views (R6b-36). More is [`InspectError::TooComplex`].
+pub const MAX_VIEW_GROUPS: usize = 6;
+
+/// Whether base page `pair.0` and edited page `pair.1` differ other than under redaction boxes
+/// in any view of their optional content: each combination of the states of the groups either
+/// page's content depends on (the default view and the view with every layer off among them),
+/// each view rendered without the content its groups and membership dictionaries hide there.
+/// Views that hide nothing on either page are the render of every layer, compared already.
+fn layer_views_differ(before: &Side, after: &Side, pair: (usize, usize), budget: &mut Budget) -> Result<bool, InspectError> {
+    let (Some(b), Some(e)) = (before.structure.pages.get(pair.0), after.structure.pages.get(pair.1)) else { return Ok(false) };
+    let mut groups = BTreeSet::new();
+    b.layers.groups(&mut groups);
+    e.layers.groups(&mut groups);
+    if groups.len() > MAX_VIEW_GROUPS {
+        return Err(InspectError::TooComplex);
+    }
+    let groups: Vec<usize> = groups.into_iter().collect();
+    let mut seen: BTreeSet<(Vec<structure::LayerObject>, Vec<structure::LayerObject>)> = BTreeSet::new();
+    for view in 0u32..(1u32 << groups.len()) {
+        let on = |group: usize| groups.iter().position(|known| *known == group).is_some_and(|bit| view & (1u32 << bit) != 0);
+        let (base_hidden, edited_hidden) = (b.layers.hidden(&on), e.layers.hidden(&on));
+        if (base_hidden.is_empty() && edited_hidden.is_empty()) || !seen.insert((base_hidden.clone(), edited_hidden.clone())) {
+            continue;
+        }
+        let base_view = render_hiding(before, pair.0, &base_hidden, budget).map_err(|fail| fail.of(Role::Base))?;
+        let edited_view = render_hiding(after, pair.1, &edited_hidden, budget).map_err(|fail| fail.of(Role::Edited))?;
+        if visual::redaction_boxes(&base_view, &edited_view).outside {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The page rendered without the content inside `hidden` optional content: one view of its
+/// layers (see [`structure::PageLayers::hidden`]).
 fn render_hiding(side: &Side, index: usize, hidden: &[(i32, i32)], budget: &mut Budget) -> Result<UprightRaster, Fail> {
     render_with(side, index, hidden, budget)
 }
@@ -1189,6 +1227,15 @@ fn compare_pages(
         budget.time().map_err(|fail| fail.of(Role::Edited))?;
         let (Some(b), Some(e)) = (before.structure.pages.get(old), after.structure.pages.get(new)) else { continue };
         let drawn_differently = b.content != e.content || b.resources != e.resources || b.other != e.other || layers_changed;
+        // R6b-36: readers apply `/Usage` differently (PDFium applies `/Usage /View /ViewState`
+        // before `/D`, so its default view is not the one `/D` gives), so no fact about a changed
+        // page that uses such a group would hold for every reader.
+        if drawn_differently && (b.layers.usage || e.layers.usage) {
+            return Err(InspectError::Edited(format!(
+                "page {} is changed and uses optional content with /Usage, which readers apply differently",
+                new.saturating_add(1)
+            )));
+        }
         // The same content, resources and page entries draw the same glyphs and images.
         let pairing = if drawn_differently {
             glyphs::pair(&b.glyphs, &e.glyphs, budget).map_err(|fail| fail.of(Role::Edited))?
@@ -1211,19 +1258,12 @@ fn compare_pages(
             } else {
                 (Vec::new(), false)
             };
-            // R6b-29. What the page shows by default, where some content is in a layer that is
-            // off, and with every layer off: the render of every layer cannot tell content moved
-            // into or out of a layer, or covered by a layer's content, from what was there.
-            if drawn_differently {
-                let views = [(&b.hidden_layers, &e.hidden_layers), (&b.layer_objects, &e.layer_objects)];
-                for (base_hidden, edited_hidden) in views {
-                    if outside || (base_hidden.is_empty() && edited_hidden.is_empty()) {
-                        continue;
-                    }
-                    let base_view = render_hiding(before, old, base_hidden, budget).map_err(|fail| fail.of(Role::Base))?;
-                    let edited_view = render_hiding(after, new, edited_hidden, budget).map_err(|fail| fail.of(Role::Edited))?;
-                    outside |= visual::redaction_boxes(&base_view, &edited_view).outside;
-                }
+            // R6b-29, R6b-36. The page in every combination of its layers: the render of every
+            // layer cannot tell content moved into or out of a layer, or covered or uncovered
+            // by a layer's content, from what was there. (A changed layer configuration is a
+            // change outside the redactions on every page already.)
+            if drawn_differently && !outside && !layers_changed {
+                outside |= layer_views_differ(before, after, (old, new), budget)?;
             }
             // A glyph, image or form now in other optional content (or shown otherwise by
             // default) than it was: not a redaction, whatever the boxes cover.
