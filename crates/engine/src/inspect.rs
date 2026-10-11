@@ -8,8 +8,10 @@
 //! - structure (page tree, page dictionaries, annotations, form fields, the cross-reference chain
 //!   and the trailer) comes from one parser, `pdfcraft_cos`, the one the writer uses; every object
 //!   read must sit where the cross-reference data says, and any repair is an error;
-//! - hayro (through `pdfcraft_render::content`) only extracts text and renders, and must agree with
-//!   `pdfcraft_cos` on the page count and each page's annotation count; a glyph without text, an
+//! - hayro (through `pdfcraft_render::content`) only interprets page content (each glyph and each
+//!   image it draws, and where: one interpretation, the one the render shows) and renders, and
+//!   must agree with `pdfcraft_cos` on the page count and each page's annotation count; a glyph
+//!   without text, an image hayro draws that `pdfcraft_cos` does not read as an image, an
 //!   interpreter warning or a rebuilt cross-reference table is an error;
 //! - an appended update must leave every base page's content and resources as they were (edit
 //!   mode never writes page content there); a rewrite is accepted only as an applied redaction,
@@ -120,8 +122,10 @@ pub struct TextChanges {
 pub struct ContentChanges {
     /// Pages that lost an image (drawn directly, inside a form XObject, or inline). Appended
     /// updates compare images by a hash of each one's encoded stream (a cleared image is a new
-    /// one). Rewrites compare each image placement: a base image gone, or replaced at its place by
-    /// one whose pixels differ under a redaction area (an image redacted in place).
+    /// one). Rewrites compare each image placement where hayro's interpreter drew it (also in soft
+    /// masks' groups; an image in a tiling pattern's cell by its hash alone): a base image gone,
+    /// or replaced at its place by one whose pixels differ under a redaction area (an image
+    /// redacted in place).
     pub pages_with_images_removed: u32,
     /// Pages that gained an image. In rewrites, an image redacted in place (the same size and
     /// meaning at the same place, pixels changed only under the redaction areas) is not one.
@@ -141,7 +145,9 @@ pub struct ContentChanges {
     ///   outside every box that differs from the base (losslessly coded images), or differs by
     ///   more than requantising the base with the edited image's quantisation tables explains
     ///   (baseline JPEGs); an image replaced by one of another size, meaning, coding or placement,
-    ///   or removed, unless it lay wholly under the boxes.
+    ///   or removed, unless it lay wholly under the boxes. Each image is placed where hayro's
+    ///   interpreter drew it, and all of it is compared, whatever a clip hides;
+    /// - an image drawn in a tiling pattern's cell added, removed or changed at all.
     pub pages_changed_outside_redactions: u32,
 }
 
@@ -447,11 +453,10 @@ fn read_side(bytes: &[u8], against: Option<(&[u8], &Structure, bool)>, placement
     if let Some(repair) = doc.repair_log().first() {
         return Err(Fail::Read(format!("the file is damaged: {repair}")));
     }
-    let structure = structure::read(&doc, budget)?;
+    let (structure, mut known) = structure::read(&doc, budget)?;
     if let Some((base_bytes, base, base_kept)) = against {
         structure::check_chain(&structure.sections, base_bytes.len(), &base.sections, base_kept)?;
     }
-    drop(doc);
     let hayro = match ContentDocument::open(shared.clone(), budget.limits.page_work) {
         Ok(hayro) => hayro,
         Err(ContentOpenError::Encrypted) => return Err(Fail::Encrypted),
@@ -470,16 +475,19 @@ fn read_side(bytes: &[u8], against: Option<(&[u8], &Structure, bool)>, placement
         page.size = side.hayro.upright_size(index).ok_or_else(|| Fail::Read(format!("page {number} could not be read")))?;
         budget.content(page.interpreted)?;
         let before = side.hayro.work_spent();
-        let text = side.hayro.text(index);
+        let content = side.hayro.content(index);
         budget.work(&side.hayro, before)?;
-        let glyphs = text.map_err(content_failure)?;
-        budget.glyphs(glyphs.len().saturating_add(glyphs.chars.len()))?;
-        page.glyphs = glyphs;
-        if !placements {
-            page.image_uses = Vec::new();
+        let content = content.map_err(content_failure)?;
+        budget.glyphs(content.glyphs.len().saturating_add(content.glyphs.chars.len()))?;
+        page.glyphs = content.glyphs;
+        // Where each image is drawn is where hayro's interpretation (the one the render check
+        // sees) drew it; `pdfcraft_cos` says which image it is.
+        if placements {
+            page.image_uses = known.image_uses(&doc, budget, &content.images)?;
         }
         page.fingerprint = structure::fingerprint(page);
     }
+    drop(doc);
     if side.hayro.repaired() {
         return Err(Fail::Read("the file's cross-reference data is damaged".into()));
     }
@@ -868,5 +876,7 @@ fn compare_annotations(
     Ok(changes)
 }
 
+#[cfg(test)]
+mod placement_tests;
 #[cfg(test)]
 mod tests;

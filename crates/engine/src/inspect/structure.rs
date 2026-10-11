@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use pdfcraft_cos::{Dict, Document, Lexer, ObjRef, Object, Stream, XrefEntry, parse_indirect};
-use pdfcraft_render::content::PageGlyphs;
+use pdfcraft_render::content::{ImageDraw, ImageSource, PageGlyphs};
 
 use super::{Budget, Fail, MAX_PAGES};
 
@@ -73,7 +73,8 @@ pub(crate) struct PageFacts {
     pub other: Digest,
     /// The images drawn (directly, inside form XObjects, inline), as a sorted multiset.
     pub images: Vec<Digest>,
-    /// Each image drawn, where (for a rewrite's redaction check).
+    /// Each image hayro drew, where (for a rewrite's redaction check): filled from hayro's
+    /// interpretation (see [`Known::image_uses`]), not from this scan.
     pub image_uses: Vec<ImageUse>,
     /// The image pixels drawn, summed over every use.
     pub image_pixels: u64,
@@ -88,13 +89,15 @@ pub(crate) struct PageFacts {
     pub fingerprint: Digest,
 }
 
-/// One use of an image on a page.
+/// One use of an image on a page, as hayro's interpreter drew it.
 #[derive(Clone, Debug)]
 pub(crate) struct ImageUse {
     /// The raw encoded stream's digest (with its dictionary).
     pub digest: Digest,
     /// Image space (the unit square) to user space.
     pub matrix: Matrix,
+    /// Drawn in a tiling pattern's cell: `matrix` is in the cell's space, not the page's.
+    pub tiled: bool,
     /// The image XObject (`None`: an inline image).
     pub image: Option<Arc<ImageInfo>>,
 }
@@ -186,30 +189,17 @@ struct Scan {
     len: usize,
 }
 
-/// What a content stream draws that the comparison follows.
+/// What a content stream draws that the comparison follows: which images and forms, not where
+/// (placements are hayro's, see [`Known::image_uses`]).
 enum Item {
-    /// `/Name Do`, under this transformation (relative to the stream's start).
-    Draw(Vec<u8>, Matrix),
-    /// An inline image: its digest, pixel count and transformation.
-    Inline(Digest, u64, Matrix),
+    /// `/Name Do`.
+    Draw(Vec<u8>),
+    /// An inline image: its digest and pixel count.
+    Inline(Digest, u64),
 }
 
 /// A transformation matrix `[a b c d e f]` (ISO 32000-2 §8.3.3).
 pub(crate) type Matrix = [f64; 6];
-
-const IDENTITY: Matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
-
-/// `m` then `then` (`m × then`, as `cm` concatenates onto the CTM).
-fn concat(m: &Matrix, then: &Matrix) -> Matrix {
-    [
-        m[0] * then[0] + m[1] * then[2],
-        m[0] * then[1] + m[1] * then[3],
-        m[2] * then[0] + m[3] * then[2],
-        m[2] * then[1] + m[3] * then[3],
-        m[4] * then[0] + m[5] * then[2] + then[4],
-        m[4] * then[1] + m[5] * then[3] + then[5],
-    ]
-}
 
 /// The box an image drawn under `m` covers (the unit square), in the space `m` maps into. A
 /// matrix that does not give finite numbers gives a box that contains nothing.
@@ -240,8 +230,6 @@ struct PageNode {
 #[derive(Default)]
 struct Drawn {
     images: Vec<Digest>,
-    /// Each image drawn, where.
-    placements: Vec<ImageUse>,
     pixels: u64,
     interpreted: usize,
 }
@@ -659,15 +647,13 @@ impl<'d, 'b> Reader<'d, 'b> {
         Ok(scan)
     }
 
-    /// What a content stream draws that is followed: `Do` and inline images. Anything the lexer
-    /// cannot read is an error.
+    /// What a content stream draws that is followed: `Do` and inline images, for the images'
+    /// identities and the work a page asks of the interpreter. Anything the lexer cannot read is
+    /// an error.
     fn scan(&mut self, data: &[u8]) -> Result<Scan, Fail> {
         let unreadable = |what: &str| read_error(format!("a content stream cannot be read: {what}"));
         let mut lx = Lexer::new(data, 0);
         let mut name: Option<Vec<u8>> = None;
-        let mut numbers: Vec<f64> = Vec::new();
-        let mut ctm = IDENTITY;
-        let mut saved: Vec<Matrix> = Vec::new();
         let mut items = Vec::new();
         loop {
             self.budget.tick()?;
@@ -678,9 +664,6 @@ impl<'d, 'b> Reader<'d, 'b> {
                 let operand = lx.object().map_err(|error| unreadable(&error.to_string()))?;
                 if lx.pos <= at {
                     return Err(unreadable("no progress"));
-                }
-                if let Some(number) = operand.as_f64() {
-                    numbers.push(number);
                 }
                 name = match operand {
                     Object::Name(n) => Some(n),
@@ -696,23 +679,14 @@ impl<'d, 'b> Reader<'d, 'b> {
                 return Err(unreadable("an unknown byte"));
             }
             match keyword {
-                b"Do" => items.push(Item::Draw(name.take().ok_or_else(|| unreadable("Do without a name"))?, ctm)),
+                b"Do" => items.push(Item::Draw(name.take().ok_or_else(|| unreadable("Do without a name"))?)),
                 b"BI" => {
                     let (digest, pixels, end) = self.inline_image(data, lx.pos)?;
-                    items.push(Item::Inline(digest, pixels, ctm));
+                    items.push(Item::Inline(digest, pixels));
                     lx.pos = end;
-                }
-                b"q" => saved.push(ctm),
-                b"Q" => ctm = saved.pop().unwrap_or(ctm),
-                b"cm" => {
-                    if let Some(m) = numbers.len().checked_sub(6).and_then(|from| numbers.get(from..)) {
-                        let m: Matrix = [m[0], m[1], m[2], m[3], m[4], m[5]];
-                        ctm = concat(&m, &ctm);
-                    }
                 }
                 _ => {}
             }
-            numbers.clear();
             name = None;
         }
         Ok(Scan { digest: sha256(&[data]), items, len: data.len() })
@@ -771,18 +745,15 @@ impl<'d, 'b> Reader<'d, 'b> {
     }
 
     /// Follow what a content stream draws: images (hashed once each) and forms (recursively).
-    /// `ctm` maps the stream's space to user space.
-    fn draw(&mut self, items: &[Item], chain: &[Arc<Dict>], depth: usize, ctm: &Matrix, drawn: &mut Drawn) -> Result<(), Fail> {
+    fn draw(&mut self, items: &[Item], chain: &[Arc<Dict>], depth: usize, drawn: &mut Drawn) -> Result<(), Fail> {
         for item in items {
             self.budget.uses()?;
             match item {
-                Item::Inline(digest, pixels, at) => {
+                Item::Inline(digest, pixels) => {
                     drawn.images.push(*digest);
-                    drawn.placements.push(ImageUse { digest: *digest, matrix: concat(at, ctm), image: None });
                     drawn.pixels = drawn.pixels.saturating_add(*pixels);
                 }
-                Item::Draw(name, at) => {
-                    let placed = concat(at, ctm);
+                Item::Draw(name) => {
                     let Some(r) = self.xobject(chain, name)? else { continue };
                     let obj = self.get(r)?;
                     let Object::Stream(stream) = &*obj else { continue };
@@ -792,7 +763,6 @@ impl<'d, 'b> Reader<'d, 'b> {
                             let info = self.image_info(r, &stream.dict)?;
                             drawn.images.push(digest);
                             drawn.pixels = drawn.pixels.saturating_add(u64::from(info.width).saturating_mul(u64::from(info.height)));
-                            drawn.placements.push(ImageUse { digest, matrix: placed, image: Some(info) });
                         }
                         Some(b"Form") => {
                             if depth >= self.budget.limits.form_depth {
@@ -804,12 +774,7 @@ impl<'d, 'b> Reader<'d, 'b> {
                             let mut inner = Vec::with_capacity(chain.len().saturating_add(1));
                             inner.push(Arc::new(own));
                             inner.extend(chain.iter().cloned());
-                            let numbers = self.array_of(stream.dict.get(b"Matrix"), "a form's /Matrix")?;
-                            let matrix = match numbers.iter().map(Object::as_f64).collect::<Option<Vec<f64>>>().as_deref() {
-                                Some([a, b, c, d, e, f]) => [*a, *b, *c, *d, *e, *f],
-                                _ => IDENTITY,
-                            };
-                            self.draw(&scan.items, &inner, depth.saturating_add(1), &concat(&matrix, &placed), drawn)?;
+                            self.draw(&scan.items, &inner, depth.saturating_add(1), drawn)?;
                         }
                         _ => {}
                     }
@@ -867,7 +832,7 @@ impl<'d, 'b> Reader<'d, 'b> {
         let resources = sha256(&[&levels]);
         let scan = self.page_content(&node.dict)?;
         let mut drawn = Drawn { interpreted: scan.len, ..Drawn::default() };
-        self.draw(&scan.items, &chain, 0, &IDENTITY, &mut drawn)?;
+        self.draw(&scan.items, &chain, 0, &mut drawn)?;
         drawn.images.sort_unstable();
         let (annots, annots_in_array) = self.annotations(node, widgets, annotation_ids)?;
         Ok(PageFacts {
@@ -877,7 +842,7 @@ impl<'d, 'b> Reader<'d, 'b> {
             other,
             images: drawn.images,
             image_pixels: drawn.pixels,
-            image_uses: drawn.placements,
+            image_uses: Vec::new(),
             interpreted: drawn.interpreted,
             annots,
             annots_in_array,
@@ -1050,8 +1015,84 @@ fn section(data: &[u8], offset: u64, is_stream: bool) -> Result<Section, Fail> {
     Ok(Section { offset, prev, hybrid: trailer.contains(b"XRefStm") })
 }
 
+/// What [`read`] established about objects, kept for identifying the images hayro draws: which
+/// objects were checked to sit where the cross-reference data says, the digests made, and the
+/// image XObjects read.
+pub(crate) struct Known {
+    checked: HashMap<u32, u16>,
+    object_streams: HashMap<u32, Arc<Vec<u32>>>,
+    digests: HashMap<ObjRef, Digest>,
+    images: HashMap<ObjRef, Arc<ImageInfo>>,
+}
+
+impl Known {
+    /// The images hayro drew on a page, each identified by `pdfcraft_cos` (an image XObject is the
+    /// object hayro names, read and digested here like any other; an inline image is its bytes
+    /// as hayro's parser delimited them) and placed where hayro drew it. An object hayro names
+    /// that is not an image here is an error: the readers disagree.
+    pub fn image_uses(&mut self, doc: &Document, budget: &mut Budget, draws: &[ImageDraw]) -> Result<Vec<ImageUse>, Fail> {
+        let mut reader = Reader {
+            doc,
+            data: doc.bytes().as_slice(),
+            budget,
+            checked: std::mem::take(&mut self.checked),
+            checking: HashSet::new(),
+            object_streams: std::mem::take(&mut self.object_streams),
+            digests: std::mem::take(&mut self.digests),
+            stack: Vec::new(),
+            contents: HashMap::new(),
+            forms: HashMap::new(),
+            images: std::mem::take(&mut self.images),
+        };
+        // Inline images by the copies hayro's draws share (alive as long as `draws`): one digest
+        // for the uses of an inline image in a form drawn many times.
+        let mut inline = HashMap::new();
+        let uses = draws.iter().map(|draw| reader.image_use(draw, &mut inline)).collect::<Result<Vec<_>, _>>();
+        self.checked = reader.checked;
+        self.object_streams = reader.object_streams;
+        self.digests = reader.digests;
+        self.images = reader.images;
+        uses
+    }
+}
+
+impl Reader<'_, '_> {
+    fn image_use(&mut self, draw: &ImageDraw, inline: &mut HashMap<(usize, usize), Digest>) -> Result<ImageUse, Fail> {
+        self.budget.uses()?;
+        let (digest, image) = match &draw.source {
+            ImageSource::Object { num, generation } => {
+                let r = ObjRef::new(*num, *generation);
+                let obj = self.get(r)?;
+                let Object::Stream(stream) = &*obj else {
+                    return Err(read_error(format!("readers disagree: hayro draws object {r} as an image")));
+                };
+                if stream.dict.name(b"Subtype") != Some(b"Image") {
+                    return Err(read_error(format!("readers disagree: hayro draws object {r} as an image")));
+                }
+                let (digest, _) = self.digest_ref(r)?;
+                (digest, Some(self.image_info(r, &stream.dict)?))
+            }
+            ImageSource::Inline { dict, data } => {
+                let key = (dict.as_ptr() as usize, data.as_ptr() as usize);
+                let digest = match inline.get(&key) {
+                    Some(digest) => *digest,
+                    None => {
+                        self.budget.hashed(dict.len().saturating_add(data.len()))?;
+                        let length = u64::try_from(dict.len()).unwrap_or(u64::MAX).to_le_bytes();
+                        let digest = sha256(&[b"inline", &length, dict, data]);
+                        inline.insert(key, digest);
+                        digest
+                    }
+                };
+                (digest, None)
+            }
+        };
+        Ok(ImageUse { digest, matrix: draw.matrix, tiled: draw.tiled, image })
+    }
+}
+
 /// Read one file's structure. Fails on anything not read for certain.
-pub(crate) fn read(doc: &Document, budget: &mut Budget) -> Result<Structure, Fail> {
+pub(crate) fn read(doc: &Document, budget: &mut Budget) -> Result<(Structure, Known), Fail> {
     let data = doc.bytes().as_slice();
     let sections = doc.revisions().iter().map(|revision| section(data, revision.xref_offset, revision.is_stream)).collect::<Result<Vec<_>, _>>()?;
     if sections.is_empty() {
@@ -1092,5 +1133,6 @@ pub(crate) fn read(doc: &Document, budget: &mut Budget) -> Result<Structure, Fai
         reader.budget.time()?;
         pages.push(reader.page(node, &widgets, &mut annotation_ids)?);
     }
-    Ok(Structure { pages, fields, form, catalog: entries, layers, sections })
+    let known = Known { checked: reader.checked, object_streams: reader.object_streams, digests: reader.digests, images: reader.images };
+    Ok((Structure { pages, fields, form, catalog: entries, layers, sections }, known))
 }

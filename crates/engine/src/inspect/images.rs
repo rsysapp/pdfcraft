@@ -10,6 +10,10 @@
 //! way (another size or meaning, another codec, an inline image, a coding this reader does not
 //! decode) is accepted only when both uses lie wholly under the areas. A base use with no
 //! replacement must lie wholly under the areas; an edited use with no base use is an added image.
+//!
+//! Uses are where hayro's interpreter drew each image (the interpretation the page render
+//! shows). Images drawn in a tiling pattern's cell repeat over what the pattern paints; they are
+//! compared by identity only, and any difference counts as a change outside the areas.
 
 use std::collections::HashMap;
 use std::f64::consts::PI;
@@ -17,7 +21,7 @@ use std::sync::OnceLock;
 
 use pdfcraft_cos::{Document, Object, Stream};
 
-use super::structure::{ImageUse, Matrix, unit_square};
+use super::structure::{Digest, ImageUse, Matrix, unit_square};
 use super::{AREA_TOLERANCE, Budget, Fail, jpeg};
 
 /// How far (PDF points) the corners of two placements of an image may lie apart for them to be one
@@ -144,6 +148,18 @@ fn same_placement(a: &Matrix, b: &Matrix) -> bool {
     corners(a).iter().zip(corners(b)).all(|(p, q)| (p.0 - q.0).abs() <= PLACEMENT_TOLERANCE && (p.1 - q.1).abs() <= PLACEMENT_TOLERANCE)
 }
 
+/// Whether two multisets of digests differ: (`a` has one `b` lacks, `b` has one `a` lacks).
+fn differ(a: &[Digest], b: &[Digest]) -> (bool, bool) {
+    let mut counts: HashMap<&Digest, i64> = HashMap::new();
+    for digest in a {
+        *counts.entry(digest).or_default() += 1;
+    }
+    for digest in b {
+        *counts.entry(digest).or_default() -= 1;
+    }
+    (counts.values().any(|n| *n > 0), counts.values().any(|n| *n < 0))
+}
+
 /// A placement's grid cell (its origin to the nearest point), for finding the same placement.
 fn place_key(m: &Matrix) -> Option<(i64, i64)> {
     (m[4].is_finite() && m[5].is_finite()).then(|| (m[4].floor() as i64, m[5].floor() as i64))
@@ -158,6 +174,16 @@ pub(crate) fn compare(
     budget: &mut Budget,
 ) -> Result<ImageOutcome, Fail> {
     let mut outcome = ImageOutcome::default();
+    // Images in pattern cells: by identity.
+    let tiled = |uses: &[ImageUse]| uses.iter().filter(|used| used.tiled).map(|used| used.digest).collect::<Vec<_>>();
+    let (lost, gained) = differ(&tiled(base), &tiled(edited));
+    if lost || gained {
+        outcome.removed |= lost;
+        outcome.added |= gained;
+        outcome.outside = true;
+    }
+    let base: Vec<&ImageUse> = base.iter().filter(|used| !used.tiled).collect();
+    let edited: Vec<&ImageUse> = edited.iter().filter(|used| !used.tiled).collect();
     // Base uses not yet accounted for, by placement cell.
     let mut left: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
     let mut taken = vec![false; base.len()];
@@ -173,7 +199,7 @@ pub(crate) fn compare(
             for dy in -1..=1 {
                 let Some(list) = left.get(&(x.saturating_add(dx), y.saturating_add(dy))) else { continue };
                 for &index in list {
-                    let Some(candidate) = base.get(index) else { continue };
+                    let Some(candidate) = base.get(index).copied() else { continue };
                     if !taken.get(index).copied().unwrap_or(true)
                         && (!same_image || candidate.digest == use_.digest)
                         && same_placement(&candidate.matrix, &use_.matrix)
@@ -187,7 +213,7 @@ pub(crate) fn compare(
     };
     // The same image at the same place: unchanged.
     let mut rest = Vec::new();
-    for used in edited {
+    for used in edited.iter().copied() {
         budget.tick()?;
         match find(&left, &taken, used, true) {
             Some(index) => {
@@ -208,7 +234,7 @@ pub(crate) fn compare(
         if let Some(slot) = taken.get_mut(index) {
             *slot = true;
         }
-        let Some(original) = base.get(index) else { continue };
+        let Some(original) = base.get(index).copied() else { continue };
         match replacement(original, used, files, areas, budget)? {
             Replaced::Same => {}
             Replaced::Redacted => outcome.removed = true,
