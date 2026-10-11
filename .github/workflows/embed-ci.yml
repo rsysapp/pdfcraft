@@ -1,0 +1,134 @@
+# CI for the embed build. The upstream workflows run on main only; the embed branches (named
+# *-embed) and pull requests into them get these gates:
+#   lint     actionlint on the workflows, shellcheck on the packaging scripts, and the self-tests
+#            of the zip verifier (crafted zips it must refuse) and of the rustflags guard
+#   check    `cargo xtask ci`: fmt, clippy, tests, layers, the wasm32 check, then the `embed` step,
+#            which builds and tests the configuration the module ships (ui-egui without default
+#            features: its unit tests and every tests/embed_*.rs) and runs clippy for
+#            pdfcraft-embed on wasm32, then assets, deny and parity. `cargo test --workspace`
+#            never builds the shipped configuration, because the apps turn the `brand` feature back on.
+#   package  a dry run of the release: packaging/embed/package.sh, then the zip checked against
+#            its checksums, kept as an artifact (the release candidate)
+# The licence notices have their own workflow (embed-licences.yml). Releases: embed-release.yml.
+name: Embed CI
+
+on:
+  push:
+    branches: ["*-embed"]
+  pull_request:
+    branches: ["*-embed"]
+  workflow_dispatch:
+
+# Read-only everywhere: nothing here publishes or writes to the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: embed-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  ACTIONLINT_VERSION: 1.7.12
+  # From the release's own checksums file.
+  ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+  # `cargo xtask ci` requires cargo-deny under CI. Built from its crates.io source at this exact
+  # version with its own Cargo.lock (--locked): crates.io never replaces a published version and
+  # cargo checks every crate against the index's checksum, so the only code that runs is source
+  # this pin fixes: no prebuilt binary or container image whose bytes a tag or a cache could change.
+  CARGO_DENY_VERSION: 0.20.2
+
+jobs:
+  lint:
+    name: workflows and scripts
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install shellcheck and actionlint
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck
+          tarball="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$tarball" "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/$tarball"
+          echo "$ACTIONLINT_SHA256  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP" actionlint
+      - name: actionlint
+        run: '"$RUNNER_TEMP/actionlint" -color'
+      - name: shellcheck
+        run: shellcheck packaging/*.sh packaging/*/*.sh
+      - name: verify-zip.sh refuses crafted zips
+        run: packaging/embed/test-verify-zip.sh
+      - name: rustflags guard refuses only flags the wasm build would lose
+        run: packaging/embed/test-rustflags-guard.sh
+
+  check:
+    name: cargo xtask ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install system libraries (egui/winit/rfd)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev \
+            libgl1-mesa-dev libgtk-3-dev
+      # The toolchain the module is built with: embed-release.yml's `toolchain:` line is the pin
+      # (packaging/embed/third-party-licenses.sh reads it); keep the embed workflows' lines equal.
+      - uses: dtolnay/rust-toolchain@1d64bbcee8ef0c191a54710c227fd268a0d5014b # 1.95.0
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      # Build outputs only: installed tools are not cached (cache-bin), so cargo-deny is always
+      # the one built from its pinned source below, never a binary restored from another run.
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          key: embed-ci
+          cache-bin: "false"
+      - name: Install cargo-deny (pinned, built from source)
+        run: cargo install cargo-deny --version "$CARGO_DENY_VERSION" --locked
+      - name: cargo xtask ci
+        run: cargo --locked xtask ci
+      # xtask's own cargo calls do not all pass --locked: a lockfile they changed fails here.
+      - name: Cargo.lock unchanged
+        run: git diff --exit-code -- Cargo.lock
+
+  package:
+    name: package dry run
+    needs: check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1d64bbcee8ef0c191a54710c227fd268a0d5014b # 1.95.0
+        with:
+          toolchain: 1.95.0
+          targets: wasm32-unknown-unknown
+      # No build cache: the package is the release candidate, built from nothing but the checkout.
+      - name: Install wasm-bindgen (the version in Cargo.lock)
+        run: |
+          v="$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/version = |"/, ""); print; exit }' Cargo.lock)"
+          cargo install wasm-bindgen-cli --version "$v" --locked
+      # The version and SHA-256 are in packaging/embed/tools.env; the script checks the tarball.
+      - name: Install wasm-opt (binaryen)
+        run: packaging/embed/install-binaryen.sh
+      # The version and SHA-256 are in packaging/embed/cargo-about.env; the script checks the tarball.
+      - name: Install cargo-about (licence notices of the Rust crates)
+        run: packaging/embed/install-cargo-about.sh
+      - name: Build and zip
+        run: packaging/embed/package.sh
+      - name: Check the zip against its checksums
+        run: packaging/embed/verify-zip.sh "dist/release/pdfcraft-embed-$(packaging/embed/package.sh --print-version).zip"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pdfcraft-embed
+          path: dist/release/pdfcraft-embed-*
+          if-no-files-found: error
