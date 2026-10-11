@@ -63,6 +63,10 @@ impl Models {
             dirs.push(exe.join("models"));
             dirs.push(exe.join("../Resources/models"));
         }
+        // Embed build: a browser has no source tree to look in, and `env!` would compile the build
+        // machine's checkout path into the module, where no --remap-path-prefix reaches it
+        // (packaging/embed/package.sh refuses a module that names it).
+        #[cfg(not(target_arch = "wasm32"))]
         dirs.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/models"));
         dirs
     }
