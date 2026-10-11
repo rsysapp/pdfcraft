@@ -897,6 +897,8 @@ fn compare_annotations(
 #[cfg(test)]
 mod agreement_tests;
 #[cfg(test)]
+mod limit_tests;
+#[cfg(test)]
 mod placement_tests;
 #[cfg(test)]
 mod tests;
