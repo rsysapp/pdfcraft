@@ -26,7 +26,7 @@ use hayro::hayro_interpret::{
     SoftMask, TransformExt, interpret_page, work_spent,
 };
 use hayro::hayro_syntax::budget::{decode_budget_exceeded, decode_spent, set_decode_budget};
-use hayro::hayro_syntax::object::{Array, Dict};
+use hayro::hayro_syntax::object::{Array, Dict, ObjectIdentifier};
 use hayro::hayro_syntax::resolved;
 use hayro::hayro_syntax::{LoadPdfError, Pdf};
 use hayro::vello_cpu::color::palette::css::WHITE;
@@ -117,13 +117,30 @@ pub struct ImageDraw {
     pub tiled: bool,
 }
 
+/// One form XObject hayro's interpreter drew: which, and where its `/BBox` (the clip its content
+/// is drawn under) lies.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FormDraw {
+    /// The form's object number and generation, as hayro resolved it.
+    pub num: u32,
+    pub generation: u16,
+    /// The bounding box of the form's `/BBox` in user space (PDF points), `[x0, y0, x1, y1]`;
+    /// for a `tiled` form, in the cell's pattern space.
+    pub rect: [f64; 4],
+    /// Drawn in a tiling pattern's cell.
+    pub tiled: bool,
+}
+
 /// What a page's content draws that a save inspector compares: its glyphs (the page's own
 /// content) and every image drawn (in the page's content, in form XObjects, in soft masks'
-/// groups and in tiling patterns' cells), in drawing order; and what hayro read to draw them.
+/// groups, in tiling patterns' cells and in Type 3 glyph procedures), in drawing order; every
+/// form XObject drawn; and what hayro read to draw them. Content hayro stops reading before its
+/// end is an error (see [`ContentDocument::content`]).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PageContent {
     pub glyphs: PageGlyphs,
     pub images: Vec<ImageDraw>,
+    pub forms: Vec<FormDraw>,
     /// The page dictionary's object (`None`: hayro has no object number for it).
     pub page: Option<(u32, u16)>,
     /// The page's content streams as hayro decoded and joined them (`None`: hayro found none).
@@ -150,14 +167,21 @@ pub struct Resolved {
     pub objects: Vec<((u32, u16), ObjectPlace)>,
     /// (number, generation) and the data's (start, length) in the file.
     pub streams: Vec<((u32, u16), (usize, usize))>,
-    /// Objects hayro read from two places, or with an object number it cannot have read.
+    /// Objects hayro read from two places, or with an object number it cannot have read; content
+    /// streams decoded two ways, or without an object number.
     pub conflicts: usize,
+    /// (number, generation) and the decoded data of each content stream interpreted besides the
+    /// page's own: form XObjects, tiling patterns' cells and Type 3 glyph procedures.
+    pub content: Vec<((u32, u16), Vec<u8>)>,
+    /// Content streams hayro did not read to their end (an operator after which it gives up,
+    /// data it cannot parse) or could not decode.
+    pub stopped: usize,
 }
 
 impl Resolved {
     fn from_log(log: Option<resolved::Log>) -> Self {
         let Some(log) = log else { return Self { conflicts: 1, ..Self::default() } };
-        let mut out = Self { conflicts: log.conflicts, ..Self::default() };
+        let mut out = Self { conflicts: log.conflicts, stopped: log.stopped, ..Self::default() };
         let id = |(num, generation): (i32, i32)| u32::try_from(num).ok().zip(u16::try_from(generation).ok());
         for (key, place) in log.objects {
             let place = match place {
@@ -172,6 +196,12 @@ impl Resolved {
         for (key, range) in log.streams {
             match id(key) {
                 Some(id) => out.streams.push((id, range)),
+                None => out.conflicts = out.conflicts.saturating_add(1),
+            }
+        }
+        for (key, decoded) in log.content {
+            match id(key) {
+                Some(id) => out.content.push((id, decoded)),
                 None => out.conflicts = out.conflicts.saturating_add(1),
             }
         }
@@ -193,7 +223,9 @@ struct PageDevice<'a> {
     /// Glyphs drawn that gave no text (no Unicode value) or no usable box.
     unread: usize,
     images: Vec<ImageDraw>,
-    /// Images drawn that could not be identified (an object number hayro cannot have read).
+    forms: Vec<FormDraw>,
+    /// Images or forms drawn that could not be identified (an object number hayro cannot have
+    /// read, or none).
     unidentified: usize,
     /// Soft masks already interpreted (see `SoftMask::use_key`), kept so their keys stay theirs.
     masks: Vec<SoftMask<'a>>,
@@ -212,6 +244,7 @@ impl<'a> PageDevice<'a> {
             found: PageGlyphs::default(),
             unread: 0,
             images: Vec::new(),
+            forms: Vec::new(),
             unidentified: 0,
             masks: Vec::new(),
             mask_keys: HashSet::new(),
@@ -243,6 +276,7 @@ impl<'a> PageDevice<'a> {
         self.masks = inner.masks;
         self.inline = inner.inline;
         self.images.append(&mut inner.images);
+        self.forms.append(&mut inner.forms);
         self.unidentified = self.unidentified.saturating_add(inner.unidentified);
     }
 
@@ -284,6 +318,12 @@ impl<'a> Device<'a> for PageDevice<'a> {
     }
     fn draw_glyph(&mut self, glyph: &Glyph<'a>, transform: kurbo::Affine, glyph_transform: kurbo::Affine, paint: &Paint<'a>, _: &GlyphDrawMode) {
         self.paint(paint);
+        // A Type 3 glyph's procedure is content like any other: what it draws (images, forms) and
+        // how far it is read count. Its own glyphs are not text on the page.
+        if let Glyph::Type3(procedure) = glyph {
+            let to_user = self.to_user;
+            self.nested(to_user, self.tiled, |inner| procedure.interpret(inner, transform, glyph_transform, paint));
+        }
         if !self.with_glyphs {
             return;
         }
@@ -342,6 +382,14 @@ impl<'a> Device<'a> for PageDevice<'a> {
     }
     fn pop_clip_path(&mut self) {}
     fn pop_transparency_group(&mut self) {}
+    fn draw_form(&mut self, id: Option<ObjectIdentifier>, bbox: &BezPath) {
+        let Some((num, generation)) = id.and_then(|id| u32::try_from(id.obj_number).ok().zip(u16::try_from(id.gen_number).ok())) else {
+            self.unidentified = self.unidentified.saturating_add(1);
+            return;
+        };
+        let b = (self.to_user * bbox.clone()).bounding_box();
+        self.forms.push(FormDraw { num, generation, rect: [b.x0, b.y0, b.x1, b.y1], tiled: self.tiled });
+    }
 }
 
 /// A page's content rendered upright: `rgba` is premultiplied RGBA8, `width` × `height` pixels.
@@ -469,8 +517,10 @@ impl ContentDocument {
 
     /// The glyphs and images the page draws (see [`PageContent`]), from one interpretation.
     /// Fails when a drawn glyph gives no text (no Unicode mapping) or no usable box, when a drawn
-    /// image cannot be identified, on an interpreter warning, on a panic, when the parser had to
-    /// rebuild the cross-reference data, and past the work budget.
+    /// image or form cannot be identified, when hayro stops reading a content stream before its
+    /// end (an operator after which it gives up, data it cannot parse) or cannot decode one, on an
+    /// interpreter warning, on a panic, when the parser had to rebuild the cross-reference data,
+    /// and past the work budget.
     pub fn content(&self, page: usize) -> Result<PageContent, ContentError> {
         let before = self.counts();
         let number = page.saturating_add(1);
@@ -490,7 +540,7 @@ impl ContentDocument {
             interpret_page(p, &mut ctx, &mut device);
             let read = Resolved::from_log(resolved::close_log());
             let page = p.raw().obj_id().and_then(|id| u32::try_from(id.obj_number).ok().zip(u16::try_from(id.gen_number).ok()));
-            let content = PageContent { glyphs: device.found, images: device.images, page, decoded, resolved: read };
+            let content = PageContent { glyphs: device.found, images: device.images, forms: device.forms, page, decoded, resolved: read };
             Some(Ok((content, device.unread, device.unidentified)))
         }));
         // A panic above leaves the log open: close it.
@@ -506,7 +556,12 @@ impl ContentDocument {
             return Err(format!("page {number}: {unread} glyph(s) have no text").into());
         }
         if unidentified > 0 {
-            return Err(format!("page {number}: {unidentified} image(s) cannot be identified").into());
+            return Err(format!("page {number}: {unidentified} image(s) or form(s) cannot be identified").into());
+        }
+        if content.resolved.stopped > 0 {
+            return Err(
+                format!("page {number}: the interpreter stopped reading {} content stream(s) before their end", content.resolved.stopped).into()
+            );
         }
         if self.repaired() {
             return Err(ContentError::Unreadable("the file's cross-reference data is damaged".into()));

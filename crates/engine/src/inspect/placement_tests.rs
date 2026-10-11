@@ -218,11 +218,17 @@ fn image_placements_are_where_the_interpreter_draws() {
 }
 
 #[test]
-fn an_image_after_an_operator_that_ends_the_content_is_not_drawn_or_reported() {
+fn an_image_after_an_operator_that_ends_the_content_is_refused_not_left_unplaced() {
     // `m` with one operand: hayro stops reading the content stream there (a malformed path
-    // operator could otherwise draw anything), so the image after it is never drawn.
+    // operator could otherwise draw anything), so the image after it is never drawn. Content
+    // read by nothing is an error, not an image without a place.
     let file = one_page(b"q 100 0 0 100 50 100 cm 10 m /Im1 Do Q", "/XObject << /Im1 5 0 R >>", &[black()]);
-    assert_drawn_where_reported("a malformed operator before the image", &file, 0, false);
+    let mut budget = Budget::new(Limits::default());
+    match read_side(&file, None, true, &mut budget) {
+        Err(Fail::Read(message)) => assert!(message.contains("stopped reading"), "{message}"),
+        Err(other) => panic!("expected a read failure, got {other:?}"),
+        Ok(_) => panic!("expected a read failure"),
+    }
 }
 
 // ── end to end: the comparison follows the uses ─────────────────────────────────────────────
