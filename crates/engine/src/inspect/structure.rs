@@ -5,12 +5,15 @@
 //! object stream) and that `pdfcraft_cos` did not fall back to scanning the file for it. Objects
 //! are compared by canonical SHA-256 digests that do not depend on object numbers (a rewrite
 //! renumbers every object): references are replaced by the digest of what they point to.
+//! Content streams other than a page's own (form XObjects, Type 3 glyph procedures, annotation
+//! appearances) are digested by their decoded data, so a save that only re-encodes one does not
+//! change it; images and every other stream by their encoded bytes.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use pdfcraft_cos::{Dict, Document, Lexer, ObjRef, Object, Stream, XrefEntry, parse_indirect};
-use pdfcraft_render::content::{ImageDraw, ImageSource, ObjectPlace, PageGlyphs, Resolved};
+use pdfcraft_render::content::{FormDraw, ImageDraw, ImageSource, ObjectPlace, PageContent, PageGlyphs, Resolved};
 
 use super::{Budget, Fail, MAX_PAGES};
 
@@ -41,6 +44,16 @@ const PAGE_OWN_KEYS: [&[u8]; 7] = [b"Parent", b"Annots", b"Rotate", b"Contents",
 ///   can carry different document information with no trace in the result.
 const CATALOG_REPORTED: [&[u8]; 7] = [b"Pages", b"AcroForm", b"OCProperties", b"Metadata", b"StructTreeRoot", b"MarkInfo", b"Version"];
 
+/// Stream-dictionary entries that say how the data is encoded, not what it is.
+const CODING_KEYS: [&[u8]; 4] = [b"Filter", b"DecodeParms", b"Length", b"DL"];
+
+/// A form's dictionary entries left out of its key (see [`PageFacts::forms`]).
+const FORM_KEY_LEFT_OUT: [&[u8]; 5] = [b"Filter", b"DecodeParms", b"Length", b"DL", b"Resources"];
+
+/// Dictionary entries whose values are content streams, or dictionaries of them (Type 3 glyph
+/// procedures, annotation appearances): digested by their decoded data.
+const CONTENT_KEYS: [&[u8]; 2] = [b"CharProcs", b"AP"];
+
 /// The deepest chain of references followed while digesting one object.
 const MAX_REFERENCE_DEPTH: usize = 256;
 /// The deepest page tree and field tree read.
@@ -59,6 +72,11 @@ pub(crate) struct Annot {
     pub tracked: bool,
     /// For `Redact` marks: the marked areas in user space (each quadrilateral's box, or `/Rect`).
     pub areas: Vec<[f64; 4]>,
+    /// The dictionary without its appearance (`/AP`): two annotations alike but for their
+    /// appearance have the same `bare` digest.
+    pub bare: Digest,
+    /// `/Rect`, normalised (`None`: missing or not four finite numbers).
+    pub rect: Option<[f64; 4]>,
 }
 
 /// What one page is, as far as the comparison goes.
@@ -78,6 +96,18 @@ pub(crate) struct PageFacts {
     /// Each image hayro drew, where (for a rewrite's redaction check): filled from hayro's
     /// interpretation (see [`Known::image_uses`]), not from this scan.
     pub image_uses: Vec<ImageUse>,
+    /// What hayro must draw, as this scan reads the content (see [`Required`]).
+    pub required: Required,
+    /// Every form XObject the content draws (through `Do`, in forms, in tiling patterns and as
+    /// soft masks' groups, shown or not): the form, and its key: its dictionary but for its encoding and resources, and its
+    /// decoded content (what it draws itself; what it draws with its resources is compared on
+    /// its own).
+    pub forms: Vec<(ObjRef, Digest)>,
+    /// Each form hayro drew, where (for a rewrite's redaction check).
+    pub form_draws: Vec<FormDraw>,
+    /// The glyph procedures of the Type 3 fonts in the resources the content is drawn with (the
+    /// page's, and each drawn form's and pattern's own), each by its name and decoded content.
+    pub type3: BTreeSet<Digest>,
     /// The image pixels drawn, summed over every use.
     pub image_pixels: u64,
     /// Content bytes the interpreter reads for the page (forms counted per use).
@@ -112,6 +142,28 @@ pub(crate) struct ImageInfo {
     pub meaning: Digest,
     pub width: u32,
     pub height: u32,
+}
+
+/// An image as both readers name it: an image XObject by its object, or an inline image (which
+/// the two readers delimit each their own way: counted, not identified).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ImageKey {
+    Object(ObjRef),
+    Inline,
+}
+
+/// What hayro must draw for a page, by this scan of its content: every image and form the
+/// content draws, unless it is optional content that is off in the document's default
+/// configuration (see [`OptionalContent`]). Images in tiling patterns' cells only once each
+/// (a cell is drawn once per paint that uses it).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Required {
+    /// Images drawn directly or in forms: how many times each.
+    pub plain: BTreeMap<ImageKey, usize>,
+    /// Images drawn in tiling patterns' cells.
+    pub patterned: BTreeSet<ImageKey>,
+    /// Forms drawn directly or in forms.
+    pub forms: BTreeSet<ObjRef>,
 }
 
 /// One cross-reference section of the file.
@@ -191,13 +243,23 @@ struct Scan {
     len: usize,
 }
 
-/// What a content stream draws that the comparison follows: which images and forms, not where
-/// (placements are hayro's, see [`Known::image_uses`]).
+/// What a content stream draws that the comparison follows: which images, forms and patterns,
+/// and which optional content it lies in; not where (placements are hayro's, see
+/// [`Known::image_uses`]).
 enum Item {
     /// `/Name Do`.
     Draw(Vec<u8>),
     /// An inline image: its digest and pixel count.
     Inline(Digest, u64),
+    /// `/Name scn` or `/Name SCN`: a pattern chosen as the colour.
+    Pattern(Vec<u8>),
+    /// `BMC` or `BDC`: optional content when the tag is `/OC` and the property list a name (the
+    /// name), any other marked content otherwise (`None`).
+    Begin(Option<Vec<u8>>),
+    /// `EMC`.
+    End,
+    /// `/Name gs`: a graphics state, which may set a soft mask.
+    State(Vec<u8>),
 }
 
 /// A transformation matrix `[a b c d e f]` (ISO 32000-2 §8.3.3).
@@ -234,6 +296,51 @@ struct Drawn {
     images: Vec<Digest>,
     pixels: u64,
     interpreted: usize,
+    required: Required,
+    forms: Vec<(ObjRef, Digest)>,
+    type3: BTreeSet<Digest>,
+    /// Tiling patterns and soft masks' groups already followed on this page.
+    patterns: BTreeSet<ObjRef>,
+    masks: BTreeSet<ObjRef>,
+}
+
+fn require(required: &mut Required, key: ImageKey, patterned: bool) {
+    if patterned {
+        required.patterned.insert(key);
+    } else {
+        let count = required.plain.entry(key).or_default();
+        *count = count.saturating_add(1);
+    }
+}
+
+/// Where in a page's content a stream is drawn.
+#[derive(Clone, Copy)]
+struct Context {
+    depth: usize,
+    /// Inside optional content that is off in the default configuration.
+    hidden: bool,
+    /// Inside a tiling pattern's cell.
+    patterned: bool,
+    /// Inside a soft mask's group: drawn only when something is painted through the mask, so
+    /// nothing in it is required of hayro; its forms are still compared.
+    masked: bool,
+}
+
+/// The document's default optional-content configuration (`/OCProperties /D`), as far as it is
+/// certain: which groups are off, and which groups' state cannot be told without a viewer's
+/// choices (automatic states, intents other than viewing).
+#[derive(Default)]
+pub(crate) struct OptionalContent {
+    off: BTreeSet<ObjRef>,
+    on: BTreeSet<ObjRef>,
+    /// Groups whose state is not certain.
+    uncertain: BTreeSet<ObjRef>,
+    /// The configuration's state for groups listed nowhere: `Some(true)` on (`/BaseState /ON`, or
+    /// none given), `None` not certain.
+    default: Option<bool>,
+    /// Whether the configuration is read for viewing: its `/Intent` is absent, `/View` or `/All`
+    /// (or an array holding one).
+    viewing: bool,
 }
 
 struct Reader<'d, 'b> {
@@ -245,13 +352,17 @@ struct Reader<'d, 'b> {
     checking: HashSet<u32>,
     /// Object streams: the object numbers they hold, in order.
     object_streams: HashMap<u32, Arc<Vec<u32>>>,
-    digests: HashMap<ObjRef, Digest>,
+    /// Digests by object and whether it is digested as content (see [`CONTENT_KEYS`]).
+    digests: HashMap<(ObjRef, bool), Digest>,
     /// The references being digested, outermost first.
     stack: Vec<ObjRef>,
     /// Content streams scanned, by their references and whether `/Contents` is an array.
     contents: HashMap<(Vec<ObjRef>, bool), Arc<Scan>>,
     forms: HashMap<ObjRef, Arc<Scan>>,
     images: HashMap<ObjRef, Arc<ImageInfo>>,
+    /// Type 3 fonts' glyph procedure keys, by font.
+    type3: HashMap<ObjRef, Arc<Vec<Digest>>>,
+    optional: Arc<OptionalContent>,
 }
 
 fn read_error(what: impl std::fmt::Display) -> Fail {
@@ -428,7 +539,7 @@ impl<'d, 'b> Reader<'d, 'b> {
     /// The digest of `o` and everything it references.
     fn digest(&mut self, o: &Object) -> Result<Digest, Fail> {
         let mut out = Vec::new();
-        self.encode(o, 0, &mut out)?;
+        self.encode(o, 0, false, &mut out)?;
         Ok(sha256(&[&out]))
     }
 
@@ -438,10 +549,11 @@ impl<'d, 'b> Reader<'d, 'b> {
         self.digest(&Object::Dict(kept))
     }
 
-    /// The digest of object `r` and the lowest position on the reference stack its subtree
-    /// referred back to (`usize::MAX`: none above it), which decides whether it can be reused.
-    fn digest_ref(&mut self, r: ObjRef) -> Result<(Digest, usize), Fail> {
-        if let Some(found) = self.digests.get(&r) {
+    /// The digest of object `r` (as content: see [`CONTENT_KEYS`]) and the lowest position on the
+    /// reference stack its subtree referred back to (`usize::MAX`: none above it), which decides
+    /// whether it can be reused.
+    fn digest_ref(&mut self, r: ObjRef, content: bool) -> Result<(Digest, usize), Fail> {
+        if let Some(found) = self.digests.get(&(r, content)) {
             return Ok((*found, usize::MAX));
         }
         if self.stack.len() >= MAX_REFERENCE_DEPTH {
@@ -451,13 +563,13 @@ impl<'d, 'b> Reader<'d, 'b> {
         let position = self.stack.len();
         self.stack.push(r);
         let mut out = Vec::new();
-        let encoded = self.encode(&obj, 0, &mut out);
+        let encoded = self.encode(&obj, 0, content, &mut out);
         self.stack.pop();
         let lowest = encoded?;
         let digest = sha256(&[&out]);
         if lowest >= position {
             // Refers back to nothing outside itself: the same wherever it is reached from.
-            self.digests.insert(r, digest);
+            self.digests.insert((r, content), digest);
             Ok((digest, usize::MAX))
         } else {
             Ok((digest, lowest))
@@ -465,8 +577,9 @@ impl<'d, 'b> Reader<'d, 'b> {
     }
 
     /// Append the canonical encoding of `o` to `out`; returns the lowest reference-stack position
-    /// a reference in it pointed back to.
-    fn encode(&mut self, o: &Object, depth: usize, out: &mut Vec<u8>) -> Result<usize, Fail> {
+    /// a reference in it pointed back to. `content`: `o` is reached through [`CONTENT_KEYS`], so a
+    /// stream is a content stream, and a dictionary's values are too.
+    fn encode(&mut self, o: &Object, depth: usize, content: bool, out: &mut Vec<u8>) -> Result<usize, Fail> {
         if depth > 512 {
             return Err(Fail::TooComplex);
         }
@@ -497,13 +610,23 @@ impl<'d, 'b> Reader<'d, 'b> {
                 out.push(b'[');
                 out.extend_from_slice(&(items.len() as u64).to_le_bytes());
                 for item in items {
-                    lowest = lowest.min(self.encode(item, depth.saturating_add(1), out)?);
+                    lowest = lowest.min(self.encode(item, depth.saturating_add(1), false, out)?);
                 }
             }
-            Object::Dict(d) => lowest = self.encode_dict(d, depth, out)?,
+            Object::Dict(d) => lowest = self.encode_dict(d, depth, content, out)?,
+            Object::Stream(stream) if content || stream.dict.name(b"Subtype") == Some(b"Form") => {
+                // A content stream: what it draws is its decoded data, however it is encoded.
+                out.push(b'D');
+                let kept: Dict =
+                    stream.dict.iter().filter(|(key, _)| !CODING_KEYS.contains(&key.as_slice())).map(|(k, v)| (k.clone(), v.clone())).collect();
+                lowest = self.encode_dict(&kept, depth, false, out)?;
+                let data = self.decode(stream)?;
+                self.budget.hashed(data.len())?;
+                out.extend_from_slice(&sha256(&[&data]));
+            }
             Object::Stream(stream) => {
                 out.push(b'S');
-                lowest = self.encode_dict(&stream.dict, depth, out)?;
+                lowest = self.encode_dict(&stream.dict, depth, false, out)?;
                 self.budget.hashed(stream.raw.len())?;
                 out.extend_from_slice(&sha256(&[&stream.raw]));
             }
@@ -515,7 +638,7 @@ impl<'d, 'b> Reader<'d, 'b> {
                     out.extend_from_slice(&(self.stack.len().saturating_sub(position) as u64).to_le_bytes());
                     lowest = position;
                 } else {
-                    let (digest, below) = self.digest_ref(*r)?;
+                    let (digest, below) = self.digest_ref(*r, content)?;
                     out.push(b'R');
                     out.extend_from_slice(&digest);
                     lowest = below;
@@ -525,7 +648,7 @@ impl<'d, 'b> Reader<'d, 'b> {
         Ok(lowest)
     }
 
-    fn encode_dict(&mut self, d: &Dict, depth: usize, out: &mut Vec<u8>) -> Result<usize, Fail> {
+    fn encode_dict(&mut self, d: &Dict, depth: usize, content: bool, out: &mut Vec<u8>) -> Result<usize, Fail> {
         let mut entries: Vec<(&Vec<u8>, &Object)> = d.iter().filter(|(key, _)| !BACK_REFERENCES.contains(&key.as_slice())).collect();
         entries.sort_by(|a, b| a.0.cmp(b.0));
         out.push(b'<');
@@ -534,7 +657,8 @@ impl<'d, 'b> Reader<'d, 'b> {
         for (key, value) in entries {
             out.extend_from_slice(&(key.len() as u64).to_le_bytes());
             out.extend_from_slice(key);
-            lowest = lowest.min(self.encode(value, depth.saturating_add(1), out)?);
+            let content = content || CONTENT_KEYS.contains(&key.as_slice());
+            lowest = lowest.min(self.encode(value, depth.saturating_add(1), content, out)?);
         }
         Ok(lowest)
     }
@@ -656,7 +780,9 @@ impl<'d, 'b> Reader<'d, 'b> {
     fn scan(&mut self, data: &[u8]) -> Result<Scan, Fail> {
         let unreadable = |what: &str| read_error(format!("a content stream cannot be read: {what}"));
         let mut lx = Lexer::new(data, 0);
+        // The last operand, and the one before it, when they are names.
         let mut name: Option<Vec<u8>> = None;
+        let mut before: Option<Vec<u8>> = None;
         let mut items = Vec::new();
         loop {
             self.budget.tick()?;
@@ -668,6 +794,7 @@ impl<'d, 'b> Reader<'d, 'b> {
                 if lx.pos <= at {
                     return Err(unreadable("no progress"));
                 }
+                before = name.take();
                 name = match operand {
                     Object::Name(n) => Some(n),
                     _ => None,
@@ -688,9 +815,23 @@ impl<'d, 'b> Reader<'d, 'b> {
                     items.push(Item::Inline(digest, pixels));
                     lx.pos = end;
                 }
+                b"scn" | b"SCN" => {
+                    if let Some(pattern) = name.take() {
+                        items.push(Item::Pattern(pattern));
+                    }
+                }
+                b"BMC" => items.push(Item::Begin(None)),
+                b"BDC" => items.push(Item::Begin(if before.as_deref() == Some(b"OC") { name.take() } else { None })),
+                b"EMC" => items.push(Item::End),
+                b"gs" => {
+                    if let Some(state) = name.take() {
+                        items.push(Item::State(state));
+                    }
+                }
                 _ => {}
             }
             name = None;
+            before = None;
         }
         Ok(Scan { digest: sha256(&[data]), items, len: data.len() })
     }
@@ -747,44 +888,274 @@ impl<'d, 'b> Reader<'d, 'b> {
         Ok(None)
     }
 
-    /// Follow what a content stream draws: images (hashed once each) and forms (recursively).
-    fn draw(&mut self, items: &[Item], chain: &[Arc<Dict>], depth: usize, drawn: &mut Drawn) -> Result<(), Fail> {
+    /// The first resource of `kind` named `name` in a resource chain (nearest first), as hayro
+    /// looks it up: a reference.
+    fn resource(&mut self, chain: &[Arc<Dict>], kind: &[u8], name: &[u8]) -> Result<Option<ObjRef>, Fail> {
+        for level in chain {
+            let Some(entries) = self.dict_of(level.get(kind), "a resource dictionary")? else { continue };
+            if let Some(found) = entries.get(name) {
+                return Ok(found.as_ref());
+            }
+        }
+        Ok(None)
+    }
+
+    /// Follow what a content stream draws: images (hashed once each), forms (recursively) and
+    /// tiling patterns' cells, with the optional content each lies in.
+    fn draw(&mut self, items: &[Item], chain: &[Arc<Dict>], at: Context, drawn: &mut Drawn) -> Result<(), Fail> {
+        // Marked content opened in this stream, each level hidden or not; it ends with the stream.
+        let mut levels: Vec<bool> = Vec::new();
         for item in items {
             self.budget.uses()?;
+            let hidden = levels.last().copied().unwrap_or(at.hidden);
             match item {
+                Item::Begin(None) => levels.push(hidden),
+                Item::Begin(Some(name)) => {
+                    let group = self.resource(chain, b"Properties", name)?;
+                    let off = match group {
+                        Some(group) => self.optional_off(&Object::Ref(group))?,
+                        None => false,
+                    };
+                    levels.push(hidden || off);
+                }
+                Item::End => {
+                    levels.pop();
+                }
                 Item::Inline(digest, pixels) => {
                     drawn.images.push(*digest);
                     drawn.pixels = drawn.pixels.saturating_add(*pixels);
+                    if !hidden && !at.masked {
+                        require(&mut drawn.required, ImageKey::Inline, at.patterned);
+                    }
                 }
                 Item::Draw(name) => {
                     let Some(r) = self.xobject(chain, name)? else { continue };
                     let obj = self.get(r)?;
                     let Object::Stream(stream) = &*obj else { continue };
+                    let hidden = match stream.dict.get(b"OC") {
+                        Some(oc) => hidden || self.optional_off(oc)?,
+                        None => hidden,
+                    };
                     match stream.dict.name(b"Subtype") {
                         Some(b"Image") => {
-                            let (digest, _) = self.digest_ref(r)?;
+                            let (digest, _) = self.digest_ref(r, false)?;
                             let info = self.image_info(r, &stream.dict)?;
                             drawn.images.push(digest);
                             drawn.pixels = drawn.pixels.saturating_add(u64::from(info.width).saturating_mul(u64::from(info.height)));
+                            if !hidden && !at.masked {
+                                require(&mut drawn.required, ImageKey::Object(r), at.patterned);
+                            }
                         }
                         Some(b"Form") => {
-                            if depth >= self.budget.limits.form_depth {
+                            if at.depth >= self.budget.limits.form_depth {
                                 return Err(Fail::TooComplex);
                             }
                             let scan = self.form_content(r, stream)?;
+                            let key = sha256(&[b"form", &self.digest_without(&stream.dict, &FORM_KEY_LEFT_OUT)?, &scan.digest]);
+                            drawn.forms.push((r, key));
+                            if !hidden && !at.patterned && !at.masked {
+                                drawn.required.forms.insert(r);
+                            }
                             drawn.interpreted = drawn.interpreted.saturating_add(scan.len);
                             let own = self.dict_of(stream.dict.get(b"Resources"), "a form's /Resources")?.unwrap_or_default();
+                            self.type3_procedures(&own, drawn)?;
                             let mut inner = Vec::with_capacity(chain.len().saturating_add(1));
                             inner.push(Arc::new(own));
                             inner.extend(chain.iter().cloned());
-                            self.draw(&scan.items, &inner, depth.saturating_add(1), drawn)?;
+                            self.draw(&scan.items, &inner, Context { depth: at.depth.saturating_add(1), hidden, ..at }, drawn)?;
                         }
                         _ => {}
                     }
                 }
+                Item::Pattern(name) => {
+                    let Some(r) = self.resource(chain, b"Pattern", name)? else { continue };
+                    let obj = self.get(r)?;
+                    // Shading patterns (dictionaries) draw no images; a tiling pattern is a stream.
+                    let Object::Stream(stream) = &*obj else { continue };
+                    if stream.dict.int(b"PatternType") != Some(1) || !drawn.patterns.insert(r) {
+                        continue;
+                    }
+                    if at.depth >= self.budget.limits.form_depth {
+                        return Err(Fail::TooComplex);
+                    }
+                    let scan = self.form_content(r, stream)?;
+                    drawn.interpreted = drawn.interpreted.saturating_add(scan.len);
+                    let own = self.dict_of(stream.dict.get(b"Resources"), "a pattern's /Resources")?.unwrap_or_default();
+                    self.type3_procedures(&own, drawn)?;
+                    let mut inner = Vec::with_capacity(chain.len().saturating_add(1));
+                    inner.push(Arc::new(own));
+                    inner.extend(chain.iter().cloned());
+                    self.draw(&scan.items, &inner, Context { depth: at.depth.saturating_add(1), hidden, patterned: true, ..at }, drawn)?;
+                }
+                Item::State(name) => {
+                    let Some(group) = self.soft_mask_group(chain, name)? else { continue };
+                    if !drawn.masks.insert(group) {
+                        continue;
+                    }
+                    let obj = self.get(group)?;
+                    let Object::Stream(stream) = &*obj else { continue };
+                    if at.depth >= self.budget.limits.form_depth {
+                        return Err(Fail::TooComplex);
+                    }
+                    let scan = self.form_content(group, stream)?;
+                    let key = sha256(&[b"form", &self.digest_without(&stream.dict, &FORM_KEY_LEFT_OUT)?, &scan.digest]);
+                    drawn.forms.push((group, key));
+                    drawn.interpreted = drawn.interpreted.saturating_add(scan.len);
+                    let own = self.dict_of(stream.dict.get(b"Resources"), "a soft mask's /Resources")?.unwrap_or_default();
+                    self.type3_procedures(&own, drawn)?;
+                    let mut inner = Vec::with_capacity(chain.len().saturating_add(1));
+                    inner.push(Arc::new(own));
+                    inner.extend(chain.iter().cloned());
+                    self.draw(&scan.items, &inner, Context { depth: at.depth.saturating_add(1), hidden, masked: true, ..at }, drawn)?;
+                }
             }
         }
         Ok(())
+    }
+
+    /// The group of the soft mask the graphics state `name` sets (a form XObject), if it sets one:
+    /// the state is looked up as hayro looks it up (the first level of the chain naming it).
+    fn soft_mask_group(&mut self, chain: &[Arc<Dict>], name: &[u8]) -> Result<Option<ObjRef>, Fail> {
+        for level in chain {
+            let Some(states) = self.dict_of(level.get(b"ExtGState"), "/ExtGState")? else { continue };
+            let Some(state) = states.get(name) else { continue };
+            let Some(state) = self.dict_of(Some(state), "a graphics state")? else { return Ok(None) };
+            let Some(mask) = state.get(b"SMask") else { return Ok(None) };
+            let Object::Dict(mask) = &*self.resolve(mask)? else { return Ok(None) };
+            return Ok(mask.get(b"G").and_then(Object::as_ref));
+        }
+        Ok(None)
+    }
+
+    /// The glyph procedures of the Type 3 fonts in `resources`' `/Font`, each by its name and
+    /// decoded content.
+    fn type3_procedures(&mut self, resources: &Dict, drawn: &mut Drawn) -> Result<(), Fail> {
+        let Some(fonts) = self.dict_of(resources.get(b"Font"), "/Font")? else { return Ok(()) };
+        for (_, font) in fonts.iter() {
+            self.budget.tick()?;
+            let keys = match font {
+                Object::Ref(r) => match self.type3.get(r) {
+                    Some(found) => found.clone(),
+                    None => {
+                        let keys = match &*self.get(*r)? {
+                            Object::Dict(dict) => Arc::new(self.procedure_keys(dict)?),
+                            _ => Arc::new(Vec::new()),
+                        };
+                        self.type3.insert(*r, keys.clone());
+                        keys
+                    }
+                },
+                Object::Dict(dict) => Arc::new(self.procedure_keys(dict)?),
+                _ => continue,
+            };
+            drawn.type3.extend(keys.iter().copied());
+        }
+        Ok(())
+    }
+
+    fn procedure_keys(&mut self, font: &Dict) -> Result<Vec<Digest>, Fail> {
+        if font.name(b"Subtype") != Some(b"Type3") {
+            return Ok(Vec::new());
+        }
+        let Some(procedures) = self.dict_of(font.get(b"CharProcs"), "/CharProcs")? else { return Ok(Vec::new()) };
+        let mut keys = Vec::with_capacity(procedures.len());
+        for (name, procedure) in procedures.iter() {
+            let obj = self.resolve(procedure)?;
+            let Object::Stream(stream) = &*obj else { return Err(read_error("a Type 3 glyph procedure is not a stream")) };
+            let data = self.decode(stream)?;
+            self.budget.hashed(data.len())?;
+            let length = (name.len() as u64).to_le_bytes();
+            keys.push(sha256(&[b"type3", &length, name, &sha256(&[&data])]));
+        }
+        Ok(keys)
+    }
+
+    /// Whether the optional content `oc` (a group or a membership dictionary, as `/OC` or a
+    /// marked-content property list gives it) is certainly off in the default configuration.
+    fn optional_off(&mut self, oc: &Object) -> Result<bool, Fail> {
+        let resolved = self.resolve(oc)?;
+        let Object::Dict(dict) = &*resolved else { return Ok(false) };
+        let config = self.optional.clone();
+        let shown = match dict.name(b"Type") {
+            Some(b"OCG") => match oc.as_ref() {
+                Some(group) => self.group_shown(&config, group, dict)?,
+                None => None,
+            },
+            Some(b"OCMD") => self.membership_shown(&config, dict)?,
+            _ => None,
+        };
+        Ok(shown == Some(false))
+    }
+
+    /// A group's state: shown, hidden, or not certain (`None`).
+    fn group_shown(&mut self, config: &OptionalContent, group: ObjRef, dict: &Dict) -> Result<Option<bool>, Fail> {
+        if !config.viewing || config.uncertain.contains(&group) || dict.name(b"Type") != Some(b"OCG") {
+            return Ok(None);
+        }
+        // A group not meant for viewing is not governed by the viewing configuration.
+        let intent = match dict.get(b"Intent") {
+            None => true,
+            Some(intent) => match &*self.resolve(intent)? {
+                Object::Name(name) => name.as_slice() == b"View",
+                Object::Array(names) => names.iter().any(|name| name.as_name() == Some(b"View")),
+                _ => false,
+            },
+        };
+        if !intent {
+            return Ok(None);
+        }
+        Ok(match (config.on.contains(&group), config.off.contains(&group)) {
+            (true, true) => None,
+            (true, false) => Some(true),
+            (false, true) => Some(false),
+            (false, false) => config.default,
+        })
+    }
+
+    /// A membership dictionary's state (ISO 32000-2 §8.11.2.2), by its `/OCGs` and `/P`; one with
+    /// a visibility expression (`/VE`) is not certain.
+    fn membership_shown(&mut self, config: &OptionalContent, dict: &Dict) -> Result<Option<bool>, Fail> {
+        if dict.contains(b"VE") {
+            return Ok(None);
+        }
+        let groups = match dict.get(b"OCGs") {
+            None => Vec::new(),
+            Some(entry) => match &*self.resolve(entry)? {
+                Object::Null => Vec::new(),
+                Object::Array(groups) => groups.clone(),
+                Object::Dict(_) => vec![entry.clone()],
+                _ => return Ok(None),
+            },
+        };
+        let mut states = Vec::with_capacity(groups.len());
+        for group in &groups {
+            let Object::Ref(r) = group else { return Ok(None) };
+            let Some(dict) = self.get(*r)?.as_dict().cloned() else { return Ok(None) };
+            states.push(self.group_shown(config, *r, &dict)?);
+        }
+        if states.is_empty() {
+            return Ok(Some(true));
+        }
+        let any = |state: bool| states.contains(&Some(state));
+        let all = |state: bool| states.iter().all(|s| *s == Some(state));
+        let policy = match dict.get(b"P") {
+            None => b"AnyOn".to_vec(),
+            Some(p) => match &*self.resolve(p)? {
+                Object::Name(name) => name.clone(),
+                _ => return Ok(None),
+            },
+        };
+        Ok(match policy.as_slice() {
+            b"AllOn" if all(true) => Some(true),
+            b"AllOn" if any(false) => Some(false),
+            b"AnyOn" if any(true) => Some(true),
+            b"AnyOn" if all(false) => Some(false),
+            b"AnyOff" if any(false) => Some(true),
+            b"AnyOff" if all(true) => Some(false),
+            b"AllOff" if all(false) => Some(true),
+            b"AllOff" if any(true) => Some(false),
+            _ => None,
+        })
     }
 
     /// What image `r` (with dictionary `dict`) is, once per image.
@@ -799,6 +1170,49 @@ impl<'d, 'b> Reader<'d, 'b> {
         let info = Arc::new(ImageInfo { obj: r, meaning, width, height });
         self.images.insert(r, info.clone());
         Ok(info)
+    }
+
+    /// The default optional-content configuration (`/OCProperties /D`, ISO 32000-2 §8.11.4.3).
+    fn optional_content(&mut self, catalog: &Dict) -> Result<OptionalContent, Fail> {
+        let Some(properties) = self.dict_of(catalog.get(b"OCProperties"), "/OCProperties")? else {
+            // No configuration: optional content is shown.
+            return Ok(OptionalContent { default: Some(true), viewing: true, ..OptionalContent::default() });
+        };
+        let config = self.dict_of(properties.get(b"D"), "/OCProperties /D")?.unwrap_or_default();
+        let refs = |items: Vec<Object>| items.iter().filter_map(Object::as_ref).collect::<BTreeSet<ObjRef>>();
+        let listed = refs(self.array_of(properties.get(b"OCGs"), "/OCGs")?);
+        let on = refs(self.array_of(config.get(b"ON"), "/ON")?);
+        let mut off = refs(self.array_of(config.get(b"OFF"), "/OFF")?);
+        let base = match config.get(b"BaseState") {
+            None => Some(b"ON".to_vec()),
+            Some(base) => self.resolve(base)?.as_name().map(<[u8]>::to_vec),
+        };
+        let default = match base.as_deref() {
+            Some(b"ON") => Some(true),
+            Some(b"OFF") => {
+                off.extend(listed.difference(&on).copied());
+                // A group the document does not list: whether the base state reaches it is not
+                // certain.
+                None
+            }
+            _ => None,
+        };
+        // Groups an automatic state (`/AS`) may switch when the document is viewed.
+        let mut uncertain = BTreeSet::new();
+        for usage in self.array_of(config.get(b"AS"), "/AS")? {
+            if let Some(usage) = self.dict_of(Some(&usage), "an /AS entry")? {
+                uncertain.extend(refs(self.array_of(usage.get(b"OCGs"), "/AS /OCGs")?));
+            }
+        }
+        let viewing = match config.get(b"Intent") {
+            None => true,
+            Some(intent) => match &*self.resolve(intent)? {
+                Object::Name(name) => matches!(name.as_slice(), b"View" | b"All"),
+                Object::Array(names) => names.iter().any(|name| matches!(name.as_name(), Some(b"View" | b"All"))),
+                _ => false,
+            },
+        };
+        Ok(OptionalContent { off, on, uncertain, default, viewing })
     }
 
     // ── pages ───────────────────────────────────────────────────────────────────────────────
@@ -835,7 +1249,10 @@ impl<'d, 'b> Reader<'d, 'b> {
         let resources = sha256(&[&levels]);
         let scan = self.page_content(&node.dict)?;
         let mut drawn = Drawn { interpreted: scan.len, ..Drawn::default() };
-        self.draw(&scan.items, &chain, 0, &mut drawn)?;
+        for level in &chain {
+            self.type3_procedures(level, &mut drawn)?;
+        }
+        self.draw(&scan.items, &chain, Context { depth: 0, hidden: false, patterned: false, masked: false }, &mut drawn)?;
         drawn.images.sort_unstable();
         let (annots, annots_in_array) = self.annotations(node, widgets, annotation_ids)?;
         Ok(PageFacts {
@@ -847,6 +1264,10 @@ impl<'d, 'b> Reader<'d, 'b> {
             images: drawn.images,
             image_pixels: drawn.pixels,
             image_uses: Vec::new(),
+            required: drawn.required,
+            forms: drawn.forms,
+            form_draws: Vec::new(),
+            type3: drawn.type3,
             interpreted: drawn.interpreted,
             annots,
             annots_in_array,
@@ -876,14 +1297,20 @@ impl<'d, 'b> Reader<'d, 'b> {
                 return Err(read_error(format!("annotation {id} is listed more than once")));
             }
             let digest = match id {
-                Some(r) => self.digest_ref(r)?.0,
+                Some(r) => self.digest_ref(r, false)?.0,
                 None => self.digest(&Object::Dict(dict.clone()))?,
+            };
+            let bare = self.digest_without(&dict, &[b"AP"])?;
+            let rect = self.array_of(dict.get(b"Rect"), "/Rect")?;
+            let rect = match rect.iter().map(Object::as_f64).collect::<Option<Vec<f64>>>().as_deref() {
+                Some(&[x0, y0, x1, y1]) if [x0, y0, x1, y1].iter().all(|v| v.is_finite()) => Some([x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)]),
+                _ => None,
             };
             let subtype = dict.name(b"Subtype").unwrap_or_default().to_vec();
             let widget = subtype == b"Widget" && id.is_some_and(|id| widgets.contains(&id));
             let silent_popup = subtype == b"Popup" && !dict.contains(b"AP");
             let areas = if subtype == b"Redact" { self.marked_areas(&dict)? } else { Vec::new() };
-            annots.push(Annot { id, subtype, digest, tracked: !widget && !silent_popup, areas });
+            annots.push(Annot { id, subtype, digest, tracked: !widget && !silent_popup, areas, bare, rect });
         }
         Ok((annots, in_array))
     }
@@ -959,7 +1386,7 @@ impl<'d, 'b> Reader<'d, 'b> {
                     return Err(read_error("the form's field tree loops"));
                 }
                 widgets.insert(kid_ref);
-                widget_digests.extend_from_slice(&self.digest_ref(kid_ref)?.0);
+                widget_digests.extend_from_slice(&self.digest_ref(kid_ref, false)?.0);
             }
         }
         let mut path = ancestors.to_vec();
@@ -1025,8 +1452,10 @@ fn section(data: &[u8], offset: u64, is_stream: bool) -> Result<Section, Fail> {
 pub(crate) struct Known {
     checked: HashMap<u32, u16>,
     object_streams: HashMap<u32, Arc<Vec<u32>>>,
-    digests: HashMap<ObjRef, Digest>,
+    digests: HashMap<(ObjRef, bool), Digest>,
     images: HashMap<ObjRef, Arc<ImageInfo>>,
+    /// Content streams' decoded data as `pdfcraft_cos` decodes it, by digest.
+    decoded: HashMap<ObjRef, Digest>,
 }
 
 impl Known {
@@ -1077,6 +1506,37 @@ impl Known {
             }
         }
         if result.is_ok() {
+            // Content streams hayro interpreted (forms, patterns' cells, Type 3 glyph procedures):
+            // decoded to the same data here.
+            for ((num, generation), decoded) in &resolved.content {
+                let r = ObjRef::new(*num, *generation);
+                let theirs = match reader.budget.hashed(decoded.len()) {
+                    Ok(()) => sha256(&[decoded]),
+                    Err(fail) => {
+                        result = Err(fail);
+                        break;
+                    }
+                };
+                let ours = match self.decoded.get(&r) {
+                    Some(ours) => Ok(*ours),
+                    None => reader.content_digest(r),
+                };
+                match ours {
+                    Ok(ours) if ours == theirs => {
+                        self.decoded.insert(r, ours);
+                    }
+                    Ok(_) => {
+                        result = Err(disagree(format!("hayro decoded content stream {r} to other data")));
+                        break;
+                    }
+                    Err(fail) => {
+                        result = Err(fail);
+                        break;
+                    }
+                }
+            }
+        }
+        if result.is_ok() {
             for ((num, generation), (start, length)) in &resolved.streams {
                 let r = ObjRef::new(*num, *generation);
                 let read = reader.get(r);
@@ -1112,6 +1572,8 @@ impl Known {
             contents: HashMap::new(),
             forms: HashMap::new(),
             images: std::mem::take(&mut self.images),
+            type3: HashMap::new(),
+            optional: Arc::default(),
         }
     }
 
@@ -1124,6 +1586,15 @@ impl Known {
 }
 
 impl Reader<'_, '_> {
+    /// The digest of content stream `r`'s decoded data.
+    fn content_digest(&mut self, r: ObjRef) -> Result<Digest, Fail> {
+        let obj = self.get(r)?;
+        let Object::Stream(stream) = &*obj else { return Err(read_error(format!("readers disagree: hayro interprets object {r} as content"))) };
+        let data = self.decode(stream)?;
+        self.budget.hashed(data.len())?;
+        Ok(sha256(&[&data]))
+    }
+
     fn image_use(&mut self, draw: &ImageDraw, inline: &mut HashMap<(usize, usize), Digest>) -> Result<ImageUse, Fail> {
         self.budget.uses()?;
         let (digest, image) = match &draw.source {
@@ -1136,7 +1607,7 @@ impl Reader<'_, '_> {
                 if stream.dict.name(b"Subtype") != Some(b"Image") {
                     return Err(read_error(format!("readers disagree: hayro draws object {r} as an image")));
                 }
-                let (digest, _) = self.digest_ref(r)?;
+                let (digest, _) = self.digest_ref(r, false)?;
                 (digest, Some(self.image_info(r, &stream.dict)?))
             }
             ImageSource::Inline { dict, data } => {
@@ -1155,6 +1626,47 @@ impl Reader<'_, '_> {
             }
         };
         Ok(ImageUse { digest, matrix: draw.matrix, tiled: draw.tiled, image })
+    }
+}
+
+/// Check that hayro drew what the page's content draws (see [`Required`]): each image as often as
+/// the content draws it outside optional content that is off, each image of a tiling pattern's
+/// cell at least once, and each form. Anything missing is an error: hayro did not draw it, so no
+/// fact about it would be certain (another viewer may well draw it).
+pub(crate) fn check_drawn(page: &PageFacts, content: &PageContent, number: usize) -> Result<(), Fail> {
+    let missing = |what: String| Err(read_error(format!("page {number}: the interpreter did not draw {what} the content draws")));
+    let mut plain: BTreeMap<ImageKey, usize> = BTreeMap::new();
+    let mut any: BTreeSet<ImageKey> = BTreeSet::new();
+    for draw in &content.images {
+        let key = match &draw.source {
+            ImageSource::Object { num, generation } => ImageKey::Object(ObjRef::new(*num, *generation)),
+            ImageSource::Inline { .. } => ImageKey::Inline,
+        };
+        any.insert(key);
+        if !draw.tiled {
+            let count = plain.entry(key).or_default();
+            *count = count.saturating_add(1);
+        }
+    }
+    for (key, needed) in &page.required.plain {
+        if plain.get(key).copied().unwrap_or(0) < *needed {
+            return missing(describe(key));
+        }
+    }
+    if let Some(key) = page.required.patterned.iter().find(|key| !any.contains(key)) {
+        return missing(describe(key));
+    }
+    let forms: BTreeSet<ObjRef> = content.forms.iter().map(|form| ObjRef::new(form.num, form.generation)).collect();
+    if let Some(form) = page.required.forms.iter().find(|form| !forms.contains(form)) {
+        return missing(format!("form {form}"));
+    }
+    Ok(())
+}
+
+fn describe(key: &ImageKey) -> String {
+    match key {
+        ImageKey::Object(r) => format!("every use of image {r}"),
+        ImageKey::Inline => "every inline image".into(),
     }
 }
 
@@ -1177,6 +1689,8 @@ pub(crate) fn read(doc: &Document, budget: &mut Budget) -> Result<(Structure, Kn
         contents: HashMap::new(),
         forms: HashMap::new(),
         images: HashMap::new(),
+        type3: HashMap::new(),
+        optional: Arc::default(),
     };
     let Some(root) = doc.root() else { return Err(read_error("the trailer's /Root is not a reference")) };
     let catalog = reader.get(root)?.as_dict().cloned().ok_or_else(|| read_error("the catalog is not a dictionary"))?;
@@ -1188,6 +1702,7 @@ pub(crate) fn read(doc: &Document, budget: &mut Budget) -> Result<(Structure, Kn
         None => (BTreeMap::new(), None),
     };
     let layers = catalog.get(b"OCProperties").map(|layers| reader.digest(layers)).transpose()?;
+    reader.optional = Arc::new(reader.optional_content(&catalog)?);
     let mut entries = BTreeMap::new();
     for (key, value) in catalog.iter() {
         if !CATALOG_REPORTED.contains(&key.as_slice()) {
@@ -1200,6 +1715,12 @@ pub(crate) fn read(doc: &Document, budget: &mut Budget) -> Result<(Structure, Kn
         reader.budget.time()?;
         pages.push(reader.page(node, &widgets, &mut annotation_ids)?);
     }
-    let known = Known { checked: reader.checked, object_streams: reader.object_streams, digests: reader.digests, images: reader.images };
+    let known = Known {
+        checked: reader.checked,
+        object_streams: reader.object_streams,
+        digests: reader.digests,
+        images: reader.images,
+        decoded: HashMap::new(),
+    };
     Ok((Structure { pages, fields, form, catalog: entries, layers, sections }, known))
 }

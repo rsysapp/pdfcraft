@@ -8,22 +8,32 @@
 //! - structure (page tree, page dictionaries, annotations, form fields, the cross-reference chain
 //!   and the trailer) comes from one parser, `pdfcraft_cos`, the one the writer uses; every object
 //!   read must sit where the cross-reference data says, and any repair is an error;
-//! - hayro (through `pdfcraft_render::content`) only interprets page content (each glyph and each
-//!   image it draws, and where: one interpretation, the one the render shows) and renders, and
+//! - hayro (through `pdfcraft_render::content`) only interprets page content (each glyph, image
+//!   and form it draws, and where: one interpretation, the one the render shows) and renders, and
 //!   must agree with `pdfcraft_cos` on the page count and each page's annotation count; a glyph
 //!   without text, an image hayro draws that `pdfcraft_cos` does not read as an image, an
 //!   interpreter warning or a rebuilt cross-reference table is an error;
+//! - hayro reads every content stream it interprets to its end: one it stops reading early (an
+//!   operator after which it gives up, data it cannot parse) or cannot decode is an error, since
+//!   what follows would be checked by nothing; and it draws everything the content draws as
+//!   `pdfcraft_cos` reads it (every image, directly, in forms and in tiling patterns' cells, and
+//!   every form), except optional content that is certainly off in the document's default
+//!   configuration: anything else it leaves undrawn is an error;
 //! - the two read one document, checked: every object hayro reads (opening the file and drawing
 //!   each page) must be where `pdfcraft_cos`'s cross-reference data puts it and pass the same
 //!   checks, every stream's data must be the same bytes, each page must be the same object, and
 //!   its content as hayro decoded and joined it must be what `pdfcraft_cos` decoded; any
-//!   difference is an error;
+//!   difference is an error; so is a content stream hayro interprets (a form, a pattern's cell, a
+//!   Type 3 glyph procedure) that it decoded to other data than `pdfcraft_cos` does;
 //! - an appended update must leave every base page's content and resources as they were (edit
 //!   mode never writes page content there); a rewrite is accepted only as an applied redaction,
 //!   checked visually (every changed pixel lies inside a uniformly filled black rectangle), glyph
 //!   by glyph (a glyph is its text and its place; every removed glyph lies under a box, and none
-//!   is added) and image by image at each image's own resolution (pixels outside the boxes are
-//!   the base's, or within requantisation of them for a JPEG);
+//!   is added), image by image at each image's own resolution (pixels outside the boxes are
+//!   the base's, or within requantisation of them for a JPEG), and content stream by content
+//!   stream: forms, Type 3 glyph procedures and annotation appearances by their decoded data (a
+//!   form or appearance that changed must lie wholly under the boxes; a glyph procedure may not
+//!   change);
 //! - work is bounded (pages, decoded bytes, hashed bytes, rendered pixels, nesting, a deadline),
 //!   and exceeding a bound is [`InspectError::TooComplex`].
 
@@ -105,7 +115,8 @@ pub struct AnnotationChanges {
     /// renumbers objects), a base annotation whose dictionary is no longer on its page.
     pub removed: u32,
     /// Appended updates: base annotations (by object identity) whose dictionary or appearance
-    /// changed, or that moved to another page. (A rewrite reports these as removed and added.)
+    /// (by its decoded content) changed, or that moved to another page. (A rewrite reports these
+    /// as removed and added.)
     pub changed: u32,
     /// Rewrites: base `Redact` marks gone from a page where their area is now uniformly filled.
     pub redactions_applied: u32,
@@ -139,7 +150,9 @@ pub struct ContentChanges {
     pub pages_with_content_removed: u32,
     /// Appended updates only (0 for rewrites): pages whose content streams, resources or other
     /// page-dictionary entries (all but `/Rotate` and `/Annots`) differ from the base page's, or
-    /// every page present in both when the document's layer configuration changed.
+    /// every page present in both when the document's layer configuration changed. Forms and
+    /// Type 3 glyph procedures in the resources are compared by their decoded content: one
+    /// written again with another encoding is not a change.
     pub pages_with_content_changed: u32,
     /// Rewrites only (0 for appended updates): pages whose content changed anywhere but inside
     /// the editor's redaction boxes: opaque, uniformly filled rectangles in the redaction fill
@@ -152,7 +165,16 @@ pub struct ContentChanges {
     ///   (baseline JPEGs); an image replaced by one of another size, meaning, coding or placement,
     ///   or removed, unless it lay wholly under the boxes. Each image is placed where hayro's
     ///   interpreter drew it, and all of it is compared, whatever a clip hides;
-    /// - an image drawn in a tiling pattern's cell added, removed or changed at all.
+    /// - an image drawn in a tiling pattern's cell added, removed or changed at all;
+    /// - a form XObject drawn (directly, in forms or tiling patterns' cells, or as a soft mask's
+    ///   group; compared by its dictionary and decoded content, not its encoding or resources)
+    ///   added, removed or changed, unless its `/BBox` lies wholly under the boxes
+    ///   everywhere hayro drew it on the page (never for a form drawn in a pattern's cell, or one
+    ///   hayro did not draw);
+    /// - a glyph procedure of a Type 3 font in the resources the content is drawn with added,
+    ///   removed or changed (by its decoded content);
+    /// - an annotation whose appearance alone changed (by its decoded content), unless its
+    ///   `/Rect`, before and after, lies wholly under the boxes.
     pub pages_changed_outside_redactions: u32,
 }
 
@@ -496,12 +518,16 @@ fn read_side(bytes: &[u8], against: Option<(&[u8], &Structure, bool)>, placement
             return Err(Fail::Read(format!("readers disagree on the content of page {number}")));
         }
         known.agree(&doc, budget, &content.resolved)?;
+        // Every image and form the content draws (as `pdfcraft_cos` reads it) is one hayro drew,
+        // unless optional content that is off hides it.
+        structure::check_drawn(page, &content, number)?;
         budget.glyphs(content.glyphs.len().saturating_add(content.glyphs.chars.len()))?;
         page.glyphs = content.glyphs;
         // Where each image is drawn is where hayro's interpretation (the one the render check
         // sees) drew it; `pdfcraft_cos` says which image it is.
         if placements {
             page.image_uses = known.image_uses(&doc, budget, &content.images)?;
+            page.form_draws = content.forms;
         }
         page.fingerprint = structure::fingerprint(page);
     }
@@ -714,10 +740,16 @@ fn compare_pages(
         let mut gained_image = images_missing(&e.images, &b.images);
         if base_kept {
             counts.content_changed += usize::from(drawn_differently);
-        } else if drawn_differently {
-            let (base_raster, edited_raster) = rasters.get(before, after, (old, new), budget)?;
-            let verdict = visual::redaction_boxes(&base_raster, &edited_raster);
-            let boxes: Vec<[f32; 4]> = verdict.boxes.iter().map(|rect| user_rect(&edited_raster, *rect)).collect();
+        } else {
+            // Unchanged content and resources leave only the annotations to compare (nothing on
+            // the page explains a change in them).
+            let (boxes, mut outside) = if drawn_differently {
+                let (base_raster, edited_raster) = rasters.get(before, after, (old, new), budget)?;
+                let verdict = visual::redaction_boxes(&base_raster, &edited_raster);
+                (verdict.boxes.iter().map(|rect| user_rect(&edited_raster, *rect)).collect(), verdict.outside)
+            } else {
+                (Vec::new(), false)
+            };
             let mut areas = Areas::new(&boxes);
             // Every removed glyph by its centre, and every image at its own resolution.
             let glyphs_inside = pairing.removed.iter().all(|&index| {
@@ -725,11 +757,21 @@ fn compare_pages(
                     .glyph(index)
                     .is_some_and(|(_, rect)| areas.take_point(f64::from(rect[0] + rect[2]) / 2.0, f64::from(rect[1] + rect[3]) / 2.0))
             });
-            let images = images::compare(&b.image_uses, &e.image_uses, (&before.images, &after.images), &mut areas, budget)
-                .map_err(|fail| fail.of(Role::Edited))?;
-            lost_image = images.removed;
-            gained_image = images.added;
-            if verdict.outside || !glyphs_inside || images.outside {
+            if drawn_differently {
+                let images = images::compare(&b.image_uses, &e.image_uses, (&before.images, &after.images), &mut areas, budget)
+                    .map_err(|fail| fail.of(Role::Edited))?;
+                lost_image = images.removed;
+                gained_image = images.added;
+                outside |= images.outside;
+            }
+            // Content streams by their decoded data: forms where hayro drew them, Type 3 glyph
+            // procedures (which draw unclipped, wherever the glyph is) and annotations'
+            // appearances by their rectangle.
+            outside |= !glyphs_inside
+                || !forms_under(b, e, &mut areas, budget).map_err(|fail| fail.of(Role::Edited))?
+                || b.type3 != e.type3
+                || !appearances_under(b, e, &mut areas, budget).map_err(|fail| fail.of(Role::Edited))?;
+            if outside {
                 counts.outside_redactions += 1;
             } else {
                 let page = u32::try_from(new.saturating_add(1)).unwrap_or(u32::MAX);
@@ -760,6 +802,74 @@ fn compare_pages(
         pages_changed_outside_redactions: count(counts.outside_redactions),
     };
     Ok(())
+}
+
+/// Whether the forms the base page draws and the edited page draws differ only under the areas:
+/// each form (by its key, see [`PageFacts::forms`]) the one page draws more often than the other
+/// must lie wholly under the areas, by its `/BBox` everywhere hayro drew it on that page. A form
+/// hayro did not draw on the page (in a tiling pattern's cell, or hidden) is never under them.
+fn forms_under(base: &PageFacts, edited: &PageFacts, areas: &mut Areas, budget: &mut Budget) -> Result<bool, Fail> {
+    let tally = |page: &PageFacts| {
+        let mut counts: BTreeMap<Digest, usize> = BTreeMap::new();
+        for (_, key) in &page.forms {
+            let count = counts.entry(*key).or_default();
+            *count = count.saturating_add(1);
+        }
+        counts
+    };
+    let (in_base, in_edited) = (tally(base), tally(edited));
+    let keys: BTreeSet<&Digest> = in_base.keys().chain(in_edited.keys()).collect();
+    for key in keys {
+        budget.tick()?;
+        let (from_base, from_edited) = (in_base.get(key).copied().unwrap_or(0), in_edited.get(key).copied().unwrap_or(0));
+        if from_base == from_edited {
+            continue;
+        }
+        let page = if from_base > from_edited { base } else { edited };
+        let objects: BTreeSet<ObjRef> = page.forms.iter().filter(|(_, k)| k == key).map(|(r, _)| *r).collect();
+        let mut placed = false;
+        for draw in page.form_draws.iter().filter(|draw| objects.contains(&ObjRef::new(draw.num, draw.generation))) {
+            if draw.tiled || !areas.take_rect(&draw.rect) {
+                return Ok(false);
+            }
+            placed = true;
+        }
+        if !placed {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Whether the annotations of the base page and the edited page that are alike but for their
+/// appearance (compared by its decoded content) lie wholly under the areas, by `/Rect`.
+fn appearances_under(base: &PageFacts, edited: &PageFacts, areas: &mut Areas, budget: &mut Budget) -> Result<bool, Fail> {
+    let mut by_digest: HashMap<Digest, Vec<&Annot>> = HashMap::new();
+    for annot in edited.annots.iter().filter(|annot| annot.tracked) {
+        by_digest.entry(annot.digest).or_default().push(annot);
+    }
+    let mut changed: Vec<&Annot> = Vec::new();
+    for annot in base.annots.iter().filter(|annot| annot.tracked) {
+        budget.tick()?;
+        if by_digest.get_mut(&annot.digest).and_then(Vec::pop).is_none() {
+            changed.push(annot);
+        }
+    }
+    // The edited annotations left, by their dictionaries without the appearance.
+    let mut by_bare: HashMap<Digest, Vec<&Annot>> = HashMap::new();
+    for annot in by_digest.into_values().flatten() {
+        by_bare.entry(annot.bare).or_default().push(annot);
+    }
+    for annot in changed {
+        budget.tick()?;
+        let Some(other) = by_bare.get_mut(&annot.bare).and_then(Vec::pop) else { continue };
+        for rect in [annot.rect, other.rect] {
+            if !rect.is_some_and(|rect| areas.take_rect(&rect)) {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// How far (PDF points) a removed glyph's centre, or a changed image pixel's, may lie outside a
