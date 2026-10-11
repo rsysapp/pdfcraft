@@ -203,10 +203,14 @@ impl Stream {
     /// of names, `/DecodeParms` a dictionary or an array of dictionaries and nulls (either may be
     /// absent or null). [`Stream::filters`] skips anything else, which would take the data for
     /// something it is not.
+    /// A `/Crypt` filter is refused too: what it applies depends on the security handler and
+    /// its crypt filters, which readers apply differently (and a file without encryption has
+    /// none to apply).
     fn coding_is_well_formed(&self) -> bool {
         let filter = match self.dict.get(b"Filter") {
-            None | Some(Object::Null | Object::Name(_)) => true,
-            Some(Object::Array(items)) => items.iter().all(|item| matches!(item, Object::Name(_))),
+            None | Some(Object::Null) => true,
+            Some(Object::Name(name)) => name.as_slice() != b"Crypt",
+            Some(Object::Array(items)) => items.iter().all(|item| matches!(item, Object::Name(name) if name.as_slice() != b"Crypt")),
             _ => false,
         };
         let parms = match self.dict.get(b"DecodeParms") {
@@ -274,17 +278,26 @@ impl Stream {
     /// Embed build: like [`Stream::decoded_strict`], and decoding past `max` bytes is an error too
     /// (a caller with a work budget, such as a save inspector).
     pub fn decoded_strict_within(&self, max: usize) -> Result<Vec<u8>, CosError> {
+        self.decoded_strict_counted(max).map(|(data, _)| data)
+    }
+
+    /// Embed build: like [`Stream::decoded_strict_within`], also returning the bytes every filter
+    /// of the chain made together (at most `max`, which bounds them all together: see
+    /// `pdfcraft_filters::decode`), for a caller that charges the work.
+    pub fn decoded_strict_counted(&self, max: usize) -> Result<(Vec<u8>, usize), CosError> {
         if !self.coding_is_well_formed() {
-            return Err(CosError::Filter("the stream's /Filter or /DecodeParms is not a name, a dictionary or an array of them".into()));
+            return Err(CosError::Filter(
+                "the stream's /Filter or /DecodeParms is not a name, a dictionary or an array of them, or is /Crypt".into(),
+            ));
         }
         let chain = self.filters();
         if chain.is_empty() {
             if self.raw.len() > max {
                 return Err(CosError::Filter(format!("decoded output exceeds the limit of {max} bytes")));
             }
-            return Ok(self.raw.as_ref().clone());
+            return Ok((self.raw.as_ref().clone(), self.raw.len()));
         }
-        pdfcraft_filters::decode(&chain, &self.raw, max.min(MAX_DECODED)).map_err(|e| CosError::Filter(e.to_string()))
+        pdfcraft_filters::decode_counted(&chain, &self.raw, max.min(MAX_DECODED)).map_err(|e| CosError::Filter(e.to_string()))
     }
 }
 

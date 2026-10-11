@@ -114,7 +114,14 @@ pub enum FilterError {
     LimitExceeded(usize),
     #[error("unsupported filter: {0}")]
     Unsupported(String),
+    /// Embed build: more filters in one chain than [`MAX_CHAIN`].
+    #[error("the filter chain exceeds the limit of {0} filters")]
+    ChainTooLong(usize),
 }
+
+/// Embed build: the most filters one stream's chain may apply. Each repeats the work of reading
+/// what the last made; real files use one or two.
+pub const MAX_CHAIN: usize = 8;
 
 /// A decoder failure carrying whatever was decoded before the error.
 pub(crate) struct Failure {
@@ -137,36 +144,57 @@ pub(crate) type Step = Result<Vec<u8>, Failure>;
 /// Decodes `data` through `chain` (first element applied first).
 ///
 /// Image codecs, `Crypt` and unknown filters anywhere in the chain give
-/// [`FilterError::Unsupported`] (callers keep such data encoded). `max_output` bounds
-/// every intermediate buffer.
+/// [`FilterError::Unsupported`] (callers keep such data encoded). `max_output` bounds the
+/// output of every step of the chain together (embed build: not each step on its own, which let
+/// a chain of `n` filters make `n` times as much), and a chain longer than [`MAX_CHAIN`] is
+/// refused.
 pub fn decode(chain: &[(Filter, Params)], data: &[u8], max_output: usize) -> Result<Vec<u8>, FilterError> {
-    run(chain, data, max_output, true).map(|(v, _)| v)
+    run(chain, data, max_output, true).map(|(v, _, _)| v)
+}
+
+/// Embed build: [`decode`], also returning the bytes every step of the chain made together
+/// (at most `max_output`), for a caller that charges the work.
+pub fn decode_counted(chain: &[(Filter, Params)], data: &[u8], max_output: usize) -> Result<(Vec<u8>, usize), FilterError> {
+    run(chain, data, max_output, true).map(|(v, _, made)| (v, made))
 }
 
 /// Like [`decode`], but on corrupt data returns what was decoded before the error and
 /// reports `partial = true` (the behaviour viewers expect). The remaining filters of the
 /// chain still run on the partial data. Limit and unsupported errors are still errors.
 pub fn decode_tolerant(chain: &[(Filter, Params)], data: &[u8], max_output: usize) -> Result<(Vec<u8>, bool), FilterError> {
-    run(chain, data, max_output, false)
+    run(chain, data, max_output, false).map(|(v, partial, _)| (v, partial))
 }
 
-fn run(chain: &[(Filter, Params)], data: &[u8], max: usize, strict: bool) -> Result<(Vec<u8>, bool), FilterError> {
+/// Returns the data, whether it is partial, and the bytes all steps made.
+fn run(chain: &[(Filter, Params)], data: &[u8], max: usize, strict: bool) -> Result<(Vec<u8>, bool, usize), FilterError> {
+    if chain.len() > MAX_CHAIN {
+        return Err(FilterError::ChainTooLong(MAX_CHAIN));
+    }
     if let Some((f, _)) = chain.iter().find(|(f, _)| !f.is_decodable()) {
         return Err(FilterError::Unsupported(f.name().to_owned()));
     }
     let mut cur: Cow<[u8]> = Cow::Borrowed(data);
     let mut partial = false;
+    // Embed build: each step may make only what the steps before it left of `max`.
+    let mut made = 0usize;
     for (filter, params) in chain {
-        cur = Cow::Owned(match decode_one(filter, params, &cur, max) {
+        let left = max.saturating_sub(made);
+        let out = match decode_one(filter, params, &cur, left) {
             Ok(v) => v,
             Err(Failure { error: FilterError::Corrupt { .. }, partial: out }) if !strict => {
                 partial = true;
                 out
             }
+            Err(Failure { error: FilterError::LimitExceeded(_), .. }) => return Err(FilterError::LimitExceeded(max)),
             Err(f) => return Err(f.error),
-        });
+        };
+        made = made.saturating_add(out.len());
+        if made > max {
+            return Err(FilterError::LimitExceeded(max));
+        }
+        cur = Cow::Owned(out);
     }
-    Ok((cur.into_owned(), partial))
+    Ok((cur.into_owned(), partial, made))
 }
 
 fn decode_one(filter: &Filter, params: &Params, data: &[u8], max: usize) -> Step {
@@ -285,6 +313,39 @@ mod tests {
         let hex = encode(&Filter::AsciiHex, &Params::default(), &rl).unwrap();
         let chain = [(Filter::AsciiHex, Params::default()), (Filter::RunLength, Params::default()), (Filter::Lzw, p)];
         assert_eq!(decode(&chain, &hex, 1 << 20).unwrap(), data);
+    }
+
+    /// Embed build: `data` under `n` ASCIIHex layers.
+    fn hex_layers(data: &[u8], n: usize) -> (Vec<u8>, Vec<(Filter, Params)>) {
+        let mut out = data.to_vec();
+        for _ in 0..n {
+            out = encode(&Filter::AsciiHex, &Params::default(), &out).unwrap();
+        }
+        (out, vec![(Filter::AsciiHex, Params::default()); n])
+    }
+
+    #[test]
+    fn a_chain_longer_than_the_limit_is_refused_before_any_decoding() {
+        let (data, chain) = hex_layers(b"q", MAX_CHAIN);
+        assert_eq!(decode(&chain, &data, 1 << 20).unwrap(), b"q");
+        let (data, chain) = hex_layers(b"q", MAX_CHAIN + 1);
+        assert!(matches!(decode(&chain, &data, 1 << 20), Err(FilterError::ChainTooLong(MAX_CHAIN))));
+        assert!(matches!(decode_tolerant(&chain, &data, 1 << 20), Err(FilterError::ChainTooLong(MAX_CHAIN))));
+    }
+
+    #[test]
+    fn the_limit_bounds_every_step_of_a_chain_together() {
+        let (one, _) = hex_layers(&[0x5a; 128], 1);
+        let (two, _) = hex_layers(&[0x5a; 128], 2);
+        let (data, chain) = hex_layers(&[0x5a; 128], 3);
+        // Each step makes the layer below it: two, one, then the data.
+        let all = two.len() + one.len() + 128;
+        let (decoded, made) = decode_counted(&chain, &data, 1 << 20).unwrap();
+        assert_eq!((decoded, made), (vec![0x5a; 128], all));
+        assert!(decode(&chain, &data, all).is_ok());
+        // Every step fits `all - 1` on its own; together they do not.
+        assert!(two.len() < all - 1);
+        assert!(matches!(decode(&chain, &data, all - 1), Err(FilterError::LimitExceeded(_))));
     }
 
     #[test]

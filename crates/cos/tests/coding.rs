@@ -75,3 +75,49 @@ fn coding_entries_that_are_not_names_or_dictionaries_are_refused_by_strict_decod
     assert_eq!(decoded("/Filter [/ASCIIHexDecode] /DecodeParms [null]", b"48656C6C6F>", ["null", "null"]).unwrap(), b"Hello");
     assert_eq!(decoded("", b"Hello", ["null", "null"]).unwrap(), b"Hello");
 }
+
+#[test]
+fn a_crypt_filter_is_refused_by_strict_decoding() {
+    // Nothing applies it in a file without encryption, and readers apply crypt filters
+    // differently.
+    assert!(decoded("/Filter /Crypt /DecodeParms << /Name /Identity >>", b"Hello", ["null", "null"]).is_err());
+    assert!(decoded("/Filter [/Crypt /ASCIIHexDecode] /DecodeParms [<< /Name /Identity >> null]", b"48656C6C6F>", ["null", "null"]).is_err());
+    assert!(decoded("/Filter 3 0 R", b"Hello", ["/Crypt", "null"]).is_err());
+}
+
+#[test]
+fn coding_entries_that_refer_back_are_refused_quickly() {
+    // The stream's /Filter is the stream itself; an array naming itself; parameters naming the
+    // array they are in. Resolution goes one level, and loading refuses the cycle: what is left
+    // is not a name or a dictionary.
+    let started = std::time::Instant::now();
+    assert!(decoded("/Filter 2 0 R", b"Hello", ["null", "null"]).is_err());
+    assert!(decoded("/Filter 3 0 R", b"Hello", ["[3 0 R]", "null"]).is_err());
+    assert!(decoded("/Filter /ASCIIHexDecode /DecodeParms 3 0 R", b"48656C6C6F>", ["[3 0 R]", "null"]).is_err());
+    assert!(decoded("/Filter 3 0 R /DecodeParms 4 0 R", b"Hello", ["4 0 R", "3 0 R"]).is_err());
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+}
+
+#[test]
+fn a_long_chain_and_a_large_expansion_stop_at_their_limits() {
+    // Nine filters: refused before any decoding.
+    let nine = ["/ASCIIHexDecode"; 9].join(" ");
+    let error = decoded(&format!("/Filter [{nine}]"), b"30>", ["null", "null"]).unwrap_err();
+    assert!(error.to_string().contains("exceeds the limit"), "{error}");
+    // The same filter named nine times through one indirect array: the same.
+    let error = decoded("/Filter 3 0 R", b"30>", [&format!("[{nine}]"), "null"]).unwrap_err();
+    assert!(error.to_string().contains("exceeds the limit"), "{error}");
+    // 4 MiB of zeros, compressed twice to a few kilobytes, under a 1 MiB bound: stopped at
+    // the bound, every step counted.
+    let zeros = vec![0u8; 4 << 20];
+    let once = Stream::flate(Dict::new(), &zeros).raw;
+    let twice = Stream::flate(Dict::new(), &once).raw;
+    assert!(twice.len() < 64 << 10);
+    let bodies = vec![b"<< /Type /Catalog >>".to_vec(), stream("/Filter [/FlateDecode /FlateDecode]", &twice), b"null".to_vec(), b"null".to_vec()];
+    let doc = Document::open(Arc::new(file(&bodies))).unwrap();
+    let Object::Stream(bomb) = &*doc.try_get(2).unwrap() else { panic!("object 2 is not a stream") };
+    let error = bomb.decoded_strict_counted(1 << 20).unwrap_err();
+    assert!(error.to_string().contains("exceeds the limit"), "{error}");
+    let (data, made) = bomb.decoded_strict_counted(16 << 20).unwrap();
+    assert_eq!((data.len(), made), (zeros.len(), zeros.len() + once.len()));
+}
