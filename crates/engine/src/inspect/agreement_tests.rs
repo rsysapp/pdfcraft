@@ -490,7 +490,11 @@ fn update_section(base: &[u8], objects: &[(u32, &[u8])], prev: Option<usize>, ex
         out.extend_from_slice(format!("{num} 1\n{offset:010} 00000 n \n").as_bytes());
     }
     let prev = prev.map(|prev| format!("/Prev {prev}")).unwrap_or_default();
-    out.extend_from_slice(format!("trailer\n<< /Size 9 /Root 1 0 R {prev} {extra} >>\nstartxref\n{xref}\n%%EOF\n").as_bytes());
+    // At least the base's /Size: an edited file reads no object at or above its own.
+    let at = base.windows(6).rposition(|w| w == b"/Size ").unwrap_or(0);
+    let base_size: u32 = std::str::from_utf8(&base[at + 6..]).ok().and_then(|rest| rest.split_whitespace().next()?.parse().ok()).unwrap_or(0);
+    let size = base_size.max(9);
+    out.extend_from_slice(format!("trailer\n<< /Size {size} /Root 1 0 R {prev} {extra} >>\nstartxref\n{xref}\n%%EOF\n").as_bytes());
     out
 }
 
@@ -1372,4 +1376,205 @@ fn a_session_redaction_takes_away_the_text_standing_for_what_it_removed() {
         assert!(leaks.is_empty(), "named {named}: {leaks:?}");
         assert!(exposed.contains("public"), "named {named}");
     }
+}
+
+#[test]
+fn a_session_redaction_on_unbalanced_marked_content_takes_every_span_s_text_away() {
+    // Follow-up 6 audit: an `EMC` closing nothing makes which glyph is in which span each
+    // reader's guess. The redactor takes every span's text away on that page (and its elements'),
+    // so the inspection accepts.
+    use crate::{Edit, NewAnnotation, Session, Shape, Style, rect_quad};
+    let mut b = Builder::new();
+    b.object(1, b"<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 7 0 R /MarkInfo << /Marked true >> >>");
+    b.object(2, b"<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 /MediaBox [0 0 200 300] >>");
+    b.object(3, format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R {RESOURCES} /StructParents 0 >>").as_bytes());
+    let content = b"/Span << /ActualText (SECRET) >> BDC BT /F1 12 Tf 20 200 Td (SECRET) Tj ET EMC EMC\n/P << /MCID 0 /ActualText (Public) >> BDC BT /F1 12 Tf 20 100 Td (Public) Tj ET EMC";
+    b.object(4, &stream("", content));
+    b.object(5, format!("<< /Type /Page /Parent 2 0 R /Contents 6 0 R {RESOURCES} /StructParents 1 >>").as_bytes());
+    b.object(6, &stream("", b"/P << /MCID 0 >> BDC BT /F1 12 Tf 20 200 Td (Other) Tj ET EMC"));
+    b.object(7, b"<< /Type /StructTreeRoot /K [8 0 R 9 0 R] >>");
+    b.object(8, b"<< /S /P /P 7 0 R /Pg 3 0 R /K 0 /ActualText (Public) >>");
+    b.object(9, b"<< /S /P /P 7 0 R /Pg 5 0 R /K 0 /ActualText (Other) >>");
+    let rows = b.offsets.clone();
+    let base = b.finish(10, &rows, "");
+    let mark = Shape::Redact { quads: vec![rect_quad([16.0, 190.0, 120.0, 220.0])], overlay: String::new(), look: Default::default() };
+    let mut session = Session::new().with_clock(|| 1_700_000_000);
+    session.set_keep_document_information(true);
+    let id = session.open("base.pdf", None, std::sync::Arc::new(base.clone()), None).unwrap();
+    let note = NewAnnotation { page: 0, style: Style::default_for(&mark), shape: mark, contents: String::new(), author: "Sari".into() };
+    session.apply(id, Edit::AddAnnotation(note)).unwrap();
+    session.apply(id, Edit::ApplyRedactions { pages: None }).unwrap();
+    let redacted = session.save_bytes(id).unwrap();
+    let inspection = inspect(&base, &redacted, InspectLimits::default()).unwrap();
+    assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{inspection:?}");
+    let exposed = exposed_text(&redacted);
+    assert!(!exposed.contains("secret"), "{exposed}");
+    assert!(exposed.contains("other"), "the other page keeps its word");
+}
+
+// ── follow-up 6 audit: where the two readers could read different objects ─────────────────
+
+/// A page drawing "Alpha" with a square annotation (5) and document information (6).
+fn probe_base() -> Vec<u8> {
+    let mut b = Builder::new();
+    head(&mut b);
+    b.object(3, format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Annots [5 0 R] {RESOURCES} >>").as_bytes());
+    b.object(4, &stream("", &text("Alpha")));
+    b.object(5, b"<< /Type /Annot /Subtype /Square /Rect [20 200 80 260] >>");
+    b.object(6, b"<< /Title (Base) >>");
+    let rows = b.offsets.clone();
+    b.finish(7, &rows, "/Info 6 0 R")
+}
+
+/// `base` with an update appended: `objects` (number, generation, body) defined, `free` (number,
+/// generation) listed free, one subsection each, and the trailer entries `trailer` (`/Prev` added).
+fn probe_update(base: &[u8], objects: &[(u32, u16, Vec<u8>)], free: &[(u32, u16)], trailer: &str) -> Vec<u8> {
+    let at = base.windows(9).rposition(|w| w == b"startxref").unwrap();
+    let prev: usize = std::str::from_utf8(&base[at + 9..]).unwrap().split_whitespace().next().unwrap().parse().unwrap();
+    let mut out = base.to_vec();
+    let mut rows = Vec::new();
+    for (num, generation, body) in objects {
+        rows.push((*num, format!("{:010} {generation:05} n \n", out.len())));
+        out.extend_from_slice(format!("{num} {generation} obj\n").as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    for (num, generation) in free {
+        rows.push((*num, format!("0000000000 {generation:05} f \n")));
+    }
+    let xref = out.len();
+    out.extend_from_slice(b"xref\n0 1\n0000000000 65535 f \n");
+    for (num, row) in rows {
+        out.extend_from_slice(format!("{num} 1\n{row}").as_bytes());
+    }
+    out.extend_from_slice(format!("trailer\n<< {trailer} /Prev {prev} >>\nstartxref\n{xref}\n%%EOF\n").as_bytes());
+    out
+}
+
+#[test]
+fn objects_the_readers_could_take_differently_fail_closed() {
+    // Each case either reads alike in both readers (and is compared) or fails the inspection.
+    let base = probe_base();
+    let refused = |case: &str, edited: &[u8], why: &str| match inspect(&base, edited, InspectLimits::default()) {
+        Err(InspectError::Edited(message)) => assert!(message.contains(why), "{case}: {message}"),
+        other => panic!("{case}: expected Err(Edited), got {other:?}"),
+    };
+    let info =
+        |case: &str, edited: &[u8]| inspect(&base, edited, InspectLimits::default()).unwrap_or_else(|error| panic!("{case}: {error:?}")).info.changed;
+    refused("free /Info in update", &probe_update(&base, &[], &[(6, 1)], "/Size 7 /Root 1 0 R /Info 6 0 R"), "readers disagree");
+    refused("free annot in update", &probe_update(&base, &[], &[(5, 1)], "/Size 7 /Root 1 0 R /Info 6 0 R"), "readers disagree");
+    refused("free content in update", &probe_update(&base, &[], &[(4, 1)], "/Size 7 /Root 1 0 R /Info 6 0 R"), "readers disagree");
+    refused(
+        "info gen 1 redefined",
+        &probe_update(&base, &[(6, 1, b"<< /Title (Forged) >>".to_vec())], &[], "/Size 7 /Root 1 0 R /Info 6 0 R"),
+        "another generation",
+    );
+    refused(
+        "content gen 1 redefined",
+        &probe_update(&base, &[(4, 1, stream("", &text("Bravo")))], &[], "/Size 7 /Root 1 0 R /Info 6 0 R"),
+        "another generation",
+    );
+    refused("info beyond size", &probe_update(&base, &[(9, 0, b"<< /Title (Nine) >>".to_vec())], &[], "/Size 7 /Root 1 0 R /Info 9 0 R"), "/Size");
+    refused(
+        "content beyond size",
+        &probe_update(
+            &base,
+            &[
+                (9, 0, stream("", &text("Bravo"))),
+                (3, 0, format!("<< /Type /Page /Parent 2 0 R /Contents 9 0 R /Annots [5 0 R] {RESOURCES} >>").into_bytes()),
+            ],
+            &[],
+            "/Size 7 /Root 1 0 R /Info 6 0 R",
+        ),
+        "/Size",
+    );
+    refused("info ref gen 1 to gen 0 object", &probe_update(&base, &[], &[], "/Size 7 /Root 1 0 R /Info 6 1 R"), "another generation");
+    refused("size shrunk", &probe_update(&base, &[], &[], "/Size 5 /Root 1 0 R /Info 6 0 R"), "/Size");
+    refused("no root in update trailer", &probe_update(&base, &[], &[], "/Size 7 /Info 6 0 R"), "damaged");
+    // An update whose table is hybrid: its /XRefStm stream lists /Info 6 at a second definition
+    // ("Stream"), the table at "Table".
+    {
+        let mut out = base.clone();
+        let at = base.windows(9).rposition(|w| w == b"startxref").unwrap();
+        let prev: usize = std::str::from_utf8(&base[at + 9..]).unwrap().split_whitespace().next().unwrap().parse().unwrap();
+        let table_def = out.len();
+        out.extend_from_slice(b"6 0 obj\n<< /Title (Table) >>\nendobj\n");
+        let stream_def = out.len();
+        out.extend_from_slice(b"6 0 obj\n<< /Title (Stream) >>\nendobj\n");
+        let at9 = out.len();
+        let mut entries = vec![1u8];
+        entries.extend_from_slice(&u32::try_from(stream_def).unwrap().to_be_bytes());
+        entries.extend_from_slice(&[0, 0, 1]);
+        entries.extend_from_slice(&u32::try_from(at9).unwrap().to_be_bytes());
+        entries.extend_from_slice(&[0, 0]);
+        out.extend_from_slice(b"9 0 obj\n");
+        out.extend_from_slice(&stream(&format!("/Type /XRef /Size 10 /W [1 4 2] /Index [6 1 9 1] /Root 1 0 R /Prev {prev}"), &entries));
+        out.extend_from_slice(b"\nendobj\n");
+        let xref = out.len();
+        out.extend_from_slice(format!("xref\n0 1\n0000000000 65535 f \n6 1\n{table_def:010} 00000 n \ntrailer\n<< /Size 10 /Root 1 0 R /Info 6 0 R /Prev {prev} /XRefStm {at9} >>\nstartxref\n{xref}\n%%EOF\n").as_bytes());
+        // hayro rebuilds a hybrid update's cross-reference data: refused.
+        refused("hybrid update, both list 6", &out, "damaged");
+        // The table leaves 6 out, the stream lists it.
+        let mut out2 = base.clone();
+        let stream_def = out2.len();
+        out2.extend_from_slice(b"6 0 obj\n<< /Title (Stream) >>\nendobj\n");
+        let at9 = out2.len();
+        let mut entries = vec![1u8];
+        entries.extend_from_slice(&u32::try_from(stream_def).unwrap().to_be_bytes());
+        entries.extend_from_slice(&[0, 0, 1]);
+        entries.extend_from_slice(&u32::try_from(at9).unwrap().to_be_bytes());
+        entries.extend_from_slice(&[0, 0]);
+        out2.extend_from_slice(b"9 0 obj\n");
+        out2.extend_from_slice(&stream(&format!("/Type /XRef /Size 10 /W [1 4 2] /Index [6 1 9 1] /Root 1 0 R /Prev {prev}"), &entries));
+        out2.extend_from_slice(b"\nendobj\n");
+        let xref = out2.len();
+        out2.extend_from_slice(format!("xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 10 /Root 1 0 R /Info 6 0 R /Prev {prev} /XRefStm {at9} >>\nstartxref\n{xref}\n%%EOF\n").as_bytes());
+        refused("hybrid update, stream alone lists 6", &out2, "damaged");
+        // A pure cross-reference stream update after a table base.
+        let mut out3 = base.clone();
+        let def = out3.len();
+        out3.extend_from_slice(b"6 0 obj\n<< /Title (XRef) >>\nendobj\n");
+        let at9 = out3.len();
+        let mut entries = vec![1u8];
+        entries.extend_from_slice(&u32::try_from(def).unwrap().to_be_bytes());
+        entries.extend_from_slice(&[0, 0, 1]);
+        entries.extend_from_slice(&u32::try_from(at9).unwrap().to_be_bytes());
+        entries.extend_from_slice(&[0, 0]);
+        out3.extend_from_slice(b"9 0 obj\n");
+        out3.extend_from_slice(&stream(&format!("/Type /XRef /Size 10 /W [1 4 2] /Index [6 1 9 1] /Root 1 0 R /Info 6 0 R /Prev {prev}"), &entries));
+        out3.extend_from_slice(b"\nendobj\n");
+        out3.extend_from_slice(format!("startxref\n{at9}\n%%EOF\n").as_bytes());
+        assert_eq!(info("xref stream update", &out3), ["Title"]);
+    }
+    // An object stream whose header names object 6 twice.
+    {
+        let mut out = base.clone();
+        let at = base.windows(9).rposition(|w| w == b"startxref").unwrap();
+        let prev: usize = std::str::from_utf8(&base[at + 9..]).unwrap().split_whitespace().next().unwrap().parse().unwrap();
+        let first = "<< /Title (First) >>";
+        let second = "<< /Title (Second) >>";
+        let header = format!("6 0 6 {} ", first.len() + 1);
+        let data = format!("{header}{first} {second}");
+        let at8 = out.len();
+        out.extend_from_slice(b"8 0 obj\n");
+        out.extend_from_slice(&stream(&format!("/Type /ObjStm /N 2 /First {}", header.len()), data.as_bytes()));
+        out.extend_from_slice(b"\nendobj\n");
+        let at9 = out.len();
+        let mut entries = vec![2u8, 0, 0, 0, 8, 0, 1, 1];
+        entries.extend_from_slice(&u32::try_from(at8).unwrap().to_be_bytes());
+        entries.extend_from_slice(&[0, 0, 1]);
+        entries.extend_from_slice(&u32::try_from(at9).unwrap().to_be_bytes());
+        entries.extend_from_slice(&[0, 0]);
+        out.extend_from_slice(b"9 0 obj\n");
+        out.extend_from_slice(&stream(&format!("/Type /XRef /Size 10 /W [1 4 2] /Index [6 1 8 2] /Root 1 0 R /Info 6 0 R /Prev {prev}"), &entries));
+        out.extend_from_slice(b"\nendobj\n");
+        out.extend_from_slice(format!("startxref\n{at9}\n%%EOF\n").as_bytes());
+        // Both readers (as PDFium and pdf.js) take the object at the index the cross-reference
+        // data names, not the first header entry naming its number.
+        assert_eq!(info("object stream naming 6 twice", &out), ["Title"]);
+    }
+    // A body after the last startxref nobody lists.
+    let mut tail = base.clone();
+    tail.extend_from_slice(b"6 0 obj\n<< /Title (Tail) >>\nendobj\n");
+    assert!(info("unlisted tail", &tail).is_empty(), "read by neither");
 }

@@ -3880,6 +3880,21 @@ impl<'a> MarkedIndex<'a> {
     }
 }
 
+/// `elements` and their ancestors.
+fn with_ancestors(mut todo: Vec<u32>, links: &StructLinks, budget: &mut Budget) -> Result<HashSet<u32>, Fail> {
+    let mut elements = HashSet::new();
+    while let Some(element) = todo.pop() {
+        budget.tick()?;
+        if element == STRUCT_ROOT || !elements.insert(element) {
+            continue;
+        }
+        if let Some(parent) = links.parents.get(element as usize) {
+            todo.push(*parent);
+        }
+    }
+    Ok(elements)
+}
+
 /// Whether a key of [`STRUCT_TEXT_KEYS`] is text standing for the content (`/ActualText`,
 /// `/Alt`, `/E`), which may spell out what a redaction removed (R6b-47); `/Lang` and `/T` do
 /// not.
@@ -3897,8 +3912,9 @@ fn stands_for_content(key: u8) -> bool {
 /// and `true` is returned: the page counts outside the redactions.
 ///
 /// Where the readers do not agree on the page's levels (see [`PageFacts::levels_agree`]) no
-/// glyph can be placed in a span: any such text left on the edited page's spans, or anywhere in
-/// the edited structure tree, counts.
+/// glyph can be placed in a span: any such text left on the edited page's spans, or on any
+/// element (or its ancestors) with marked content on this page, in a form, or naming no page,
+/// counts.
 pub(crate) fn alternate_text_kept(
     base: &PageFacts,
     edited: &PageFacts,
@@ -3912,7 +3928,15 @@ pub(crate) fn alternate_text_kept(
     }
     if !base.levels_agree {
         let on_spans = edited.text.iter().any(|span| span.text.iter().any(|(key, _)| stands_for_content(*key)));
-        let in_tree = edited_tree.text.iter().any(|(_, key, _)| stands_for_content(*key));
+        let mut todo: Vec<u32> = Vec::new();
+        for kid in &index.links.kids {
+            budget.tick()?;
+            if kid.form.is_some() || kid.page.is_none_or(|page| page == base.object) {
+                todo.push(kid.element);
+            }
+        }
+        let elements = with_ancestors(todo, index.links, budget)?;
+        let in_tree = edited_tree.text.iter().any(|(element, key, _)| stands_for_content(*key) && elements.contains(element));
         return Ok(on_spans || in_tree);
     }
     // Every level a removed glyph was drawn in, its own and those around it.
@@ -3954,15 +3978,7 @@ pub(crate) fn alternate_text_kept(
         }
     }
     // With their ancestors: an ancestor's text stands for its descendants' content too.
-    while let Some(element) = todo.pop() {
-        budget.tick()?;
-        if element == STRUCT_ROOT || !elements.insert(element) {
-            continue;
-        }
-        if let Some(parent) = index.links.parents.get(element as usize) {
-            todo.push(*parent);
-        }
-    }
+    elements.extend(with_ancestors(todo, index.links, budget)?);
     let element_kept = edited_tree.text.iter().any(|(element, key, _)| stands_for_content(*key) && elements.contains(element));
     Ok(element_kept || spans_kept(&stripped, &edited.text).is_none())
 }

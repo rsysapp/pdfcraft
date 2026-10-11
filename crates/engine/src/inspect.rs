@@ -967,6 +967,18 @@ fn read_side(bytes: &[u8], against: Option<(&[u8], &Structure, bool)>, placement
     for _ in &read {
         budget.object()?;
     }
+    // Follow-up 6 audit: an edited file may read no object numbered at or above its trailer's
+    // `/Size` (one more than the highest object number, ISO 32000-2 §7.5.5). Both readers here
+    // take such an object; a viewer that sizes its table by `/Size` may not, and show another
+    // document.
+    if against.is_some() {
+        let size = doc.trailer().int(b"Size").and_then(|size| u32::try_from(size).ok());
+        if let Some((num, generation)) = read.iter().find(|(num, _)| size.is_none_or(|size| *num >= size)) {
+            return Err(Fail::Read(format!(
+                "object {num} {generation} R is numbered at or above the trailer's /Size, which viewers read differently"
+            )));
+        }
+    }
     let (resolved, unread) = side.hayro.read_objects(&read);
     // An object hayro cannot read is accepted only where `pdfcraft_cos` reads it as null: one
     // `pdfcraft_cos` cannot read now either is refused, not passed over.
