@@ -565,6 +565,9 @@ impl XRef {
 
                 if let Some(object) = r.read_with_context::<IndirectObject<T>>(&ctx) {
                     if object.id() == &id {
+                        // Embed build: where this object was read, for a caller checking another
+                        // reader agrees (`resolved`).
+                        crate::resolved::object((id.obj_number, id.gen_number), crate::resolved::Place::InFile(offset));
                         return Some(object.get());
                     }
                 } else {
@@ -604,7 +607,10 @@ impl XRef {
                 let stream = self.get_with::<Stream<'_>>(obj_stream_id, &ctx)?;
                 let data = repr.data.get_with(obj_stream_id, &ctx)?;
                 let object_stream = ObjectStream::new(stream, data, &ctx)?;
-                object_stream.get(index)
+                let object = object_stream.get(index)?;
+                // Embed build: as above.
+                crate::resolved::object((id.obj_number, id.gen_number), crate::resolved::Place::InStream(obj_stram_gen_num, index));
+                Some(object)
             }
         }
     }

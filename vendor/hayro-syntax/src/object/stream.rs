@@ -222,14 +222,24 @@ impl<'a> Readable<'a> for Stream<'a> {
         }
 
         let offset = r.offset();
-        parse_proper(r, &dict)
+        let stream = parse_proper(r, &dict)
             .or_else(|| {
                 warn!("failed to parse stream, trying to parse it manually");
 
                 r.jump(offset);
                 parse_fallback(r, &dict)
             })
-            .error_none("was unable to manually parse the stream")
+            .error_none("was unable to manually parse the stream")?;
+        // Embed build: the range of a file object's stream data, for a caller checking another
+        // reader read the same bytes (`resolved`).
+        if let Some(id) = ctx.obj_number()
+            && !ctx.in_object_stream()
+            && !ctx.in_content_stream()
+            && let Some(start) = (stream.data.as_ptr() as usize).checked_sub(r.data.as_ptr() as usize)
+        {
+            crate::resolved::stream((id.obj_number, id.gen_number), (start, stream.data.len()));
+        }
+        Some(stream)
     }
 }
 

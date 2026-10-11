@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use pdfcraft_cos::{Dict, Document, Lexer, ObjRef, Object, Stream, XrefEntry, parse_indirect};
-use pdfcraft_render::content::{ImageDraw, ImageSource, PageGlyphs};
+use pdfcraft_render::content::{ImageDraw, ImageSource, ObjectPlace, PageGlyphs, Resolved};
 
 use super::{Budget, Fail, MAX_PAGES};
 
@@ -65,6 +65,8 @@ pub(crate) struct Annot {
 pub(crate) struct PageFacts {
     /// `/Rotate` (inherited), 0, 90, 180 or 270.
     pub rotation: i64,
+    /// The page dictionary's object.
+    pub object: ObjRef,
     /// The decoded content streams, in order.
     pub content: Digest,
     /// The resources the page's content is drawn with: its own and each ancestor's.
@@ -246,7 +248,8 @@ struct Reader<'d, 'b> {
     digests: HashMap<ObjRef, Digest>,
     /// The references being digested, outermost first.
     stack: Vec<ObjRef>,
-    contents: HashMap<Vec<ObjRef>, Arc<Scan>>,
+    /// Content streams scanned, by their references and whether `/Contents` is an array.
+    contents: HashMap<(Vec<ObjRef>, bool), Arc<Scan>>,
     forms: HashMap<ObjRef, Arc<Scan>>,
     images: HashMap<ObjRef, Arc<ImageInfo>>,
 }
@@ -598,41 +601,41 @@ impl<'d, 'b> Reader<'d, 'b> {
         Ok(data)
     }
 
-    /// The page's content streams, decoded, joined and scanned (once per distinct list).
+    /// The page's content streams, decoded, joined and scanned (once per distinct list). Joined
+    /// as hayro joins them, so the two readers' decoded content can be compared: an array's
+    /// streams each followed by a space, a single stream as it is.
     fn page_content(&mut self, page: &Dict) -> Result<Arc<Scan>, Fail> {
-        let refs: Vec<ObjRef> = match page.get(b"Contents") {
-            None => Vec::new(),
+        let refs_of = |items: &[Object]| -> Result<Vec<ObjRef>, Fail> {
+            items.iter().map(|item| item.as_ref().ok_or_else(|| read_error("a /Contents entry is not a reference"))).collect()
+        };
+        let (refs, array): (Vec<ObjRef>, bool) = match page.get(b"Contents") {
+            None => (Vec::new(), false),
             Some(Object::Ref(r)) => match &*self.get(*r)? {
-                Object::Stream(_) => vec![*r],
-                Object::Array(items) => items
-                    .iter()
-                    .map(|item| item.as_ref().ok_or_else(|| read_error("a /Contents entry is not a reference")))
-                    .collect::<Result<_, _>>()?,
-                Object::Null => Vec::new(),
+                Object::Stream(_) => (vec![*r], false),
+                Object::Array(items) => (refs_of(items)?, true),
+                Object::Null => (Vec::new(), false),
                 _ => return Err(read_error("/Contents is neither a stream nor an array")),
             },
-            Some(Object::Array(items)) => {
-                items.iter().map(|item| item.as_ref().ok_or_else(|| read_error("a /Contents entry is not a reference"))).collect::<Result<_, _>>()?
-            }
-            Some(Object::Null) => Vec::new(),
+            Some(Object::Array(items)) => (refs_of(items)?, true),
+            Some(Object::Null) => (Vec::new(), false),
             Some(_) => return Err(read_error("/Contents is neither a stream nor an array")),
         };
-        if let Some(found) = self.contents.get(&refs) {
+        let key = (refs, array);
+        if let Some(found) = self.contents.get(&key) {
             return Ok(found.clone());
         }
         let mut data = Vec::new();
-        let single = refs.len() == 1;
-        for r in &refs {
+        for r in &key.0 {
             let obj = self.get(*r)?;
             let Object::Stream(stream) = &*obj else { return Err(read_error(format!("content stream {r} is not a stream"))) };
             data.extend_from_slice(&self.decode(stream)?);
-            if !single {
+            if array {
                 // As hayro joins them: at least one whitespace in between.
                 data.push(b' ');
             }
         }
         let scan = Arc::new(self.scan(&data)?);
-        self.contents.insert(refs, scan.clone());
+        self.contents.insert(key, scan.clone());
         Ok(scan)
     }
 
@@ -837,6 +840,7 @@ impl<'d, 'b> Reader<'d, 'b> {
         let (annots, annots_in_array) = self.annotations(node, widgets, annotation_ids)?;
         Ok(PageFacts {
             rotation,
+            object: node.obj,
             content: scan.digest,
             resources,
             other,
@@ -1031,7 +1035,72 @@ impl Known {
     /// as hayro's parser delimited them) and placed where hayro drew it. An object hayro names
     /// that is not an image here is an error: the readers disagree.
     pub fn image_uses(&mut self, doc: &Document, budget: &mut Budget, draws: &[ImageDraw]) -> Result<Vec<ImageUse>, Fail> {
-        let mut reader = Reader {
+        let mut reader = self.reader(doc, budget);
+        // Inline images by the copies hayro's draws share (alive as long as `draws`): one digest
+        // for the uses of an inline image in a form drawn many times.
+        let mut inline = HashMap::new();
+        let uses = draws.iter().map(|draw| reader.image_use(draw, &mut inline)).collect::<Result<Vec<_>, _>>();
+        self.keep(reader);
+        uses
+    }
+}
+
+impl Known {
+    /// Check that `pdfcraft_cos` reads what hayro read (see [`Resolved`]): every object at the
+    /// same place (the same file offset with the same generation, or the same object stream and
+    /// index), read here too with every check [`read`] makes, and every stream's data the same
+    /// bytes. Any difference is an error: the two readers would not describe one document.
+    pub fn agree(&mut self, doc: &Document, budget: &mut Budget, resolved: &Resolved) -> Result<(), Fail> {
+        let disagree = |what: String| read_error(format!("readers disagree: {what}"));
+        if resolved.conflicts > 0 {
+            return Err(disagree("hayro read an object two ways".into()));
+        }
+        let data = doc.bytes().as_slice();
+        let mut reader = self.reader(doc, budget);
+        let mut result = Ok(());
+        for ((num, generation), place) in &resolved.objects {
+            let r = ObjRef::new(*num, *generation);
+            let same = match (doc.xref_entry(*num), place) {
+                (Some(XrefEntry::InFile { offset, generation: g }), ObjectPlace::InFile(at)) => offset == *at && g == *generation,
+                (Some(XrefEntry::InStream { stream, index }), ObjectPlace::InStream { stream: s, index: i }) => {
+                    stream == *s && index == *i && *generation == 0
+                }
+                _ => false,
+            };
+            if !same {
+                result = Err(disagree(format!("hayro read object {r} from another place")));
+                break;
+            }
+            if let Err(fail) = reader.get(r) {
+                result = Err(fail);
+                break;
+            }
+        }
+        if result.is_ok() {
+            for ((num, generation), (start, length)) in &resolved.streams {
+                let r = ObjRef::new(*num, *generation);
+                let read = reader.get(r);
+                let theirs = start.checked_add(*length).and_then(|end| data.get(*start..end));
+                let same = match (&read, theirs) {
+                    (Ok(obj), Some(theirs)) => matches!(&**obj, Object::Stream(stream) if stream.raw.as_slice() == theirs),
+                    _ => false,
+                };
+                if let Err(fail) = reader.budget.hashed(*length) {
+                    result = Err(fail);
+                    break;
+                }
+                if !same {
+                    result = Err(disagree(format!("hayro read other data for stream {r}")));
+                    break;
+                }
+            }
+        }
+        self.keep(reader);
+        result
+    }
+
+    fn reader<'d, 'b>(&mut self, doc: &'d Document, budget: &'b mut Budget) -> Reader<'d, 'b> {
+        Reader {
             doc,
             data: doc.bytes().as_slice(),
             budget,
@@ -1043,16 +1112,14 @@ impl Known {
             contents: HashMap::new(),
             forms: HashMap::new(),
             images: std::mem::take(&mut self.images),
-        };
-        // Inline images by the copies hayro's draws share (alive as long as `draws`): one digest
-        // for the uses of an inline image in a form drawn many times.
-        let mut inline = HashMap::new();
-        let uses = draws.iter().map(|draw| reader.image_use(draw, &mut inline)).collect::<Result<Vec<_>, _>>();
+        }
+    }
+
+    fn keep(&mut self, reader: Reader<'_, '_>) {
         self.checked = reader.checked;
         self.object_streams = reader.object_streams;
         self.digests = reader.digests;
         self.images = reader.images;
-        uses
     }
 }
 

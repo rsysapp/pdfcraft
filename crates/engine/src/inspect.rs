@@ -13,6 +13,11 @@
 //!   must agree with `pdfcraft_cos` on the page count and each page's annotation count; a glyph
 //!   without text, an image hayro draws that `pdfcraft_cos` does not read as an image, an
 //!   interpreter warning or a rebuilt cross-reference table is an error;
+//! - the two read one document, checked: every object hayro reads (opening the file and drawing
+//!   each page) must be where `pdfcraft_cos`'s cross-reference data puts it and pass the same
+//!   checks, every stream's data must be the same bytes, each page must be the same object, and
+//!   its content as hayro decoded and joined it must be what `pdfcraft_cos` decoded; any
+//!   difference is an error;
 //! - an appended update must leave every base page's content and resources as they were (edit
 //!   mode never writes page content there); a rewrite is accepted only as an applied redaction,
 //!   checked visually (every changed pixel lies inside a uniformly filled black rectangle), glyph
@@ -462,6 +467,8 @@ fn read_side(bytes: &[u8], against: Option<(&[u8], &Structure, bool)>, placement
         Err(ContentOpenError::Encrypted) => return Err(Fail::Encrypted),
         Err(ContentOpenError::Invalid) => return Err(Fail::Read("the file could not be parsed for its content".into())),
     };
+    // What hayro read opening the file (catalog, page tree, pages) is what `pdfcraft_cos` reads.
+    known.agree(&doc, budget, hayro.opened())?;
     if hayro.page_count() != structure.pages.len() {
         return Err(Fail::Read(format!("readers disagree on the page count ({} or {})", structure.pages.len(), hayro.page_count())));
     }
@@ -478,6 +485,17 @@ fn read_side(bytes: &[u8], against: Option<(&[u8], &Structure, bool)>, placement
         let content = side.hayro.content(index);
         budget.work(&side.hayro, before)?;
         let content = content.map_err(content_failure)?;
+        // The page hayro drew is this page, its decoded content this content, and every object
+        // it read to draw it the object `pdfcraft_cos` reads.
+        if content.page != Some((page.object.num, page.object.generation)) {
+            return Err(Fail::Read(format!("readers disagree: page {number} is another object to hayro")));
+        }
+        let decoded = content.decoded.as_deref().unwrap_or_default();
+        budget.hashed(decoded.len())?;
+        if structure::sha256(&[decoded]) != page.content {
+            return Err(Fail::Read(format!("readers disagree on the content of page {number}")));
+        }
+        known.agree(&doc, budget, &content.resolved)?;
         budget.glyphs(content.glyphs.len().saturating_add(content.glyphs.chars.len()))?;
         page.glyphs = content.glyphs;
         // Where each image is drawn is where hayro's interpretation (the one the render check
@@ -876,6 +894,8 @@ fn compare_annotations(
     Ok(changes)
 }
 
+#[cfg(test)]
+mod agreement_tests;
 #[cfg(test)]
 mod placement_tests;
 #[cfg(test)]

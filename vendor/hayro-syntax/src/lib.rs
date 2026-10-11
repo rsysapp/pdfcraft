@@ -98,6 +98,8 @@ mod crypto;
 pub mod metadata;
 pub mod object;
 pub mod page;
+/// Embed build: what the parser resolved, logged per thread for a caller that checks it.
+pub mod resolved;
 pub mod transform;
 pub mod xref;
 

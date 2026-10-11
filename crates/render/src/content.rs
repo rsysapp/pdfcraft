@@ -27,6 +27,7 @@ use hayro::hayro_interpret::{
 };
 use hayro::hayro_syntax::budget::{decode_budget_exceeded, decode_spent, set_decode_budget};
 use hayro::hayro_syntax::object::{Array, Dict};
+use hayro::hayro_syntax::resolved;
 use hayro::hayro_syntax::{LoadPdfError, Pdf};
 use hayro::vello_cpu::color::palette::css::WHITE;
 use hayro::{RenderCache, RenderSettings, render_upright};
@@ -118,11 +119,64 @@ pub struct ImageDraw {
 
 /// What a page's content draws that a save inspector compares: its glyphs (the page's own
 /// content) and every image drawn (in the page's content, in form XObjects, in soft masks'
-/// groups and in tiling patterns' cells), in drawing order.
+/// groups and in tiling patterns' cells), in drawing order; and what hayro read to draw them.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PageContent {
     pub glyphs: PageGlyphs,
     pub images: Vec<ImageDraw>,
+    /// The page dictionary's object (`None`: hayro has no object number for it).
+    pub page: Option<(u32, u16)>,
+    /// The page's content streams as hayro decoded and joined them (`None`: hayro found none).
+    pub decoded: Option<Vec<u8>>,
+    /// Every object hayro read while interpreting the page.
+    pub resolved: Resolved,
+}
+
+/// Where hayro read an object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectPlace {
+    /// Its `N G obj` header at this offset in the file.
+    InFile(u64),
+    /// In an object stream, at an index.
+    InStream { stream: u32, index: u32 },
+}
+
+/// The objects hayro read through the cross-reference data, each with where it read it, and the
+/// file range of each stream's data as hayro delimited it: what another reader of the same file
+/// must agree with for the two to describe one document.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Resolved {
+    /// (number, generation) and where.
+    pub objects: Vec<((u32, u16), ObjectPlace)>,
+    /// (number, generation) and the data's (start, length) in the file.
+    pub streams: Vec<((u32, u16), (usize, usize))>,
+    /// Objects hayro read from two places, or with an object number it cannot have read.
+    pub conflicts: usize,
+}
+
+impl Resolved {
+    fn from_log(log: Option<resolved::Log>) -> Self {
+        let Some(log) = log else { return Self { conflicts: 1, ..Self::default() } };
+        let mut out = Self { conflicts: log.conflicts, ..Self::default() };
+        let id = |(num, generation): (i32, i32)| u32::try_from(num).ok().zip(u16::try_from(generation).ok());
+        for (key, place) in log.objects {
+            let place = match place {
+                resolved::Place::InFile(offset) => u64::try_from(offset).ok().map(ObjectPlace::InFile),
+                resolved::Place::InStream(stream, index) => Some(ObjectPlace::InStream { stream, index }),
+            };
+            match (id(key), place) {
+                (Some(id), Some(place)) => out.objects.push((id, place)),
+                _ => out.conflicts = out.conflicts.saturating_add(1),
+            }
+        }
+        for (key, range) in log.streams {
+            match id(key) {
+                Some(id) => out.streams.push((id, range)),
+                None => out.conflicts = out.conflicts.saturating_add(1),
+            }
+        }
+        out
+    }
 }
 
 /// Records, from hayro's interpretation, every glyph drawn with its text and its em box, and every
@@ -313,6 +367,8 @@ pub struct ContentDocument {
     /// Interpretations that ran out of their work budget.
     exhausted: Arc<AtomicUsize>,
     spent: AtomicU64,
+    /// What hayro read opening the file and its page tree.
+    opened: Resolved,
 }
 
 impl ContentDocument {
@@ -320,7 +376,16 @@ impl ContentDocument {
     /// whether or not the empty password opens it: hayro's typed decryption errors say which.
     /// `work_budget` bounds each interpretation (see the module documentation).
     pub fn open(bytes: Arc<Vec<u8>>, work_budget: u64) -> Result<Self, ContentOpenError> {
-        let opened = catch_unwind(AssertUnwindSafe(|| Pdf::new_with_password(bytes.clone(), "")));
+        resolved::open_log();
+        let opened = catch_unwind(AssertUnwindSafe(|| {
+            let pdf = Pdf::new_with_password(bytes.clone(), "");
+            if let Ok(pdf) = &pdf {
+                // The page tree is read here, inside the log.
+                let _ = pdf.pages().len();
+            }
+            pdf
+        }));
+        let read_at_open = Resolved::from_log(resolved::close_log());
         let pdf = match opened {
             Ok(Ok(pdf)) => pdf,
             Ok(Err(LoadPdfError::Decryption(_))) => return Err(ContentOpenError::Encrypted),
@@ -339,7 +404,13 @@ impl ContentDocument {
             }),
             ..RenderConfig::default().settings()
         };
-        Ok(Self { bytes, pdf, settings, warnings, exhausted, spent: AtomicU64::new(0) })
+        Ok(Self { bytes, pdf, settings, warnings, exhausted, spent: AtomicU64::new(0), opened: read_at_open })
+    }
+
+    /// What hayro read opening the file: the catalog, the page tree and the pages (see
+    /// [`Resolved`]).
+    pub fn opened(&self) -> &Resolved {
+        &self.opened
     }
 
     pub fn page_count(&self) -> usize {
@@ -414,9 +485,16 @@ impl ContentDocument {
             let cache = InterpreterCache::new();
             let mut ctx = Context::new(initial, kurbo::Rect::new(0.0, 0.0, f64::from(w), f64::from(h)), &cache, p.xref(), self.settings.clone());
             let mut device = PageDevice::new(initial.inverse(), true, false);
+            resolved::open_log();
+            let decoded = p.page_stream().map(<[u8]>::to_vec);
             interpret_page(p, &mut ctx, &mut device);
-            Some(Ok((PageContent { glyphs: device.found, images: device.images }, device.unread, device.unidentified)))
+            let read = Resolved::from_log(resolved::close_log());
+            let page = p.raw().obj_id().and_then(|id| u32::try_from(id.obj_number).ok().zip(u16::try_from(id.gen_number).ok()));
+            let content = PageContent { glyphs: device.found, images: device.images, page, decoded, resolved: read };
+            Some(Ok((content, device.unread, device.unidentified)))
         }));
+        // A panic above leaves the log open: close it.
+        let _ = resolved::close_log();
         let (content, unread, unidentified) = match extracted {
             Ok(Some(Ok(found))) => found,
             Ok(Some(Err(()))) => return Err(format!("page {number} has no usable page box").into()),
