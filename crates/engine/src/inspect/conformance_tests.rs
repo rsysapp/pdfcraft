@@ -1,13 +1,14 @@
-//! Embed build: conformance tests of unusual but valid, or malformed, content (Ruling R6b-20).
+//! Embed build: conformance tests of unusual but valid, or malformed, content.
 //!
 //! - Content hayro stops reading before its end (an operator after which it gives up) fails the
 //!   inspection: what follows would be checked by nobody, though another viewer may draw it.
-//! - Form XObjects, Type 3 glyph procedures and annotation appearances are compared by their
-//!   decoded content; in a rewrite, a difference that does not lie wholly under the redaction
-//!   boxes is a change outside redactions.
+//! - Form XObjects drawn more than once, Type 3 fonts and annotation appearances are compared as
+//!   content streams: by their decoded data where hayro decoded them, else by their encoded
+//!   data; in a rewrite, a difference that does not lie wholly under the redaction boxes is a
+//!   change outside redactions.
 //! - Every image the content draws (as `pdfcraft_cos` reads it: directly, in forms and in tiling
-//!   patterns) must be one hayro drew, unless optional content that is certainly off in the
-//!   document's default configuration hides it.
+//!   patterns) must be one hayro drew. hayro draws every optional-content layer, so content in a
+//!   layer that is off is compared like any other.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -213,9 +214,15 @@ fn an_annotation_appearance_changed_in_a_rewrite_is_a_change_outside_redactions(
     let inspection = run(&base, &changed).unwrap();
     assert!(!inspection.base_kept);
     assert_eq!(inspection.content.pages_changed_outside_redactions, 1, "{inspection:?}");
-    // The same appearance encoded otherwise is the same annotation.
+    // The same appearance encoded otherwise: no second reader decodes an appearance, so it is
+    // compared as encoded, and it changed.
     let recoded = annotated(flate_stream("/Type /XObject /Subtype /Form /BBox [0 0 60 60]", square("0 0 1").as_bytes()), WORD_BOX);
     let inspection = run(&base, &recoded).unwrap();
+    assert_eq!(inspection.annotations, AnnotationChanges { drawings: 1, removed: 1, ..AnnotationChanges::default() }, "{inspection:?}");
+    assert_eq!(inspection.content.pages_changed_outside_redactions, 1, "{inspection:?}");
+    // Written again as it was, it is the same annotation.
+    let same = annotated(appearance(&square("0 0 1")), WORD_BOX);
+    let inspection = run(&base, &same).unwrap();
     assert_eq!(inspection.annotations, AnnotationChanges::default(), "{inspection:?}");
     assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{inspection:?}");
 }
@@ -245,8 +252,10 @@ fn a_form_encoded_otherwise_with_the_same_content_is_unchanged() {
 
 #[test]
 fn a_form_whose_decoded_content_differs_outside_the_boxes_is_a_change_outside_redactions() {
-    let with_form =
-        |content: &str, word: &str| page_file("", "", &format!("/Fm Do\n{word}"), "/XObject << /Fm 5 0 R >>", &[form("0 0 100 100", content)]);
+    // Drawn twice: a change to the form changes both places.
+    let with_form = |content: &str, word: &str| {
+        page_file("", "", &format!("/Fm Do q 1 0 0 1 100 150 cm /Fm Do Q\n{word}"), "/XObject << /Fm 5 0 R >>", &[form("0 0 100 100", content)])
+    };
     let base = with_form(&text(10, 10, "Alpha"), WORD);
     // Drawing outside the form's box: the box clips it away everywhere, yet the form changed.
     let changed = with_form(&format!("{} 0 g 500 500 10 10 re f", text(10, 10, "Alpha")), WORD_BOX);
@@ -304,51 +313,39 @@ fn layered(config: &str, content: &str, image: Vec<u8>, extra: &[Vec<u8>]) -> Ve
 
 const DRAW_IMAGE: &str = "q 100 0 0 100 50 100 cm /Im1 Do Q";
 
+type LayerCase = (&'static str, &'static str, &'static str, &'static str, Vec<Vec<u8>>);
+
 #[test]
-fn an_image_in_optional_content_that_is_off_may_go_undrawn() {
+fn an_image_in_optional_content_that_is_off_is_drawn_and_compared() {
     let pixels = texture(16, 16);
     let mut changed = pixels.clone();
     changed[0] ^= 0x40;
-    let cases: [(&str, &str, &str, &str); 3] = [
-        ("marked as off", "/OFF [6 0 R]", "/OC /L BDC", ""),
-        ("off by the base state", "/BaseState /OFF", "/OC /L BDC", ""),
-        ("an image whose /OC is off", "/OFF [6 0 R]", "", "/OC 6 0 R"),
+    let membership = b"<< /Type /OCMD /OCGs [6 0 R] /P /AllOn /VE [/Not 6 0 R] >>".to_vec();
+    // (case, configuration, marked content around the image, the image's /OC, extra objects)
+    let cases: [LayerCase; 6] = [
+        ("marked as off", "/OFF [6 0 R]", "/OC /L BDC", "", vec![]),
+        ("off by the base state", "/BaseState /OFF", "/OC /L BDC", "", vec![]),
+        ("an image whose /OC is off", "/OFF [6 0 R]", "", "/OC 6 0 R", vec![]),
+        // Readers disagree on these: hayro alone hid them before it drew every layer.
+        ("a group named by a tag other than /OC", "/OFF [6 0 R]", "/Span /L BDC", "", vec![]),
+        ("a membership dictionary with a visibility expression", "/OFF [6 0 R]", "/OC /M BDC", "", vec![membership]),
+        ("a group with an automatic state", "/OFF [6 0 R] /AS [<< /Event /View /OCGs [6 0 R] /Category [/View] >>]", "/OC /L BDC", "", vec![]),
     ];
-    for (case, config, begin, oc) in cases {
+    for (case, config, begin, oc, extra) in cases {
         let (open, close) = if begin.is_empty() { ("", "") } else { (begin, "EMC") };
-        let file = |pixels: &[u8], word: &str| layered(config, &format!("{open} {DRAW_IMAGE} {close}\n{word}"), grey(16, 16, pixels, oc), &[]);
+        let file = |pixels: &[u8], word: &str| layered(config, &format!("{open} {DRAW_IMAGE} {close}\n{word}"), grey(16, 16, pixels, oc), &extra);
         let base = file(&pixels, WORD);
         let inspection = run(&base, &base).unwrap_or_else(|error| panic!("{case}: {error:?}"));
         assert_eq!(inspection.content, ContentChanges::default(), "{case}");
-        // Hidden in every viewer that shows the default configuration: not compared.
+        // A viewer's Layers panel shows it: compared like any image.
         let inspection = run(&base, &file(&changed, WORD_BOX)).unwrap_or_else(|error| panic!("{case}: {error:?}"));
-        assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{case}: {inspection:?}");
+        assert_eq!(inspection.content.pages_changed_outside_redactions, 1, "{case}: {inspection:?}");
     }
 }
 
 #[test]
 fn an_image_the_content_draws_that_hayro_does_not_is_refused() {
     let pixels = texture(16, 16);
-    let mut changed = pixels.clone();
-    changed[0] ^= 0x40;
-    // hayro hides each of these; a viewer following the standard shows it.
-    let membership = b"<< /Type /OCMD /OCGs [6 0 R] /P /AllOn /VE [/Not 6 0 R] >>".to_vec();
-    let cases: [(&str, &str, &str, Vec<Vec<u8>>); 3] = [
-        // Marked content tagged other than /OC is not optional content.
-        ("a group named by a tag other than /OC", "/OFF [6 0 R]", "/Span /L BDC", vec![]),
-        // A visibility expression decides over /OCGs and /P: shown.
-        ("a membership dictionary with a visibility expression", "/OFF [6 0 R]", "/OC /M BDC", vec![membership]),
-        // A group an automatic state may switch on is not certainly off.
-        ("a group with an automatic state", "/OFF [6 0 R] /AS [<< /Event /View /OCGs [6 0 R] /Category [/View] >>]", "/OC /L BDC", vec![]),
-    ];
-    for (case, config, begin, extra) in cases {
-        let base = layered(config, &format!("{DRAW_IMAGE}\n{WORD}"), grey(16, 16, &pixels, ""), &extra);
-        let edited = layered(config, &format!("{begin} {DRAW_IMAGE} EMC\n{WORD_BOX}"), grey(16, 16, &changed, ""), &extra);
-        let message = edited_error(run(&base, &edited));
-        assert!(message.contains("did not draw every use of image"), "{case}: {message}");
-        // As a base, the same file has no answer either.
-        assert!(matches!(run(&edited, &edited), Err(InspectError::Base(_))), "{case}");
-    }
     // An image in a tiling pattern's cell that hayro never paints (nothing is filled with it).
     let pattern = stream(
         "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 10 10] /XStep 10 /YStep 10 /Resources << /XObject << /Im 5 0 R >> >>",

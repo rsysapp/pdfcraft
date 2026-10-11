@@ -1,14 +1,14 @@
-//! Embed build: which glyphs of a page are still there after an edit. A glyph is its text and its
-//! place: an edited glyph is the base glyph with the same text whose em box lies within
-//! [`POSITION_TOLERANCE`] on every side. Glyphs are paired one to one (a maximum matching, so a
+//! Embed build: which glyphs of a page are still there after an edit. A glyph is its name and its
+//! place: an edited glyph is the base glyph with the same name (its text, or for a glyph without
+//! a Unicode value its font and glyph ID) whose em box lies within [`POSITION_TOLERANCE`] on every
+//! side. Glyphs are paired one to one (a maximum matching, so a
 //! glyph drawn twice at one place pairs twice), with no alignment by reading order: what is left
 //! over in the base was removed, what is left over in the edited page was added. A space drawn
 //! as a glyph counts like any other glyph.
 
 use std::collections::HashMap;
 
-use pdfcraft_render::content::PageGlyphs;
-
+use super::structure::Glyphs;
 use super::{Budget, Fail};
 
 /// How far (PDF points) an edited glyph's em box may lie from the base glyph's on each side. A
@@ -52,7 +52,7 @@ fn distance(a: [f32; 4], b: [f32; 4]) -> f32 {
 }
 
 /// Pair the glyphs of `edited` with those of `base`.
-pub(crate) fn pair(base: &PageGlyphs, edited: &PageGlyphs, budget: &mut Budget) -> Result<Pairing, Fail> {
+pub(crate) fn pair(base: &Glyphs, edited: &Glyphs, budget: &mut Budget) -> Result<Pairing, Fail> {
     // Base glyphs by the 1-point cell of their centre: a glyph within the tolerance of another
     // has its centre within half a point, so in the same or a neighbouring cell.
     let mut cells: HashMap<(i64, i64), Vec<u32>> = HashMap::new();
@@ -178,11 +178,23 @@ mod tests {
     use super::*;
     use crate::inspect::Limits;
 
-    fn glyphs(list: &[(&str, f32)]) -> PageGlyphs {
-        let mut out = PageGlyphs::default();
+    /// Glyphs at `x` named by text, or, written `#n` (font A) or `%n` (font B), without text: by
+    /// font and glyph ID `n`.
+    fn glyphs(list: &[(&str, f32)]) -> Glyphs {
+        let mut out = Glyphs::default();
         for (text, x) in list {
-            out.chars.extend(text.chars());
-            out.glyphs.push((out.chars.len() as u32, [*x, 100.0, x + 6.0, 112.0]));
+            let font = match text.chars().next() {
+                Some('#') => Some([1u8; 32]),
+                Some('%') => Some([2u8; 32]),
+                _ => None,
+            };
+            match font {
+                Some(font) => {
+                    out.unnamed.insert(out.page.glyphs.len() as u32, (font, text[1..].parse().unwrap()));
+                }
+                None => out.page.chars.extend(text.chars()),
+            }
+            out.page.glyphs.push((out.page.chars.len() as u32, [*x, 100.0, x + 6.0, 112.0]));
         }
         out
     }
@@ -205,6 +217,19 @@ mod tests {
         assert_eq!(run(&[("a", 10.0)], &[("e", 10.0)]), (vec![0], vec![0]));
         // A space is a glyph.
         assert_eq!(run(&[("1", 10.0), (" ", 16.0), ("0", 22.0)], &[("1", 10.0), ("0", 22.0)]), (vec![1], vec![]));
+    }
+
+    #[test]
+    fn glyphs_without_text_pair_by_font_and_glyph() {
+        // The same glyph of the same font at the same place.
+        assert_eq!(run(&[("#7", 10.0), ("#8", 16.0)], &[("#7", 10.0), ("#8", 16.2)]), (vec![], vec![]));
+        // Another glyph of the font, or the same glyph ID of another font, is another glyph.
+        assert_eq!(run(&[("#7", 10.0)], &[("#9", 10.0)]), (vec![0], vec![0]));
+        assert_eq!(run(&[("#7", 10.0)], &[("%7", 10.0)]), (vec![0], vec![0]));
+        // A glyph without text is never one with text, even an empty one.
+        assert_eq!(run(&[("#7", 10.0)], &[("", 10.0)]), (vec![0], vec![0]));
+        // Removed between named glyphs.
+        assert_eq!(run(&[("a", 10.0), ("#7", 16.0), ("b", 22.0)], &[("a", 10.0), ("b", 22.0)]), (vec![1], vec![]));
     }
 
     #[test]

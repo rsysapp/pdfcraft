@@ -1,10 +1,12 @@
 //! Embed build: what a save inspector reads through hayro: the page count, each page's annotation
 //! count, the glyphs and images its content draws (page content only, see [`PageContent`]) and an
-//! upright render of its content (no annotations, `/Rotate` ignored). Every answer is certain or
-//! an error: a glyph that gives no text, an image that cannot be identified, an interpreter
-//! warning (an unsupported font, an image that does not decode) or a renderer panic fails the call
-//! instead of being skipped, and [`ContentDocument::repaired`] says whether the parser had to
-//! rebuild the cross-reference data.
+//! upright render of its content (no annotations, `/Rotate` ignored). Every optional-content
+//! layer is drawn, whatever the document's configuration says: which layers show is a viewer's
+//! choice, and an inspection must see all of the content. Every answer is certain or an error: a
+//! glyph that can be identified neither by its text nor by its font and glyph, an image that
+//! cannot be identified, an interpreter warning (an unsupported font, an image that does not
+//! decode) or a renderer panic fails the call instead of being skipped, and
+//! [`ContentDocument::repaired`] says whether the parser had to rebuild the cross-reference data.
 //!
 //! Work is bounded without a clock: each interpretation (a page's text, a page's render) may do at
 //! most the work budget given to [`ContentDocument::open`] (hayro's `work_budget`: operators,
@@ -63,13 +65,19 @@ impl From<String> for ContentError {
 /// twice): each glyph's text (its Unicode value: one character, several for a ligature, none
 /// when the font maps it to an empty string; whitespace and control characters included, since a
 /// drawn space is a drawn glyph) and its em box in the page's user space (PDF points): the
-/// advance by the em square (descender −200 to ascender 800 of 1,000), as the font places it.
+/// advance by the em square (descender −200 to ascender 800 of 1,000), as the font places it. A
+/// glyph without a Unicode value has no characters, and is listed in `unnamed` by its font and
+/// glyph instead.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PageGlyphs {
     /// Every glyph's characters, one after the other.
     pub chars: Vec<char>,
     /// Per glyph: where its characters end in `chars`, and its box `[x0, y0, x1, y1]`.
     pub glyphs: Vec<(u32, [f32; 4])>,
+    /// The glyphs without a Unicode value, in order: (index in `glyphs`, the font dictionary's
+    /// object (number, generation), the glyph's ID in the font; for a Type 3 font, the code that
+    /// selects its procedure).
+    pub unnamed: Vec<(u32, (u32, u16), u32)>,
 }
 
 impl PageGlyphs {
@@ -327,13 +335,21 @@ impl<'a> Device<'a> for PageDevice<'a> {
         if !self.with_glyphs {
             return;
         }
-        let Some(unicode) = glyph.as_unicode() else {
-            self.unread = self.unread.saturating_add(1);
-            return;
-        };
-        let text = match unicode {
-            hayro::hayro_interpret::hayro_cmap::BfString::Char(c) => c.to_string(),
-            hayro::hayro_interpret::hayro_cmap::BfString::String(s) => s,
+        // A glyph without a Unicode value is identified by its font and glyph instead (a font
+        // with no object cannot be named: the glyph is not read).
+        let (text, unnamed) = match glyph.as_unicode() {
+            Some(hayro::hayro_interpret::hayro_cmap::BfString::Char(c)) => (c.to_string(), None),
+            Some(hayro::hayro_interpret::hayro_cmap::BfString::String(s)) => (s, None),
+            None => match glyph
+                .identity()
+                .and_then(|(font, id)| u32::try_from(font.obj_number).ok().zip(u16::try_from(font.gen_number).ok()).map(|f| (f, id)))
+            {
+                Some(identity) => (String::new(), Some(identity)),
+                None => {
+                    self.unread = self.unread.saturating_add(1);
+                    return;
+                }
+            },
         };
         // Glyph space uses 1,000 units per em; the em box spans the advance by −200…800, as the
         // text extraction places glyphs (`text::TextDevice`). Without an advance, the outline's
@@ -351,6 +367,9 @@ impl<'a> Device<'a> for PageDevice<'a> {
         if !(b.x0.is_finite() && b.y0.is_finite() && b.x1.is_finite() && b.y1.is_finite()) || b.width() > 10_000.0 || b.height() > 10_000.0 {
             self.unread = self.unread.saturating_add(1);
             return;
+        }
+        if let Some((font, id)) = unnamed {
+            self.found.unnamed.push((u32::try_from(self.found.glyphs.len()).unwrap_or(u32::MAX), font, id));
         }
         self.found.chars.extend(text.chars());
         let end = u32::try_from(self.found.chars.len()).unwrap_or(u32::MAX);
@@ -445,6 +464,8 @@ impl ContentDocument {
         let settings = InterpreterSettings {
             // Page content only: annotations are compared object by object, not drawn.
             render_annotations: false,
+            // Every layer: content a viewer hides by default is still content.
+            all_layers_visible: true,
             work_budget,
             warning_sink: Arc::new(move |warning| {
                 let counter = if matches!(warning, InterpreterWarning::WorkBudgetExceeded) { &budget_counter } else { &counter };
@@ -516,7 +537,8 @@ impl ContentDocument {
     }
 
     /// The glyphs and images the page draws (see [`PageContent`]), from one interpretation.
-    /// Fails when a drawn glyph gives no text (no Unicode mapping) or no usable box, when a drawn
+    /// Fails when a drawn glyph gives neither text (a Unicode mapping) nor a font object to name it
+    /// by, or no usable box, when a drawn
     /// image or form cannot be identified, when hayro stops reading a content stream before its
     /// end (an operator after which it gives up, data it cannot parse) or cannot decode one, on an
     /// interpreter warning, on a panic, when the parser had to rebuild the cross-reference data,
@@ -553,7 +575,7 @@ impl ContentDocument {
         };
         self.finish(number, before)?;
         if unread > 0 {
-            return Err(format!("page {number}: {unread} glyph(s) have no text").into());
+            return Err(format!("page {number}: {unread} glyph(s) have neither text nor a font object to name them by, or no usable box").into());
         }
         if unidentified > 0 {
             return Err(format!("page {number}: {unidentified} image(s) or form(s) cannot be identified").into());

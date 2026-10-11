@@ -11,29 +11,37 @@
 //! - hayro (through `pdfcraft_render::content`) only interprets page content (each glyph, image
 //!   and form it draws, and where: one interpretation, the one the render shows) and renders, and
 //!   must agree with `pdfcraft_cos` on the page count and each page's annotation count; a glyph
-//!   without text, an image hayro draws that `pdfcraft_cos` does not read as an image, an
-//!   interpreter warning or a rebuilt cross-reference table is an error;
+//!   named neither by its text nor by its font and glyph, an image hayro draws that
+//!   `pdfcraft_cos` does not read as an image, an interpreter warning or a rebuilt cross-reference
+//!   table is an error;
+//! - hayro interprets every optional-content layer as visible, whatever the document's
+//!   configuration says: which layers show is each viewer's choice (a Layers panel shows hidden
+//!   ones), and readers disagree on what marked content hides, so text, images and pixels are
+//!   compared in every layer;
 //! - hayro reads every content stream it interprets to its end: one it stops reading early (an
 //!   operator after which it gives up, data it cannot parse) or cannot decode is an error, since
 //!   what follows would be checked by nothing; and it draws everything the content draws as
 //!   `pdfcraft_cos` reads it (every image, directly, in forms and in tiling patterns' cells, and
-//!   every form), except optional content that is certainly off in the document's default
-//!   configuration: anything else it leaves undrawn is an error;
+//!   every form): anything it leaves undrawn is an error;
 //! - the two read one document, checked: every object hayro reads (opening the file and drawing
 //!   each page) must be where `pdfcraft_cos`'s cross-reference data puts it and pass the same
 //!   checks, every stream's data must be the same bytes, each page must be the same object, and
 //!   its content as hayro decoded and joined it must be what `pdfcraft_cos` decoded; any
 //!   difference is an error; so is a content stream hayro interprets (a form, a pattern's cell, a
-//!   Type 3 glyph procedure) that it decoded to other data than `pdfcraft_cos` does;
+//!   Type 3 glyph procedure) that it decoded to other data than `pdfcraft_cos` does; a stream
+//!   whose `/Length` is not its data's length is read only where hayro read the same data;
+//! - streams are compared by their decoded data only where hayro decoded them and the readers
+//!   agree, everywhere else by their encoded bytes and encoding (see `structure`);
 //! - an appended update must leave every base page's content and resources as they were (edit
 //!   mode never writes page content there); a rewrite is accepted only as an applied redaction,
 //!   checked visually (every changed pixel lies inside a uniformly filled black rectangle), glyph
 //!   by glyph (a glyph is its text and its place; every removed glyph lies under a box, and none
 //!   is added), image by image at each image's own resolution (pixels outside the boxes are
 //!   the base's, or within requantisation of them for a JPEG), and content stream by content
-//!   stream: forms, Type 3 glyph procedures and annotation appearances by their decoded data (a
-//!   form or appearance that changed must lie wholly under the boxes; a glyph procedure may not
-//!   change);
+//!   stream: forms drawn more than once, Type 3 fonts with everything their glyph procedures
+//!   draw, and annotation appearances (a form or appearance that changed must lie wholly under
+//!   the boxes; a Type 3 font may not change); a form drawn exactly once is part of its page's
+//!   glyphs, images and pixels, and judged by them;
 //! - work is bounded (pages, decoded bytes, hashed bytes, rendered pixels, nesting, a deadline),
 //!   and exceeding a bound is [`InspectError::TooComplex`].
 
@@ -48,11 +56,12 @@ use pdfcraft_render::content::{ContentDocument, ContentError, ContentOpenError, 
 mod glyphs;
 mod images;
 mod jpeg;
+mod outline;
 mod structure;
 mod visual;
 
 use images::{Areas, Images};
-use structure::{Annot, Digest, PageFacts, Structure};
+use structure::{Annot, Digest, Glyphs, PageFacts, Structure};
 
 /// A longer document is refused rather than compared slowly.
 pub const MAX_PAGES: usize = 2_000;
@@ -71,6 +80,7 @@ pub struct Inspection {
     pub annotations: AnnotationChanges,
     pub text: TextChanges,
     pub content: ContentChanges,
+    pub outlines: OutlineChanges,
     /// Rewrites only (empty for appended updates): the applied redaction boxes that explain the
     /// changes, as (page number in the edited file, from 1; rectangle `[x0, y0, x1, y1]` in that
     /// page's user space, PDF points). Boxes that overlap (the line boxes of one mark) are one
@@ -115,18 +125,21 @@ pub struct AnnotationChanges {
     /// renumbers objects), a base annotation whose dictionary is no longer on its page.
     pub removed: u32,
     /// Appended updates: base annotations (by object identity) whose dictionary or appearance
-    /// (by its decoded content) changed, or that moved to another page. (A rewrite reports these
-    /// as removed and added.)
+    /// (by its encoded data and encoding) changed, or that moved to another page. (A rewrite
+    /// reports these as removed and added.)
     pub changed: u32,
     /// Rewrites: base `Redact` marks gone from a page where their area is now uniformly filled.
     pub redactions_applied: u32,
 }
 
-/// Among pages present in both files, glyph by glyph: a glyph is its text and its place (its em
-/// box, within half a point on every side), and glyphs drawn as spaces count like any other.
-/// Pages where a base glyph has no edited glyph with the same text at the same place (text
-/// removed); pages where an edited glyph has no base glyph with the same text at the same place
-/// (text added: moved or new text). A redaction removes text and adds none.
+/// Among pages present in both files, glyph by glyph: a glyph is its name and its place (its em
+/// box, within half a point on every side), and glyphs drawn as spaces count like any other. A
+/// glyph's name is its text, or for a glyph without a Unicode value its font (the font
+/// dictionary, by its content) and its glyph ID in the font. Glyphs in every optional-content
+/// layer count, shown by default or not. Pages where a base glyph has no edited glyph with the
+/// same name at the same place (text removed); pages where an edited glyph has no base glyph with
+/// the same name at the same place (text added: moved or new text). A redaction removes text and
+/// adds none.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TextChanges {
     pub pages_with_text_removed: u32,
@@ -136,9 +149,9 @@ pub struct TextChanges {
 /// Among pages present in both files.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ContentChanges {
-    /// Pages that lost an image (drawn directly, inside a form XObject, or inline). Appended
-    /// updates compare images by a hash of each one's encoded stream (a cleared image is a new
-    /// one). Rewrites compare each image placement where hayro's interpreter drew it (also in soft
+    /// Pages that lost an image (drawn directly, inside a form XObject, or inline; in any
+    /// optional-content layer). Appended updates compare images by a hash of each one's encoded
+    /// stream (a cleared image is a new one). Rewrites compare each image placement where hayro's interpreter drew it (also in soft
     /// masks' groups; an image in a tiling pattern's cell by its hash alone): a base image gone,
     /// or replaced at its place by one whose pixels differ under a redaction area (an image
     /// redacted in place).
@@ -150,9 +163,10 @@ pub struct ContentChanges {
     pub pages_with_content_removed: u32,
     /// Appended updates only (0 for rewrites): pages whose content streams, resources or other
     /// page-dictionary entries (all but `/Rotate` and `/Annots`) differ from the base page's, or
-    /// every page present in both when the document's layer configuration changed. Forms and
-    /// Type 3 glyph procedures in the resources are compared by their decoded content: one
-    /// written again with another encoding is not a change.
+    /// every page present in both when the document's layer configuration changed. A content
+    /// stream hayro decoded (a form, a pattern's cell, a Type 3 glyph procedure it drew) is
+    /// compared by its decoded data: one written again with another encoding is not a change;
+    /// every other stream by its encoded data.
     pub pages_with_content_changed: u32,
     /// Rewrites only (0 for appended updates): pages whose content changed anywhere but inside
     /// the editor's redaction boxes: opaque, uniformly filled rectangles in the redaction fill
@@ -167,15 +181,40 @@ pub struct ContentChanges {
     ///   interpreter drew it, and all of it is compared, whatever a clip hides;
     /// - an image drawn in a tiling pattern's cell added, removed or changed at all;
     /// - a form XObject drawn (directly, in forms or tiling patterns' cells, or as a soft mask's
-    ///   group; compared by its dictionary and decoded content, not its encoding or resources)
-    ///   added, removed or changed, unless its `/BBox` lies wholly under the boxes
-    ///   everywhere hayro drew it on the page (never for a form drawn in a pattern's cell, or one
-    ///   hayro did not draw);
-    /// - a glyph procedure of a Type 3 font in the resources the content is drawn with added,
-    ///   removed or changed (by its decoded content);
-    /// - an annotation whose appearance alone changed (by its decoded content), unless its
-    ///   `/Rect`, before and after, lies wholly under the boxes.
+    ///   group; compared by its dictionary and data, not its resources, and by its decoded data
+    ///   where hayro decoded it, so not by its encoding) added, removed or changed, unless its
+    ///   `/BBox` lies wholly under the boxes everywhere hayro drew it on the page (never for a
+    ///   form drawn in a pattern's cell, or one hayro did not draw). A form drawn exactly once in
+    ///   the file (on one page, at one place, directly or in forms) is not compared this way: what
+    ///   it draws is part of its page's glyphs, images and pixels, compared as above;
+    /// - a Type 3 font in the resources the content is drawn with added, removed or changed: its
+    ///   dictionary, its glyph procedures, and every resource they name (forms, images, nested
+    ///   Type 3 fonts, …, as they are looked up when the glyphs are drawn), recursively;
+    /// - an annotation whose appearance alone changed (by its encoded data: no second reader
+    ///   decodes it), unless its `/Rect`, before and after, lies wholly under the boxes;
+    /// - every page, when the document's layer configuration (`/OCProperties`) changed: which
+    ///   layers a viewer shows by default is not a redaction.
     pub pages_changed_outside_redactions: u32,
+}
+
+/// The document outline (bookmarks), entry by entry. Entries are read depth first and paired in
+/// that order by their depth and title; an entry whose title alone changed pairs with the base
+/// entry at its place among the unpaired ones. Two paired entries must agree in everything else
+/// (colour, style, any action other than going to a destination in the file), and an added entry
+/// may have no such action, or the inspection fails: no fact here reports them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OutlineChanges {
+    /// Paired entries whose title differs.
+    pub titles_changed: u32,
+    /// Paired entries whose destination differs: it goes to another page number (in its own file:
+    /// deleting or moving a page renumbers the pages after it, so destinations that follow a
+    /// page delete or move count here), to no page any more (an editor drops the destinations of
+    /// a deleted page), to another view of its page, or anywhere else another way.
+    pub destinations_changed: u32,
+    /// Edited entries paired with no base entry.
+    pub added: u32,
+    /// Base entries paired with no edited entry.
+    pub removed: u32,
 }
 
 /// Why a comparison has no answer. The host refuses the edited file on every one of them.
@@ -451,6 +490,7 @@ fn compare(base: &[u8], edited: &[u8], limits: Limits) -> Result<Inspection, Ins
         return Err(InspectError::Edited(format!("the document's /{key} changed, which this comparison does not report")));
     }
     let mut inspection = Inspection { base_kept, ..Inspection::default() };
+    inspection.outlines = outline::compare(&before.structure.outline, &after.structure.outline, &mut budget).map_err(|fail| fail.of(Role::Edited))?;
     let pairs =
         match_pages(&before.structure.pages, &after.structure.pages, &mut inspection.pages, &mut budget).map_err(|fail| fail.of(Role::Edited))?;
     // The document's layer configuration decides what every page shows.
@@ -465,7 +505,8 @@ fn compare(base: &[u8], edited: &[u8], limits: Limits) -> Result<Inspection, Ins
 
 /// Read one file. `against` is the base (bytes, structure, whether `bytes` starts with it) when
 /// reading the edited file: its cross-reference chain is checked against the base's. `placements`
-/// keeps where each image was drawn.
+/// keeps where each image and form was drawn, and takes out the forms drawn once (a rewrite's
+/// page rules judge them).
 fn read_side(bytes: &[u8], against: Option<(&[u8], &Structure, bool)>, placements: bool, budget: &mut Budget) -> Result<Side, Fail> {
     let shared = Arc::new(bytes.to_vec());
     let doc = match catch_unwind(AssertUnwindSafe(|| Document::open(shared.clone()))) {
@@ -480,22 +521,48 @@ fn read_side(bytes: &[u8], against: Option<(&[u8], &Structure, bool)>, placement
     if let Some(repair) = doc.repair_log().first() {
         return Err(Fail::Read(format!("the file is damaged: {repair}")));
     }
-    let (structure, mut known) = structure::read(&doc, budget)?;
-    if let Some((base_bytes, base, base_kept)) = against {
-        structure::check_chain(&structure.sections, base_bytes.len(), &base.sections, base_kept)?;
-    }
     let hayro = match ContentDocument::open(shared.clone(), budget.limits.page_work) {
         Ok(hayro) => hayro,
         Err(ContentOpenError::Encrypted) => return Err(Fail::Encrypted),
         Err(ContentOpenError::Invalid) => return Err(Fail::Read("the file could not be parsed for its content".into())),
     };
+    if hayro.page_count() > MAX_PAGES {
+        return Err(Fail::TooComplex);
+    }
+    // hayro reads every page first: how `pdfcraft_cos`'s structure keys a content stream depends
+    // on whether hayro decoded it (see `structure`). What it decoded is kept as digests only.
+    let mut contents = Vec::with_capacity(hayro.page_count());
+    let mut decoded: HashMap<ObjRef, Digest> = HashMap::new();
+    for index in 0..hayro.page_count() {
+        budget.time()?;
+        let before = hayro.work_spent();
+        let content = hayro.content(index);
+        budget.work(&hayro, before)?;
+        let mut content = content.map_err(content_failure)?;
+        for ((num, generation), data) in std::mem::take(&mut content.resolved.content) {
+            budget.hashed(data.len())?;
+            let r = ObjRef::new(num, generation);
+            let digest = structure::sha256(&[&data]);
+            if *decoded.entry(r).or_insert(digest) != digest {
+                return Err(Fail::Read(format!("readers disagree: hayro decoded content stream {r} two ways")));
+            }
+        }
+        let page_data = content.decoded.take().unwrap_or_default();
+        budget.hashed(page_data.len())?;
+        budget.glyphs(content.glyphs.len().saturating_add(content.glyphs.chars.len()))?;
+        contents.push((content, structure::sha256(&[&page_data])));
+    }
+    let (structure, mut known) = structure::read(&doc, budget, Arc::new(decoded))?;
+    if let Some((base_bytes, base, base_kept)) = against {
+        structure::check_chain(&structure.sections, base_bytes.len(), &base.sections, base_kept)?;
+    }
     // What hayro read opening the file (catalog, page tree, pages) is what `pdfcraft_cos` reads.
     known.agree(&doc, budget, hayro.opened())?;
     if hayro.page_count() != structure.pages.len() {
         return Err(Fail::Read(format!("readers disagree on the page count ({} or {})", structure.pages.len(), hayro.page_count())));
     }
     let mut side = Side { structure, hayro, images: Images::new(shared) };
-    for (index, page) in side.structure.pages.iter_mut().enumerate() {
+    for (index, (page, (content, page_data))) in side.structure.pages.iter_mut().zip(contents).enumerate() {
         budget.time()?;
         let number = index.saturating_add(1);
         if side.hayro.annotation_count(index) != Some(page.annots_in_array) {
@@ -503,33 +570,40 @@ fn read_side(bytes: &[u8], against: Option<(&[u8], &Structure, bool)>, placement
         }
         page.size = side.hayro.upright_size(index).ok_or_else(|| Fail::Read(format!("page {number} could not be read")))?;
         budget.content(page.interpreted)?;
-        let before = side.hayro.work_spent();
-        let content = side.hayro.content(index);
-        budget.work(&side.hayro, before)?;
-        let content = content.map_err(content_failure)?;
         // The page hayro drew is this page, its decoded content this content, and every object
         // it read to draw it the object `pdfcraft_cos` reads.
         if content.page != Some((page.object.num, page.object.generation)) {
             return Err(Fail::Read(format!("readers disagree: page {number} is another object to hayro")));
         }
-        let decoded = content.decoded.as_deref().unwrap_or_default();
-        budget.hashed(decoded.len())?;
-        if structure::sha256(&[decoded]) != page.content {
+        if page_data != page.content {
             return Err(Fail::Read(format!("readers disagree on the content of page {number}")));
         }
         known.agree(&doc, budget, &content.resolved)?;
-        // Every image and form the content draws (as `pdfcraft_cos` reads it) is one hayro drew,
-        // unless optional content that is off hides it.
+        // Every image and form the content draws (as `pdfcraft_cos` reads it) is one hayro drew.
         structure::check_drawn(page, &content, number)?;
-        budget.glyphs(content.glyphs.len().saturating_add(content.glyphs.chars.len()))?;
-        page.glyphs = content.glyphs;
+        // A glyph without text is named by its font's content, which a rewrite does not renumber.
+        let mut unnamed = HashMap::with_capacity(content.glyphs.unnamed.len());
+        for (glyph, (num, generation), id) in &content.glyphs.unnamed {
+            let font = known.font_digest(&doc, budget, ObjRef::new(*num, *generation))?;
+            unnamed.insert(*glyph, (font, *id));
+        }
         // Where each image is drawn is where hayro's interpretation (the one the render check
         // sees) drew it; `pdfcraft_cos` says which image it is.
         if placements {
             page.image_uses = known.image_uses(&doc, budget, &content.images)?;
             page.form_draws = content.forms;
         }
+        page.glyphs = Glyphs { page: content.glyphs, unnamed };
         page.fingerprint = structure::fingerprint(page);
+    }
+    // Every content stream hayro decoded is one `pdfcraft_cos` decodes alike, and every stream
+    // whose /Length is wrong one hayro read as the same data.
+    known.agree_decoded(&doc, budget)?;
+    if let Some(stream) = known.unconfirmed_length() {
+        return Err(Fail::Read(format!("stream {stream} does not have the length it declares")));
+    }
+    if placements {
+        structure::retain_shared_forms(&mut side.structure.pages);
     }
     drop(doc);
     if side.hayro.repaired() {
@@ -764,13 +838,15 @@ fn compare_pages(
                 gained_image = images.added;
                 outside |= images.outside;
             }
-            // Content streams by their decoded data: forms where hayro drew them, Type 3 glyph
-            // procedures (which draw unclipped, wherever the glyph is) and annotations'
+            // Content streams: forms drawn more than once where hayro drew them, Type 3 fonts
+            // (whose procedures draw unclipped, wherever the glyph is) and annotations'
             // appearances by their rectangle.
             outside |= !glyphs_inside
                 || !forms_under(b, e, &mut areas, budget).map_err(|fail| fail.of(Role::Edited))?
                 || b.type3 != e.type3
-                || !appearances_under(b, e, &mut areas, budget).map_err(|fail| fail.of(Role::Edited))?;
+                || !appearances_under(b, e, &mut areas, budget).map_err(|fail| fail.of(Role::Edited))?
+                // Which layers show by default changed: not a redaction, whatever the boxes.
+                || layers_changed;
             if outside {
                 counts.outside_redactions += 1;
             } else {
@@ -807,12 +883,13 @@ fn compare_pages(
 /// Whether the forms the base page draws and the edited page draws differ only under the areas:
 /// each form (by its key, see [`PageFacts::forms`]) the one page draws more often than the other
 /// must lie wholly under the areas, by its `/BBox` everywhere hayro drew it on that page. A form
-/// hayro did not draw on the page (in a tiling pattern's cell, or hidden) is never under them.
+/// hayro did not draw on the page (in a tiling pattern's cell) is never under them. Forms drawn
+/// once in their file are not among them (see `structure::retain_shared_forms`).
 fn forms_under(base: &PageFacts, edited: &PageFacts, areas: &mut Areas, budget: &mut Budget) -> Result<bool, Fail> {
     let tally = |page: &PageFacts| {
         let mut counts: BTreeMap<Digest, usize> = BTreeMap::new();
-        for (_, key) in &page.forms {
-            let count = counts.entry(*key).or_default();
+        for form in &page.forms {
+            let count = counts.entry(form.key).or_default();
             *count = count.saturating_add(1);
         }
         counts
@@ -826,7 +903,7 @@ fn forms_under(base: &PageFacts, edited: &PageFacts, areas: &mut Areas, budget: 
             continue;
         }
         let page = if from_base > from_edited { base } else { edited };
-        let objects: BTreeSet<ObjRef> = page.forms.iter().filter(|(_, k)| k == key).map(|(r, _)| *r).collect();
+        let objects: BTreeSet<ObjRef> = page.forms.iter().filter(|form| &form.key == key).map(|form| form.obj).collect();
         let mut placed = false;
         for draw in page.form_draws.iter().filter(|draw| objects.contains(&ObjRef::new(draw.num, draw.generation))) {
             if draw.tiled || !areas.take_rect(&draw.rect) {
@@ -842,7 +919,7 @@ fn forms_under(base: &PageFacts, edited: &PageFacts, areas: &mut Areas, budget: 
 }
 
 /// Whether the annotations of the base page and the edited page that are alike but for their
-/// appearance (compared by its decoded content) lie wholly under the areas, by `/Rect`.
+/// appearance (compared as a stream: see `structure`) lie wholly under the areas, by `/Rect`.
 fn appearances_under(base: &PageFacts, edited: &PageFacts, areas: &mut Areas, budget: &mut Budget) -> Result<bool, Fail> {
     let mut by_digest: HashMap<Digest, Vec<&Annot>> = HashMap::new();
     for annot in edited.annots.iter().filter(|annot| annot.tracked) {

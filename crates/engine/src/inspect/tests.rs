@@ -420,29 +420,66 @@ fn refuses_an_update_whose_prev_points_forwards() {
 
 // ── 2. text that cannot be read is an error, a page without text is not ────────────────────
 
-#[test]
-fn refuses_a_page_whose_glyphs_have_no_text() {
-    let base = pages_pdf(&[page(&text_line(20.0, 150.0, "Alpha"))], &[]);
-    // A CID font with Identity encoding, no font program and no ToUnicode: glyphs are drawn
-    // (by a substitute) but nothing says which characters they are.
+/// A page drawing five glyphs of a CID font with Identity encoding, no font program and no
+/// ToUnicode (drawn by a substitute; nothing says which characters they are). `font`: how the
+/// page's resources give the Type0 font, `5 0 R` or written directly; `content`: what the page
+/// draws (by default the five glyphs, 12 pt apart from x = 20).
+fn glyphs_without_text_drawing(font: &str, content: &str) -> Vec<u8> {
     let cid = b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /Unknown /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor << /Type /FontDescriptor /FontName /Unknown /Flags 4 /FontBBox [0 0 1000 1000] /ItalicAngle 0 /Ascent 800 /Descent -200 /CapHeight 700 /StemV 80 >> >>".to_vec();
     let type0 = b"<< /Type /Font /Subtype /Type0 /BaseFont /Unknown /Encoding /Identity-H /DescendantFonts [4 0 R] >>".to_vec();
-    let edited = {
-        let mut bodies = vec![
-            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
-            b"<< /Type /Pages /Kids [6 0 R] /Count 1 /MediaBox [0 0 200 300] >>".to_vec(),
-            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
-            cid,
-            type0,
-        ];
-        bodies.push(b"<< /Type /Page /Parent 2 0 R /Contents 7 0 R /Resources << /Font << /F1 3 0 R /F2 5 0 R >> >> >>".to_vec());
-        bodies.push(stream("", b"BT /F2 12 Tf 20 150 Td <0024004F0053004B0044> Tj ET"));
-        pdf(&bodies)
-    };
-    let message = edited_error(run(&base, &edited));
-    assert!(message.contains("text"), "{message}");
+    let mut bodies = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [6 0 R] /Count 1 /MediaBox [0 0 200 300] >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        cid,
+        type0,
+    ];
+    bodies.push(format!("<< /Type /Page /Parent 2 0 R /Contents 7 0 R /Resources << /Font << /F1 3 0 R /F2 {font} >> >> >>").into_bytes());
+    bodies.push(stream("", content.as_bytes()));
+    pdf(&bodies)
+}
+
+fn glyphs_without_text(font: &str) -> Vec<u8> {
+    glyphs_without_text_drawing(font, "BT /F2 12 Tf 20 150 Td <0024004F0053004B0044> Tj ET")
+}
+
+#[test]
+fn glyphs_without_text_are_named_by_their_font_and_glyph() {
+    // Each glyph is its font (the font's dictionary, by content) and its glyph ID, at its place.
+    let named = glyphs_without_text("5 0 R");
+    let inspection = run(&named, &named).unwrap();
+    assert_eq!(inspection.text, TextChanges::default());
+    // Replacing a word with them, in a rewrite: the word is removed (outside any box), and they
+    // are added.
+    let base = pages_pdf(&[page(&text_line(20.0, 150.0, "Alpha"))], &[]);
+    let inspection = run(&base, &named).unwrap();
+    assert_eq!(inspection.text, TextChanges { pages_with_text_removed: 1, pages_with_text_added: 1 });
+    assert_eq!(inspection.content.pages_changed_outside_redactions, 1);
+    // The last glyph redacted under a box (each glyph is 12 pt wide): removed there, and nothing
+    // else changed.
+    let redacted = glyphs_without_text_drawing("5 0 R", "BT /F2 12 Tf 20 150 Td <0024004F0053004B> Tj ET 0 g 67 140 30 30 re f");
+    let inspection = run(&named, &redacted).unwrap();
+    assert_eq!(inspection.text, TextChanges { pages_with_text_removed: 1, pages_with_text_added: 0 }, "{inspection:?}");
+    assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{inspection:?}");
+    assert_eq!(inspection.redaction_areas.len(), 1);
+    // Another glyph of the font in its place is not the same glyph.
+    let swapped = glyphs_without_text_drawing("5 0 R", "BT /F2 12 Tf 20 150 Td <0024004F0053004B0045> Tj ET");
+    assert_eq!(run(&named, &swapped).unwrap().text, TextChanges { pages_with_text_removed: 1, pages_with_text_added: 1 });
+    // A font written directly in the resources has no object to name its glyphs by: refused.
+    let direct = String::from_utf8(glyphs_without_text("5 0 R")).unwrap();
+    let type0 = "<< /Type /Font /Subtype /Type0 /BaseFont /Unknown /Encoding /Identity-H /DescendantFonts [4 0 R] >>";
+    let direct = pdf(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [5 0 R] /Count 1 /MediaBox [0 0 200 300] >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        direct.split("4 0 obj\n").nth(1).unwrap().split("\nendobj").next().unwrap().as_bytes().to_vec(),
+        format!("<< /Type /Page /Parent 2 0 R /Contents 6 0 R /Resources << /Font << /F1 3 0 R /F2 {type0} >> >> >>").into_bytes(),
+        stream("", b"BT /F2 12 Tf 20 150 Td <0024004F0053004B0044> Tj ET"),
+    ]);
+    let message = edited_error(run(&base, &direct));
+    assert!(message.contains("neither text nor a font object"), "{message}");
     // The same page as the base is refused too: its facts can't be established.
-    assert!(matches!(run(&edited, &edited), Err(InspectError::Base(_))));
+    assert!(matches!(run(&direct, &direct), Err(InspectError::Base(_))));
 }
 
 #[test]
