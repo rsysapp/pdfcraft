@@ -531,3 +531,225 @@ fn ancestors_and_named_marked_content_lose_their_text_too() {
     assert!(element(9).get(b"ActualText").is_none());
     assert!(element(10).get(b"ActualText").is_some());
 }
+
+// ── Embed build: the follow-up 6 audit of the redactor ──────────────────────────────────────
+
+/// Every string the document's file holds once written whole (reachable objects only), decoded
+/// streams included, as one lossy string.
+fn written_text(doc: &Document) -> String {
+    let bytes = write_full(doc, &SaveOptions::default()).unwrap();
+    let doc = Document::open(Arc::new(bytes)).unwrap();
+    let size = doc.trailer().int(b"Size").unwrap();
+    let mut out = String::new();
+    fn walk(object: &Object, out: &mut String) {
+        match object {
+            Object::String(s) => out.push_str(&String::from_utf8_lossy(&s.bytes)),
+            Object::Array(items) => items.iter().for_each(|item| walk(item, out)),
+            Object::Dict(dict) => dict.iter().for_each(|(_, value)| walk(value, out)),
+            Object::Stream(stream) => {
+                stream.dict.iter().for_each(|(_, value)| walk(value, out));
+                out.push_str(&String::from_utf8_lossy(&stream.decoded().unwrap()));
+            }
+            _ => {}
+        }
+        out.push('\n');
+    }
+    for num in 1..u32::try_from(size).unwrap() {
+        if let Ok(object) = doc.try_get(num) {
+            walk(&object, &mut out);
+        }
+    }
+    out
+}
+
+/// A font whose every glyph is 1,000 units wide (a 10 pt glyph advances 10 pt), widths object
+/// `widths`.
+fn wide_font(widths: u32) -> Vec<u8> {
+    format!("<< /Type /Font /Subtype /TrueType /BaseFont /Wide /FirstChar 32 /LastChar 126 /Widths {widths} 0 R >>").into_bytes()
+}
+
+fn wide_widths() -> Vec<u8> {
+    format!("[{}]", vec!["1000"; 95].join(" ")).into_bytes()
+}
+
+#[test]
+fn a_form_finds_its_font_through_the_page_s_resources() {
+    // A form with resources of its own but no /Font draws with the page's font, as hayro looks
+    // resources up. The redactor placed its glyphs with fallback metrics and left "J" (at x
+    // 100–110 in the real font) under the box.
+    let mut doc = pdf(vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /Font << /F2 5 0 R >> /XObject << /Fm1 7 0 R >> >> >>"
+            .to_vec(),
+        stream("", b"/Fm1 Do"),
+        wide_font(6),
+        wide_widths(),
+        stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 300 300] /Resources << /ProcSet [/PDF /Text] >>",
+            b"BT /F2 10 Tf 10 200 Td (ABCDEFGHIJ) Tj ET",
+        ),
+    ]);
+    mark(&mut doc, 0, &[[101.0, 195.0, 112.0, 212.0]], "");
+    let report = apply(&mut doc, None).unwrap();
+    assert_eq!(report.glyphs, 1, "{report:?}");
+    let written = written_text(&doc);
+    assert!(written.contains("ABCDEFGHI") && !written.contains("ABCDEFGHIJ"), "{written}");
+}
+
+#[test]
+fn a_form_finds_its_image_through_the_page_s_resources() {
+    let mut doc = pdf(vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /XObject << /Fm1 5 0 R /Im1 6 0 R >> >> >>".to_vec(),
+        stream("", b"/Fm1 Do"),
+        stream("/Type /XObject /Subtype /Form /BBox [0 0 300 300] /Resources << /ProcSet [/PDF] >>", b"q 50 0 0 50 100 100 cm /Im1 Do Q"),
+        stream("/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", b"\x80"),
+    ]);
+    mark(&mut doc, 0, &[[90.0, 90.0, 160.0, 160.0]], "");
+    let report = apply(&mut doc, None).unwrap();
+    assert_eq!(report.images_removed, 1, "{report:?}");
+}
+
+/// A Type 0 font with `encoding` (a CMap name), its glyphs 1,000 units each way.
+fn cjk_font(encoding: &str) -> Vec<u8> {
+    format!(
+        "<< /Type /Font /Subtype /Type0 /BaseFont /HeiseiMin-W3 /Encoding /{encoding} /DescendantFonts [<< /Type /Font /Subtype /CIDFontType0 \
+/BaseFont /HeiseiMin-W3 /CIDSystemInfo << /Registry (Adobe) /Ordering (Japan1) /Supplement 2 >> /DW 1000 >>] >>"
+    )
+    .into_bytes()
+}
+
+#[test]
+fn text_the_redactor_cannot_place_near_a_mark_refuses_the_redaction() {
+    // Vertical writing (and CMaps it does not read) runs glyphs where the redactor's horizontal,
+    // two-byte model does not put them: "glyph 4" at (100, 220) was left under the box.
+    for encoding in ["Identity-V", "UniJIS-UCS2-V", "90ms-RKSJ-H"] {
+        let content = b"BT /F2 10 Tf 100 250 Td <0001000200030004> Tj ET";
+        let make = || {
+            pdf(vec![
+                b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+                b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /Font << /F2 5 0 R >> >> >>".to_vec(),
+                stream("", content),
+                cjk_font(encoding),
+            ])
+        };
+        let mut doc = make();
+        mark(&mut doc, 0, &[[90.0, 212.0, 112.0, 228.0]], "");
+        assert!(matches!(apply(&mut doc, None), Err(RedactError::Residue(_))), "{encoding}");
+        // Far from the text, the mark is applied.
+        let mut doc = make();
+        mark(&mut doc, 0, &[[5.0, 5.0, 25.0, 25.0]], "");
+        assert!(apply(&mut doc, None).is_ok(), "{encoding}");
+    }
+    // The horizontal identity CMap is placed as before.
+    let mut doc = pdf(vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /Font << /F2 5 0 R >> >> >>".to_vec(),
+        stream("", b"BT /F2 10 Tf 100 250 Td <0001000200030004> Tj ET"),
+        cjk_font("Identity-H"),
+    ]);
+    mark(&mut doc, 0, &[[121.0, 245.0, 129.0, 262.0]], "");
+    assert_eq!(apply(&mut doc, None).unwrap().glyphs, 1);
+}
+
+#[test]
+fn what_a_redaction_replaced_is_not_left_in_the_resources() {
+    // A form whose text was redacted is drawn under a new name; the old name kept the original
+    // form, "SECRET" and all, reachable in the written file. Likewise a cleared or removed image.
+    let mut doc = pdf(vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> /XObject << /Fm1 7 0 R /Im1 8 0 R >> >> >>".to_vec(),
+        stream("", b"/Fm1 Do q 50 0 0 50 200 200 cm /Im1 Do Q"),
+        FONT.replace("95 0 R", "6 0 R").into_bytes(),
+        widths(),
+        stream("/Type /XObject /Subtype /Form /BBox [0 0 300 300]", b"BT /F1 10 Tf 10 100 Td (SECRET) Tj ET BT /F1 10 Tf 10 50 Td (Public) Tj ET"),
+        stream("/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", b"PIXELSECRET"),
+    ]);
+    mark(&mut doc, 0, &[[5.0, 95.0, 60.0, 112.0], [190.0, 190.0, 260.0, 260.0]], "");
+    let report = apply(&mut doc, None).unwrap();
+    assert_eq!((report.glyphs, report.images_removed), (6, 1), "{report:?}");
+    let written = written_text(&doc);
+    assert!(!written.contains("SECRET"), "{written}");
+    assert!(written.contains("Public"));
+}
+
+#[test]
+fn a_tagged_form_s_marked_content_is_cleaned_and_its_original_not_kept() {
+    // The structure tree names a form's marked content through /Stm: the element kept its text
+    // and the reference kept the original form, "SECRET" and all, in the written file.
+    let mut doc = pdf(vec![
+        b"<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 8 0 R /MarkInfo << /Marked true >> >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /StructParents 0 /Resources << /Font << /F1 5 0 R >> /XObject << /Fm1 7 0 R >> >> >>".to_vec(),
+        stream("", b"/Fm1 Do"),
+        FONT.replace("95 0 R", "6 0 R").into_bytes(),
+        widths(),
+        stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 300 300] /StructParents 1",
+            b"/P <</MCID 0>> BDC BT /F1 10 Tf 10 200 Td (SECRET) Tj ET EMC /P <</MCID 1>> BDC BT /F1 10 Tf 10 100 Td (Public) Tj ET EMC",
+        ),
+        b"<< /Type /StructTreeRoot /K [9 0 R 10 0 R] >>".to_vec(),
+        b"<< /S /P /P 8 0 R /Pg 3 0 R /ActualText (SECRET) /K << /Type /MCR /Pg 3 0 R /Stm 7 0 R /MCID 0 >> >>".to_vec(),
+        b"<< /S /P /P 8 0 R /Pg 3 0 R /ActualText (Public) /K << /Type /MCR /Pg 3 0 R /Stm 7 0 R /MCID 1 >> >>".to_vec(),
+    ]);
+    mark(&mut doc, 0, &[[5.0, 195.0, 60.0, 212.0]], "");
+    apply(&mut doc, None).unwrap();
+    let written = written_text(&doc);
+    assert!(!written.contains("SECRET"), "{written}");
+    let public = doc.get(pdfcraft_cos::ObjRef::new(10, 0)).as_dict().cloned().unwrap();
+    assert!(public.get(b"ActualText").is_some(), "untouched content keeps its tags");
+}
+
+#[test]
+fn one_mcid_on_two_pages_cleans_only_the_redacted_page_s_element() {
+    let page = |word: &str| format!("/P <</MCID 0>> BDC BT /F1 10 Tf 10 200 Td ({word}) Tj ET EMC").into_bytes();
+    let mut doc = pdf(vec![
+        b"<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 9 0 R /MarkInfo << /Marked true >> >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 5 0 R /StructParents 0 /Resources << /Font << /F1 7 0 R >> >> >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 6 0 R /StructParents 1 /Resources << /Font << /F1 7 0 R >> >> >>".to_vec(),
+        stream("", &page("SECRET")),
+        stream("", &page("Keep")),
+        FONT.replace("95 0 R", "8 0 R").into_bytes(),
+        widths(),
+        b"<< /Type /StructTreeRoot /K [10 0 R 11 0 R 12 0 R] >>".to_vec(),
+        b"<< /S /P /P 9 0 R /Pg 3 0 R /ActualText (SECRET) /K 0 >>".to_vec(),
+        b"<< /S /P /P 9 0 R /Pg 4 0 R /ActualText (Keep) /K 0 >>".to_vec(),
+        // Names no page: it may be the first page's, so it goes too.
+        b"<< /S /Figure /P 9 0 R /Alt (A SECRET figure) /K 0 >>".to_vec(),
+    ]);
+    mark(&mut doc, 0, &[[5.0, 195.0, 60.0, 212.0]], "");
+    apply(&mut doc, None).unwrap();
+    let element = |num: u32| doc.get(pdfcraft_cos::ObjRef::new(num, 0)).as_dict().cloned().unwrap();
+    assert!(element(10).get(b"ActualText").is_none());
+    assert!(element(11).get(b"ActualText").is_some(), "the other page's MCID 0 is its own");
+    assert!(element(12).get(b"Alt").is_none());
+}
+
+#[test]
+fn unbalanced_marked_content_takes_every_span_s_text_away() {
+    // An `EMC` closing nothing: which glyphs a span holds is each reader's guess, so every span
+    // of the scope, and every element of the page's marked content, loses its text.
+    let content = b"/Span <</ActualText (SECRET)>> BDC BT /F1 10 Tf 10 200 Td (SECRET) Tj ET EMC EMC /P <</MCID 0 /ActualText (Public)>> BDC BT /F1 10 Tf 10 100 Td (Public) Tj ET EMC";
+    let mut doc = pdf(vec![
+        b"<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 7 0 R /MarkInfo << /Marked true >> >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /StructParents 0 /Resources << /Font << /F1 5 0 R >> >> >>".to_vec(),
+        stream("", content),
+        FONT.replace("95 0 R", "6 0 R").into_bytes(),
+        widths(),
+        b"<< /Type /StructTreeRoot /K 8 0 R >>".to_vec(),
+        b"<< /S /P /P 7 0 R /Pg 3 0 R /ActualText (Public) /K 0 >>".to_vec(),
+    ]);
+    mark(&mut doc, 0, &[[5.0, 195.0, 60.0, 212.0]], "");
+    apply(&mut doc, None).unwrap();
+    let after = page_content(&doc);
+    assert!(!after.contains("ActualText"), "{after}");
+    let element = doc.get(pdfcraft_cos::ObjRef::new(8, 0)).as_dict().cloned().unwrap();
+    assert!(element.get(b"ActualText").is_none());
+}

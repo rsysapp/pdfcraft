@@ -319,11 +319,19 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
         }
         if changed || !out.xobjects.is_empty() {
             let mut res = resources;
-            if !out.xobjects.is_empty() {
+            if !out.xobjects.is_empty() || !out.dropped.is_empty() {
                 let mut xo = res.get(b"XObject").and_then(|x| doc.resolve(x).as_dict().cloned()).unwrap_or_default();
                 for (n, r) in &out.xobjects {
                     xo.set(n.clone(), Object::Ref(*r));
                 }
+                // Embed build: a name the redacted content no longer draws goes, or the
+                // unredacted form or image it names would stay in the file.
+                let drawn = {
+                    let ops: Vec<pdfcraft_content::Op> =
+                        out.drawn.iter().map(|name| pdfcraft_content::Op::new("Do", vec![Object::Name(name.clone())])).collect();
+                    interp::names_drawn(doc, &ops.iter().collect::<Vec<_>>(), &xo)
+                };
+                interp::forget_dropped(&mut xo, &out.dropped, &drawn);
                 res.set(b"XObject".to_vec(), Object::Dict(xo));
             }
             doc.update_dict(page.obj, |d| {
@@ -337,6 +345,8 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
             let named = tags::named_mcids(doc, &after.get(b"Resources").and_then(|r| doc.resolve(r).as_dict().cloned()).unwrap_or_default());
             let (changed_ids, empty_ids) = tags::touched(&data.join(&b'\n'), &new_data.join(&b'\n'), &named);
             report.tags += tags::clean(doc, page.obj, &changed_ids, &empty_ids)?;
+            // Embed build: and its references into the forms the redaction rewrote (R6b-47).
+            report.tags += tags::clean_forms(doc, page.obj, &out.forms)?;
         }
 
         // 2. Annotations: the marks, and whatever lies under them (with their pop-ups).

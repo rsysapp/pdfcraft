@@ -45,6 +45,9 @@ struct Gs {
     scale: f64,
     leading: f64,
     rise: f64,
+    /// Embed build: the font's glyphs cannot be placed (vertical writing, a CMap not read):
+    /// text shown with it near a region fails verification.
+    unplaceable: bool,
 }
 
 /// What processing a scope produced.
@@ -59,6 +62,61 @@ pub(crate) struct Output {
     /// Embed build: property lists named in the scope's `/Properties` whose spans' content
     /// changed: they lose the text standing for it (`spans::strip_named`, R6b-47).
     pub properties: Vec<Vec<u8>>,
+    /// Embed build: XObject names whose `Do` the redaction removed or replaced, and every name
+    /// the rewritten content still draws: a name no longer drawn leaves the resources, or the
+    /// original it names (the unredacted form or image) would stay in the file.
+    pub dropped: Vec<Vec<u8>>,
+    pub drawn: Vec<Vec<u8>>,
+    /// Embed build: forms rewritten, for the structure tree's references into them (`/Stm`).
+    pub forms: Vec<FormRewrite>,
+}
+
+/// Embed build: a form XObject the redaction rewrote into a new object.
+pub(crate) struct FormRewrite {
+    pub old: ObjRef,
+    pub new: ObjRef,
+    /// The MCIDs of its content that changed, and those left empty (see `tags::touched`).
+    pub changed: std::collections::HashSet<i64>,
+    pub empty: std::collections::HashSet<i64>,
+}
+
+/// Embed build: the XObject names `ops` draw, and those the forms they draw that have no
+/// resources of their own (and so draw with `xobjects`, the scope's) draw in turn.
+pub(crate) fn names_drawn(doc: &Document, ops: &[&Op], xobjects: &Dict) -> std::collections::HashSet<Vec<u8>> {
+    let mut drawn: std::collections::HashSet<Vec<u8>> = ops.iter().filter(|op| op.is("Do")).filter_map(|op| op.name(0).map(<[u8]>::to_vec)).collect();
+    let mut todo: Vec<(Vec<u8>, usize)> = drawn.iter().map(|name| (name.clone(), 0)).collect();
+    let mut seen: std::collections::HashSet<ObjRef> = std::collections::HashSet::new();
+    while let Some((name, depth)) = todo.pop() {
+        let Some(r) = xobjects.get(&name).and_then(Object::as_ref) else { continue };
+        if depth >= MAX_DEPTH || !seen.insert(r) {
+            continue;
+        }
+        let obj = doc.get(r);
+        let Object::Stream(form) = &*obj else { continue };
+        if form.dict.name(b"Subtype") != Some(b"Form") || form.dict.contains(b"Resources") {
+            continue;
+        }
+        let Ok(data) = form.decoded() else { continue };
+        for op in parse(&data).ops.iter().filter(|op| op.is("Do")) {
+            if let Some(inner) = op.name(0)
+                && drawn.insert(inner.to_vec())
+            {
+                todo.push((inner.to_vec(), depth + 1));
+            }
+        }
+    }
+    drawn
+}
+
+/// Embed build: `xobjects` without the `dropped` names `drawn` does not hold. Whether any went.
+pub(crate) fn forget_dropped(xobjects: &mut Dict, dropped: &[Vec<u8>], drawn: &std::collections::HashSet<Vec<u8>>) -> bool {
+    let mut gone = false;
+    for name in dropped {
+        if !drawn.contains(name) && xobjects.remove(name).is_some() {
+            gone = true;
+        }
+    }
+    gone
 }
 
 pub(crate) struct Scope<'a> {
@@ -75,6 +133,10 @@ pub(crate) struct Scope<'a> {
     fonts: HashMap<Vec<u8>, Rc<Metrics>>,
     used_names: Vec<Vec<u8>>,
     depth: usize,
+    /// Embed build: the resources of the scopes around this one (a form's page or form),
+    /// outermost first: a name missing from a form's own resources is looked up there, as hayro
+    /// does.
+    parents: Vec<Dict>,
 }
 
 impl<'a> Scope<'a> {
@@ -89,7 +151,17 @@ impl<'a> Scope<'a> {
             fonts: HashMap::new(),
             used_names: Vec::new(),
             depth: 0,
+            parents: Vec::new(),
         }
+    }
+
+    /// Embed build: resource `name` of `category`: in `own` (the scope's resources, by
+    /// category), else in the enclosing scopes', innermost first.
+    fn resource(&self, doc: &Document, own: &Dict, category: &[u8], name: &[u8]) -> Option<Object> {
+        if let Some(found) = own.get(name) {
+            return Some(found.clone());
+        }
+        self.parents.iter().rev().find_map(|parent| res_dict(doc, parent, category).get(name).cloned())
     }
 
     /// Sanitizing visits every form XObject (not only those under a region).
@@ -147,6 +219,28 @@ impl<'a> Scope<'a> {
     }
 }
 
+/// Embed build: whether the redactor cannot place a font's glyphs: a composite font written
+/// vertically (`/WMode 1`, a `-V` CMap) or with a CMap it does not read (any predefined CMap but
+/// `Identity-H`, whose codes and widths it would split and measure wrongly, or one that uses
+/// another, `/UseCMap`).
+fn unplaceable(doc: &Document, font: &Dict) -> bool {
+    if font.name(b"Subtype") != Some(b"Type0") {
+        return false;
+    }
+    match font.get(b"Encoding").map(|encoding| doc.resolve(encoding)).as_deref() {
+        Some(Object::Name(name)) => name.as_slice() != b"Identity-H",
+        Some(Object::Stream(cmap)) => {
+            let vertical = cmap.dict.get(b"WMode").and_then(|mode| doc.resolve(mode).as_int()).unwrap_or(0) != 0;
+            let data = cmap.decoded().unwrap_or_default();
+            vertical
+                || cmap.dict.contains(b"UseCMap")
+                || data.windows(7).any(|w| w == b"usecmap")
+                || data.windows(6).any(|w| w == b"/WMode") && !data.windows(8).any(|w| w == b"/WMode 0")
+        }
+        _ => true,
+    }
+}
+
 fn res_dict(doc: &Document, res: &Dict, key: &[u8]) -> Dict {
     res.get(key).map(|o| doc.resolve(o)).and_then(|o| o.as_dict().cloned()).unwrap_or_default()
 }
@@ -198,10 +292,22 @@ struct Glyph {
 pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<u8>], resources: &Dict, ctm: Matrix) -> Output {
     let mut out = Output::default();
     let fallback = Rc::new(Metrics::fallback());
-    let mut gs =
-        Gs { ctm, font: fallback.clone(), size: 0.0, char_spacing: 0.0, word_spacing: 0.0, render_mode: 0, scale: 1.0, leading: 0.0, rise: 0.0 };
+    let mut gs = Gs {
+        ctm,
+        font: fallback.clone(),
+        size: 0.0,
+        char_spacing: 0.0,
+        word_spacing: 0.0,
+        render_mode: 0,
+        scale: 1.0,
+        leading: 0.0,
+        rise: 0.0,
+        unplaceable: false,
+    };
     let mut stack: Vec<Gs> = Vec::new();
     let (mut tm, mut tlm) = (Matrix::IDENTITY, Matrix::IDENTITY);
+    // Embed build: codes of unplaceable text shown since the line was last set (see `show`).
+    let mut drift = 0.0;
     let fonts_res = res_dict(doc, resources, b"Font");
     let mut xobjects = res_dict(doc, resources, b"XObject");
     // The current path: its operators, its bounding box in user space, and whether it clips.
@@ -338,18 +444,19 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
                 b"BT" => {
                     tm = Matrix::IDENTITY;
                     tlm = Matrix::IDENTITY;
+                    drift = 0.0;
                 }
                 b"Tf" => {
                     gs.size = op.num(1).unwrap_or(gs.size);
                     if let Some(name) = op.name(0) {
+                        // Embed build: through the enclosing scopes' fonts too, as hayro looks
+                        // them up; a font whose glyphs cannot be placed is noted.
+                        let font = scope.resource(doc, &fonts_res, b"Font", name).and_then(|f| doc.resolve(&f).as_dict().cloned());
+                        gs.unplaceable = font.as_ref().is_some_and(|font| unplaceable(doc, font));
                         gs.font = match scope.fonts.get(name) {
                             Some(f) => f.clone(),
                             None => {
-                                let m = fonts_res
-                                    .get(name)
-                                    .and_then(|f| doc.resolve(f).as_dict().cloned())
-                                    .map(|d| Rc::new(Metrics::from_dict(doc, &d)))
-                                    .unwrap_or_else(|| fallback.clone());
+                                let m = font.map(|d| Rc::new(Metrics::from_dict(doc, &d))).unwrap_or_else(|| fallback.clone());
                                 scope.fonts.insert(name.to_vec(), m.clone());
                                 m
                             }
@@ -369,17 +476,20 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
                         }
                         tlm = Matrix::translate(x, y).then(&tlm);
                         tm = tlm;
+                        drift = 0.0;
                     }
                 }
                 b"Tm" => {
                     if let Some(m) = op.nums::<6>() {
                         tlm = Matrix(m);
                         tm = tlm;
+                        drift = 0.0;
                     }
                 }
                 b"T*" => {
                     tlm = Matrix::translate(0.0, -gs.leading).then(&tlm);
                     tm = tlm;
+                    drift = 0.0;
                 }
                 b"Tj" | b"TJ" | b"'" | b"\"" => {
                     if o == b"\"" {
@@ -389,12 +499,15 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
                     if matches!(o, b"'" | b"\"") {
                         tlm = Matrix::translate(0.0, -gs.leading).then(&tlm);
                         tm = tlm;
+                        drift = 0.0;
                     }
                     let items: Vec<Object> = match o {
                         b"TJ" => op.operands.first().and_then(Object::as_array).cloned().unwrap_or_default(),
                         _ => op.operands.last().cloned().into_iter().collect(),
                     };
-                    let (new_items, removed) = show(scope, &gs, &mut tm, &items);
+                    let (new_items, removed) = show(scope, &gs, &mut tm, &items, &mut drift);
+                    // Embed build: unplaceable glyphs are never removed, only reported (above).
+                    let removed = if gs.unplaceable && scope.mode == Mode::Apply { 0 } else { removed };
                     if removed == 0 {
                         ops.push(op);
                         continue;
@@ -444,6 +557,9 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
                 b"Do" => {
                     if let Some(new) = xobject(doc, scope, &op, &gs, resources, &mut xobjects, &mut out) {
                         changed = true;
+                        if let Some(name) = op.name(0) {
+                            out.dropped.push(name.to_vec());
+                        }
                         if let Some(n) = new {
                             ops.push(n);
                         }
@@ -468,6 +584,7 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
         scope.report.tags += stripped;
         out.properties = named;
     }
+    out.drawn = rewritten.iter().flat_map(|(ops, _)| ops.iter()).filter(|op| op.is("Do")).filter_map(|op| op.name(0).map(<[u8]>::to_vec)).collect();
     for (ops, changed) in rewritten {
         out.streams.push(changed.then(|| serialize_ops(&ops)));
     }
@@ -476,7 +593,8 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
 
 /// Lay out a shown string (or `TJ` array) glyph by glyph, advancing `tm`. Returns the `TJ`
 /// items with the glyphs under a region replaced by displacements, and how many were removed.
-fn show(scope: &Scope<'_>, gs: &Gs, tm: &mut Matrix, items: &[Object]) -> (Vec<Object>, usize) {
+/// `drift` (Embed build): how many codes of unplaceable text this line showed so far.
+fn show(scope: &Scope<'_>, gs: &Gs, tm: &mut Matrix, items: &[Object], drift: &mut f64) -> (Vec<Object>, usize) {
     let f = &gs.font;
     let size = gs.size;
     let mut out: Vec<Object> = Vec::new();
@@ -495,6 +613,19 @@ fn show(scope: &Scope<'_>, gs: &Gs, tm: &mut Matrix, items: &[Object]) -> (Vec<O
     };
     for item in items {
         match item {
+            // Embed build: glyphs that cannot be placed are never taken for outside a region:
+            // shown anywhere near one (within twice the string's length in ems, every way), they
+            // count as left under it, so verification fails and nothing is changed.
+            Object::String(s) if gs.unplaceable => {
+                // Where earlier strings of the line left off is not known either.
+                *drift += s.bytes.len() as f64;
+                let reach = (*drift + 1.0) * 2.0;
+                let trm = Matrix([size * gs.scale, 0.0, 0.0, size, 0.0, gs.rise]).then(tm).then(&gs.ctm);
+                if scope.hits(trm.bbox([-reach, -reach, reach, reach])) && scope.mode == Mode::Verify {
+                    removed += s.bytes.len().max(1);
+                }
+                out.push(item.clone());
+            }
             Object::String(s) => {
                 let bytes = &s.bytes;
                 let mut glyphs = Vec::new();
@@ -559,7 +690,8 @@ fn xobject(
     out: &mut Output,
 ) -> Option<Option<Op>> {
     let name = op.name(0)?.to_vec();
-    let r = xobjects.get(&name)?.as_ref()?;
+    // Embed build: through the enclosing scopes' resources too, as hayro looks it up.
+    let r = scope.resource(doc, xobjects, b"XObject", &name)?.as_ref()?;
     let obj = doc.get(r);
     let Object::Stream(s) = &*obj else { return None };
     match s.dict.name(b"Subtype") {
@@ -627,7 +759,10 @@ fn xobject(
             let res = own.clone().unwrap_or_else(|| resources.clone());
             let saved_fonts = std::mem::take(&mut scope.fonts);
             scope.depth += 1;
-            let inner = process(doc, scope, &[data], &res, fctm);
+            // Embed build: what the form's own resources lack, it finds in this scope's.
+            scope.parents.push(resources.clone());
+            let inner = process(doc, scope, std::slice::from_ref(&data), &res, fctm);
+            scope.parents.pop();
             scope.depth -= 1;
             // Embed build: the form's named property lists whose spans changed lose their text
             // (R6b-47); written in its resources, those are written again below.
@@ -659,23 +794,33 @@ fn xobject(
             }
             let mut dict = s.dict.clone();
             dict.remove(b"Length");
-            if own_changed && inner.xobjects.is_empty() {
-                dict.set(b"Resources".to_vec(), Object::Dict(res.clone()));
+            // Embed build: the names the redaction stopped drawing leave the form's resources
+            // (with their unredacted originals).
+            let mut xo = res_dict(doc, &res, b"XObject");
+            for (n, r) in &inner.xobjects {
+                xo.set(n.clone(), Object::Ref(*r));
             }
-            if !inner.xobjects.is_empty() {
-                let mut res = res;
-                let mut xo = res_dict(doc, &res, b"XObject");
-                for (n, r) in &inner.xobjects {
-                    xo.set(n.clone(), Object::Ref(*r));
-                }
+            let drawn = names_drawn(doc, &parse(new_data.as_deref().unwrap_or(&data)).ops.iter().collect::<Vec<_>>(), &xo);
+            let forgotten = forget_dropped(&mut xo, &inner.dropped, &drawn);
+            if own_changed || forgotten || !inner.xobjects.is_empty() {
+                let mut res = res.clone();
                 res.set(b"XObject".to_vec(), Object::Dict(xo));
                 dict.set(b"Resources".to_vec(), Object::Dict(res));
             }
-            let stream = match new_data {
-                Some(d) => Stream::flate(dict, &d),
+            let stream = match &new_data {
+                Some(d) => Stream::flate(dict, d),
                 None => Stream { dict, raw: s.raw.clone() },
             };
             let nr = doc.add(Object::Stream(stream));
+            // Embed build: the structure tree's references into the original (`/Stm`) follow
+            // the rewritten form, its changed marked content cleaned (R6b-47).
+            let named = crate::tags::named_mcids(doc, &res);
+            let (changed, empty) = match &new_data {
+                Some(new) => crate::tags::touched(&data, new, &named),
+                None => Default::default(),
+            };
+            out.forms.extend(inner.forms);
+            out.forms.push(FormRewrite { old: r, new: nr, changed, empty });
             let n = fresh_name(scope, xobjects);
             xobjects.set(n.clone(), Object::Ref(nr));
             out.xobjects.push((n.clone(), nr));

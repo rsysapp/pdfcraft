@@ -6,7 +6,8 @@
 //!
 //! A span's content is compared operator by operator, before and after, with the spans of the
 //! scope paired in their order. A list written in the content loses the text there; a list
-//! named in the resources loses it where it is. Where the redaction changed the spans themselves (fewer, more,
+//! named in the resources loses it where it is. Where marked content is unbalanced, every span
+//! of the scope loses it. Where the redaction changed the spans themselves (fewer, more,
 //! other tags or nesting), every span loses its text: what each stood for can no longer be
 //! told.
 
@@ -28,10 +29,12 @@ struct Level {
     content: DefaultHasher,
 }
 
-/// The levels of `pieces` (one content stream in pieces), in the order they open.
-fn levels(pieces: &[&[Op]]) -> Vec<Level> {
+/// The levels of `pieces` (one content stream in pieces), in the order they open, and whether
+/// marked content is unbalanced (an `EMC` closing nothing, a level left open).
+fn levels(pieces: &[&[Op]]) -> (Vec<Level>, bool) {
     let mut levels: Vec<Level> = Vec::new();
     let mut open: Vec<usize> = Vec::new();
+    let mut unbalanced = false;
     let mut bytes = Vec::new();
     for (piece, ops) in pieces.iter().enumerate() {
         for (index, op) in ops.iter().enumerate() {
@@ -43,7 +46,7 @@ fn levels(pieces: &[&[Op]]) -> Vec<Level> {
                     open.push(levels.len().saturating_sub(1));
                 }
                 b"EMC" => {
-                    open.pop();
+                    unbalanced |= open.pop().is_none();
                 }
                 _ => {
                     bytes.clear();
@@ -58,7 +61,8 @@ fn levels(pieces: &[&[Op]]) -> Vec<Level> {
             }
         }
     }
-    levels
+    let unbalanced = unbalanced || !open.is_empty();
+    (levels, unbalanced)
 }
 
 /// Take the text standing for their content off the spans of `rewritten` (the redaction's
@@ -69,8 +73,10 @@ fn levels(pieces: &[&[Op]]) -> Vec<Level> {
 pub(crate) fn strip_changed(doc: &Document, original: &[Vec<Op>], rewritten: &mut [(Vec<Op>, bool)], properties: &Dict) -> (usize, Vec<Vec<u8>>) {
     let before: Vec<&[Op]> = original.iter().map(Vec::as_slice).collect();
     let after: Vec<&[Op]> = rewritten.iter().map(|(ops, _)| ops.as_slice()).collect();
-    let (before, after) = (levels(&before), levels(&after));
-    let paired = before.len() == after.len() && before.iter().zip(&after).all(|(old, new)| old.tag == new.tag && old.parent == new.parent);
+    let ((before, unbalanced), (after, _)) = (levels(&before), levels(&after));
+    // Unbalanced, which glyphs a span holds is each reader's guess: every span loses its text.
+    let paired =
+        !unbalanced && before.len() == after.len() && before.iter().zip(&after).all(|(old, new)| old.tag == new.tag && old.parent == new.parent);
     let changed: Vec<(usize, usize)> = after
         .iter()
         .enumerate()
