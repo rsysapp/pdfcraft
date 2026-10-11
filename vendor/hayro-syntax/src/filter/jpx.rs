@@ -31,6 +31,20 @@ pub(crate) fn decode(data: &[u8], params: &ImageDecodeParams) -> Option<FilterRe
 
     let width = image.width();
     let height = image.height();
+    // Embed build: the samples the codestream declares must fit the decode budget before any is
+    // decoded (`crate::budget`).
+    let channels = match image.color_space() {
+        ColorSpace::Gray => 1,
+        ColorSpace::RGB => 3,
+        ColorSpace::CMYK => 4,
+        ColorSpace::Unknown { num_channels } => u64::from(*num_channels),
+        ColorSpace::Icc { num_channels, .. } => u64::from(*num_channels),
+    } + u64::from(image.has_alpha());
+    let samples = u64::from(width).saturating_mul(u64::from(height)).saturating_mul(channels);
+    if !crate::budget::bytes_fit(samples) || !crate::budget::codec_allows(samples, crate::budget::JPX_WEIGHT) {
+        crate::budget::exceed();
+        return None;
+    }
     let bpc = params.bpc.unwrap_or(image.original_bit_depth());
     let cs = match image.color_space() {
         ColorSpace::Gray => ImageColorSpace::Gray,

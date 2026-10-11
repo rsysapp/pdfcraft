@@ -182,6 +182,10 @@ impl<'a> Stream<'a> {
                 params,
                 image_params,
             )?;
+            // Embed build: every filter's output is charged to the decode budget (`budget`).
+            if !crate::budget::spend_bytes(new.data.len() as u64) {
+                return Err(DecodeFailure::StreamDecode);
+            }
             current = Some(new);
         }
 

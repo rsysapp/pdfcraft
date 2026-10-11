@@ -56,6 +56,9 @@ pub mod integration;
 
 mod arithmetic_decoder;
 mod bitmap;
+// Embed build: see `budget`.
+mod budget;
+pub use budget::{set_work_allowance, work_exceeded, work_spent};
 mod decode;
 mod error;
 mod file;

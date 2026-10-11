@@ -29,6 +29,15 @@ pub(crate) fn decode(
         .set_max_height(u16::MAX as usize);
     let mut decoder = zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(&*data), options);
     decoder.decode_headers().ok()?;
+    // Embed build: the samples the JPEG declares must fit the decode budget before any is decoded
+    // (`crate::budget`).
+    let (columns, rows) = decoder.dimensions()?;
+    let components = decoder.info().map_or(4, |info| u64::from(info.components)).max(1);
+    let samples = (columns as u64).saturating_mul(rows as u64).saturating_mul(components);
+    if !crate::budget::bytes_fit(samples) || !crate::budget::codec_allows(samples, crate::budget::DCT_WEIGHT) {
+        crate::budget::exceed();
+        return None;
+    }
 
     let color_transform = params.get::<u8>(COLOR_TRANSFORM);
     let input_color_space = decoder.input_colorspace().unwrap();

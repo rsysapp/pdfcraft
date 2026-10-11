@@ -5,8 +5,14 @@ use alloc::vec::Vec;
 pub(crate) fn decode(data: &[u8]) -> Option<Vec<u8>> {
     let mut reader = Reader::new(data);
     let mut decoded = vec![];
+    // Embed build: at most what the decode budget leaves (`budget`).
+    let room = crate::budget::bytes_room();
 
     loop {
+        if decoded.len() > room {
+            crate::budget::exceed();
+            return None;
+        }
         let length = reader.read_byte()?;
 
         match length {

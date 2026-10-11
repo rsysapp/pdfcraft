@@ -23,6 +23,40 @@ pub(crate) fn decode(
 
     let image = hayro_jbig2::Image::new_embedded(data, globals.as_deref()).ok()?;
 
+    // Embed build: the page's bytes must fit the decode budget, and the pixels the decoder makes
+    // and composes are counted while it runs (`crate::budget`).
+    let page_bytes = u64::from(image.width()).saturating_mul(u64::from(image.height()));
+    if !crate::budget::bytes_fit(page_bytes) {
+        crate::budget::exceed();
+        return None;
+    }
+    let room = crate::budget::work_room();
+    hayro_jbig2::set_work_allowance(if room == u64::MAX { u64::MAX } else { room / crate::budget::JBIG2_WEIGHT });
+    let decoded = decode_page(&image, image_params);
+    let spent = hayro_jbig2::work_spent();
+    let exceeded = hayro_jbig2::work_exceeded();
+    hayro_jbig2::set_work_allowance(u64::MAX);
+    if !crate::budget::codec_allows(spent, crate::budget::JBIG2_WEIGHT) || exceeded {
+        crate::budget::exceed();
+        return None;
+    }
+    let (decoded, bpc) = decoded?;
+
+    Some(FilterResult {
+        data: Cow::Owned(decoded),
+        image_data: Some(ImageData {
+            alpha: None,
+            color_space: Some(ImageColorSpace::Gray),
+            bits_per_component: bpc,
+            width: image.width(),
+            height: image.height(),
+        }),
+    })
+}
+
+/// The page's pixels, packed (indexed colour spaces) or one byte each.
+fn decode_page(image: &hayro_jbig2::Image<'_>, image_params: &ImageDecodeParams) -> Option<(Vec<u8>, u8)> {
+
     // Whenever possible (if we don't have an indexed color space), we convert
     // the data as 8-bit instead of 1-bit, so that it can be easier converted
     // into an RGBA8 image.
@@ -83,14 +117,5 @@ pub(crate) fn decode(
         (decoder.output, 8)
     };
 
-    Some(FilterResult {
-        data: Cow::Owned(decoded),
-        image_data: Some(ImageData {
-            alpha: None,
-            color_space: Some(ImageColorSpace::Gray),
-            bits_per_component: bpc,
-            width: image.width(),
-            height: image.height(),
-        }),
-    })
+    Some((decoded, bpc))
 }

@@ -14,16 +14,26 @@ pub(crate) mod flate {
         use flate2::read::{DeflateDecoder, ZlibDecoder};
         use std::io::Read;
 
-        fn zlib_stream(data: &[u8]) -> Option<Vec<u8>> {
-            let mut decoder = ZlibDecoder::new(data);
+        // Embed build: at most what the decode budget leaves (`budget`): past it, decoding stops
+        // before the output grows further, and the budget says so.
+        fn bounded(mut decoder: impl Read) -> Option<Vec<u8>> {
+            let room = crate::budget::bytes_room();
             let mut result = Vec::new();
-            decoder.read_to_end(&mut result).ok().map(|_| result)
+            let limit = u64::try_from(room).unwrap_or(u64::MAX).saturating_add(1);
+            (&mut decoder).take(limit).read_to_end(&mut result).ok()?;
+            if result.len() > room {
+                crate::budget::exceed();
+                return None;
+            }
+            Some(result)
+        }
+
+        fn zlib_stream(data: &[u8]) -> Option<Vec<u8>> {
+            bounded(ZlibDecoder::new(data))
         }
 
         fn deflate_stream(data: &[u8]) -> Option<Vec<u8>> {
-            let mut decoder = DeflateDecoder::new(data);
-            let mut result = Vec::new();
-            decoder.read_to_end(&mut result).ok().map(|_| result)
+            bounded(DeflateDecoder::new(data))
         }
 
         let decoded = zlib_stream(data)
@@ -94,8 +104,14 @@ pub(crate) mod flate {
             }
 
             fn decode(&mut self) -> Option<Vec<u8>> {
+                // Embed build: at most what the decode budget leaves (`budget`).
+                let room = crate::budget::bytes_room();
                 while !self.eof && self.pos < self.data.len() {
                     self.read_block();
+                    if self.output.len() > room {
+                        crate::budget::exceed();
+                        return None;
+                    }
                 }
 
                 Some(core::mem::take(&mut self.output))
@@ -280,6 +296,12 @@ pub(crate) mod flate {
                             return;
                         }
                     };
+
+                    // Embed build: a block may not grow past the decode budget either.
+                    if self.output.len() > crate::budget::bytes_room() {
+                        self.eof = true;
+                        return;
+                    }
 
                     if code1 < 256 {
                         self.output.push(code1 as u8);
@@ -588,8 +610,14 @@ pub(crate) mod lzw {
         let mut reader = BitReader::new(data);
         let mut decoded = vec![];
         let mut prev = None;
+        // Embed build: at most what the decode budget leaves (`budget`).
+        let room = crate::budget::bytes_room();
 
         loop {
+            if decoded.len() > room {
+                crate::budget::exceed();
+                return None;
+            }
             let next = match reader.read(bit_size) {
                 Some(code) => code as usize,
                 None => {

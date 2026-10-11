@@ -73,6 +73,10 @@ impl Bitmap {
         if u64::from(width) * u64::from(height) > MAX_PIXELS {
             bail!(OverflowError::BitmapDimension);
         }
+        // Embed build: a bitmap's pixels are work (see `budget`).
+        if !crate::budget::spend(u64::from(width) * u64::from(height)) {
+            bail!(OverflowError::BitmapDimension);
+        }
 
         let stride = width.div_ceil(WORD_BITS);
         let default_word: Word = if default_pixel { !0 } else { 0 };
@@ -98,6 +102,10 @@ impl Bitmap {
         }
         // PdfCraft patch: see `MAX_PIXELS` (the page bitmap is sized here).
         if u64::from(width) * u64::from(height) > MAX_PIXELS {
+            return Err(OverflowError::BitmapDimension.into());
+        }
+        // Embed build: a bitmap's pixels are work (see `budget`).
+        if !crate::budget::spend(u64::from(width) * u64::from(height)) {
             return Err(OverflowError::BitmapDimension.into());
         }
 
@@ -158,6 +166,12 @@ impl Bitmap {
         let src_x_start = (dest_x_start - x) as u32;
         let dest_x_start = dest_x_start as u32;
         let dest_x_end = dest_x_end as u32;
+
+        // Embed build: a composition's pixels are work (see `budget`); past the allowance it is
+        // skipped, and the decode fails.
+        if !crate::budget::spend(u64::from(dest_x_end - dest_x_start) * u64::from(other.height)) {
+            return;
+        }
 
         for src_y in 0..other.height {
             let dest_y = y + src_y as i32;

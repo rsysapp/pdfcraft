@@ -38,6 +38,14 @@ pub(crate) fn decode(
     if !super::ccitt_size_ok(settings.columns, settings.rows) {
         return None;
     }
+    // Embed build: the pixels must fit the decode budget before any is decoded (`crate::budget`);
+    // without /Rows, as many rows as the data has bits.
+    let rows = if settings.rows == 0 { (data.len() as u64).saturating_mul(8) } else { u64::from(settings.rows) };
+    let pixels = u64::from(settings.columns).saturating_mul(rows);
+    if !crate::budget::bytes_fit(pixels) || !crate::budget::codec_allows(pixels, crate::budget::CCITT_WEIGHT) {
+        crate::budget::exceed();
+        return None;
+    }
 
     // Whenever possible (if we don't have an indexed color space), we convert
     // the data as 8-bit instead of 1-bit, so that it can be easier converted
