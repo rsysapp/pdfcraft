@@ -217,6 +217,10 @@ pub struct DocView {
     /// Embed build: the view's own controls (find stepping, page buttons) moved the view since the
     /// host bridge last looked, so a selection reported to the host sits at stale coordinates.
     pub(crate) moved_by_controls: bool,
+    /// Embed build: a press this frame started on the page view itself (pages or pasteboard), not
+    /// on its scrollbar or on a control floating over it, so the host bridge re-arms selection
+    /// reporting (`crate::embed`).
+    pub(crate) pressed_on_pages: bool,
     pages: HashMap<usize, PageTex>,
     /// Pages the renderer could not draw, with the reason (never re-requested).
     errors: HashMap<usize, String>,
@@ -368,6 +372,7 @@ impl DocView {
             want_all_text: false,
             want_text_page: None,
             moved_by_controls: false,
+            pressed_on_pages: false,
             pages: HashMap::new(),
             errors: HashMap::new(),
             waiting_since: HashMap::new(),
@@ -1413,6 +1418,9 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
             ui.scroll_with_delta_animation(delta, egui::style::ScrollAnimation::none());
         }
         let (resp_rect, resp) = ui.allocate_exact_size(vec2(content_w, content_h), Sense::click_and_drag());
+        // Embed build: egui hands a press to the topmost widget under it, so a press on the
+        // scrollbar or the find bar never reaches this one (crate::embed).
+        view.pressed_on_pages = resp.is_pointer_button_down_on() && ui.input(|i| i.pointer.any_pressed());
         // The Hand tool pans: the content widget takes every drag, so scroll by its delta.
         if hand {
             if resp.dragged() {

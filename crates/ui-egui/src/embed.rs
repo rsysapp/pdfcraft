@@ -67,9 +67,14 @@ pub(crate) struct Embed {
     selection_reported: bool,
     /// The settled selection is the editor's own (a found text jump's), never told to the host.
     own_selection: bool,
-    /// A person pressed or dragged since the selection last settled, so it is told again when it
-    /// settles, even unchanged: the host hides its toolbar on input, and selecting the same passage
-    /// again must bring it back.
+    /// The editor's own selection landed while a button was held, and that button is still down:
+    /// what the held gesture does to it on the way is not a person's new selection.
+    own_under_press: bool,
+    /// A button was down when this frame's host commands ran (`embed_logic`).
+    pointer_down: bool,
+    /// A person pressed on the page view or dragged since the selection last settled, so it is
+    /// told again when it settles, even unchanged: the host hides its toolbar on input, and
+    /// selecting the same passage again must bring it back.
     settle_again: bool,
     /// The host's marks as it sent them, and their texts folded for matching.
     marks: Vec<Mark>,
@@ -106,6 +111,7 @@ impl Embed {
         self.last_selection = None;
         self.selection_reported = false;
         self.own_selection = false;
+        self.own_under_press = false;
         self.settle_again = false;
         self.set_marks(Vec::new());
     }
@@ -122,6 +128,7 @@ impl Embed {
             return;
         }
         self.own_selection = false;
+        self.own_under_press = false;
         self.settle_again = false;
         // The view's own selection goes too, or the host and the view would disagree about it.
         self.last_selection = None;
@@ -135,6 +142,7 @@ impl Embed {
     fn note_own_selection(&mut self, view: &DocView) {
         self.last_selection = view.selection_span();
         self.own_selection = self.last_selection.is_some();
+        self.own_under_press = self.own_selection && self.pointer_down;
         self.settle_again = false;
     }
 
@@ -257,6 +265,7 @@ impl PdfCraftApp {
     pub(crate) fn embed_logic(&mut self, ctx: &egui::Context) {
         let Some(mut embed) = self.embed.take() else { return };
         embed.bridge.attach(ctx);
+        embed.pointer_down = ctx.input(|i| i.pointer.any_down());
         for command in embed.bridge.take_commands() {
             match command {
                 HostCommand::Open { name, bytes } => self.host_open(&mut embed, &name, bytes),
@@ -536,16 +545,29 @@ fn collect_events(app: &mut PdfCraftApp, ctx: &egui::Context) {
     }
     // A selection settles when no button is down: drags report on release, keys at once.
     let now = view.selection_span();
-    let (pressed, down) = ctx.input(|i| (i.pointer.any_pressed(), i.pointer.any_down()));
-    // A press after a reported selection is told again on release, even unchanged (the host hid its
-    // toolbar on the input). Only a reported one: the editor's own selection stays unreported
-    // through presses that leave it as it is (a page button, the pasteboard).
-    if pressed && embed.selection_reported {
+    let pressed_on_pages = std::mem::take(&mut view.pressed_on_pages);
+    let (down, wheel) = ctx.input(|i| (i.pointer.any_down(), i.events.iter().any(|e| matches!(e, egui::Event::MouseWheel { .. }))));
+    if !down {
+        embed.own_under_press = false;
+    }
+    // Scrolling is no press: a re-report still waiting (its selection off screen) is dropped, so
+    // the selection is never told for input that did not touch it.
+    if wheel {
+        embed.settle_again = false;
+    }
+    // A press on the page view after a reported selection is told again on release, even unchanged
+    // (the host hid its toolbar on the input), as the Word editor does for a press in its canvas.
+    // A press on a control (zoom, page display, the scrollbar, the find bar) selects nothing and is
+    // not. Only a reported selection: the editor's own stays unreported through presses that leave
+    // it as it is (the pasteboard).
+    if pressed_on_pages && embed.selection_reported {
         embed.settle_again = true;
     }
     // A drag that changes the selection on its way is a person's, even when it ends on the
-    // selection settled before (a jump's match selected again by hand).
-    if down && now != embed.last_selection {
+    // selection settled before (a jump's match selected again by hand). Not when the jump landed
+    // under a button already held: that gesture began before the match existed, and taking its
+    // changes for a person's would report the editor's own selection when it ends there.
+    if down && now != embed.last_selection && !(embed.own_selection && embed.own_under_press) {
         embed.settle_again = true;
     }
     if down || (now == embed.last_selection && !embed.settle_again) {
@@ -556,8 +578,13 @@ fn collect_events(app: &mut PdfCraftApp, ctx: &egui::Context) {
         Some((page, range)) => selection_event(view, *page, range.clone(), ctx.zoom_factor()),
     };
     match reading {
-        // Off screen or its text layer not in yet: try again next frame.
-        Reading::NotReady => return,
+        // Off screen or its text layer not in yet: a changed selection is tried again next frame.
+        // A re-report of an unchanged one is dropped: it would otherwise go out whenever the
+        // selection next came into view, with no input to ask for it.
+        Reading::NotReady => {
+            embed.settle_again = false;
+            return;
+        }
         // No selection, or only whitespace: nothing for the host to act on, so a selection it was
         // told of is cleared (once), or its toolbar would stay on stale text.
         Reading::Blank => {

@@ -6,8 +6,8 @@ use egui::{Event, Key, Modifiers, PointerButton};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use embed_support::{embedded, open, pages, settle, three_pages};
-use pdfcraft_ui_egui::PdfCraftApp;
 use pdfcraft_ui_egui::embed::{HostBridge, HostCommand, HostEvent, JumpTarget};
+use pdfcraft_ui_egui::{PdfCraftApp, QuickTool};
 
 fn selections(events: &[HostEvent]) -> Vec<HostEvent> {
     events.iter().filter(|e| matches!(e, HostEvent::Selection { .. } | HostEvent::SelectionCleared)).cloned().collect()
@@ -373,4 +373,132 @@ fn a_selection_cleared_after_a_move_is_not_cleared_again_by_the_next_one() {
     assert!(selections_after_jump(&mut h, &bridge, JumpTarget::Page { page: 3 }).is_empty());
     let events = open(&mut h, &bridge, "other.pdf", three_pages());
     assert_eq!(events, [HostEvent::Opened { pages: 3 }, HostEvent::PageChanged { page: 1 }]);
+}
+
+/// A wheel scroll over the page view by `dy` points (positive moves the content down), run until
+/// the scroll has finished animating.
+fn wheel(h: &mut Harness<'static, PdfCraftApp>, dy: f32) {
+    let at = h.state().views[0].viewport_rect().center();
+    h.hover_at(at);
+    h.run_steps(1);
+    h.event(Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: egui::vec2(0.0, dy),
+        phase: egui::TouchPhase::Move,
+        modifiers: Modifiers::NONE,
+    });
+    h.run_steps(30);
+}
+
+/// A point on the pasteboard beside whichever page is current: no text, no control.
+fn pasteboard_now(h: &Harness<'static, PdfCraftApp>) -> egui::Pos2 {
+    let view = &h.state().views[0];
+    let page = view.page_screen_rect(view.current).expect("the current page is on screen");
+    let at = egui::pos2(page.max.x + 30.0, view.viewport_rect().center().y);
+    assert!(view.viewport_rect().shrink(20.0).contains(at), "{at:?} lies in the document area {:?}", view.viewport_rect());
+    at
+}
+
+#[test]
+fn a_press_on_the_controls_does_not_report_the_selection_again() {
+    let (mut h, bridge) = with_reported_selection();
+    // The zoom controls and the page display menu, in the navigation rail.
+    for label in ["Zoom in (⌘+)", "Zoom out (⌘−)"] {
+        h.get_by_label(label).click();
+        h.run_steps(5);
+        assert!(selections(&bridge.take_events()).is_empty(), "a press on {label} selects nothing");
+    }
+    // Opened and closed again by its button (Escape would clear the selection).
+    for _ in 0..2 {
+        h.get_by_label_contains("Page display: ").click();
+        h.run_steps(3);
+    }
+    assert!(selections(&bridge.take_events()).is_empty(), "a press on the page display menu selects nothing");
+    // The scrollbar, at the page view's right edge (three pages do not fit).
+    let viewport = h.state().views[0].viewport_rect();
+    let bar = egui::pos2(viewport.right() - 3.0, viewport.center().y);
+    click_at(&mut h, bar);
+    h.run_steps(3);
+    assert!(selections(&bridge.take_events()).is_empty(), "a press on the scrollbar selects nothing");
+    // The find field, floating over the page view.
+    h.state_mut().views[0].open_find();
+    h.run_steps(3);
+    let field = h
+        .query_all_by_role(egui::accesskit::Role::TextInput)
+        .map(|node| node.rect())
+        .find(|rect| viewport.contains(rect.center()))
+        .expect("the find field lies over the page view");
+    click_at(&mut h, field.center());
+    h.run_steps(3);
+    assert!(selections(&bridge.take_events()).is_empty(), "a press in the find field selects nothing");
+    assert_eq!(h.state().views[0].selected_text().as_deref(), Some("Definitions"), "the selection stays");
+    // A press on the page view after all that still is input on the selection (the scrollbar
+    // press scrolled, so beside whichever page is shown).
+    let beside = pasteboard_now(&h);
+    click_at(&mut h, beside);
+    let events = selections(&bridge.take_events());
+    assert!(is_selection_of(&events, "Definitions"), "told again on a press on the page view: {events:?}");
+}
+
+#[test]
+fn a_press_on_the_page_reports_the_selection_again() {
+    let (mut h, bridge) = with_reported_selection();
+    // With the Hand tool, so the press pans instead of selecting: the selection stays as it is.
+    h.state_mut().quick_tool = QuickTool::Hand;
+    h.run_steps(2);
+    let page = h.state().views[0].page_screen_rect(0).expect("on screen");
+    click_at(&mut h, page.center());
+    let events = selections(&bridge.take_events());
+    assert!(is_selection_of(&events, "Definitions"), "told again on release: {events:?}");
+    h.run_steps(5);
+    assert!(selections(&bridge.take_events()).is_empty(), "once per press");
+}
+
+#[test]
+fn a_selection_off_screen_is_not_reported_again_when_a_wheel_scroll_brings_it_back() {
+    let (mut h, bridge) = with_reported_selection();
+    // Scroll the selected page off screen: no press, nothing to tell.
+    wheel(&mut h, -2000.0);
+    assert!(h.state().views[0].page_screen_rect(0).is_none(), "page 1 is off screen");
+    assert!(selections(&bridge.take_events()).is_empty());
+    // A press on the page view asks for the selection again, but it is off screen: not ready.
+    let beside = pasteboard_now(&h);
+    click_at(&mut h, beside);
+    h.run_steps(3);
+    assert!(selections(&bridge.take_events()).is_empty(), "nothing while the selection is off screen");
+    // Scrolling it back into view is no input on it, so nothing is told.
+    wheel(&mut h, 2000.0);
+    assert!(h.state().views[0].page_screen_rect(0).is_some(), "page 1 is back");
+    h.run_steps(5);
+    assert!(selections(&bridge.take_events()).is_empty(), "a wheel scroll reports nothing");
+    assert_eq!(h.state().views[0].selected_text().as_deref(), Some("Definitions"));
+}
+
+#[test]
+fn a_jump_that_lands_while_the_button_is_held_is_not_reported() {
+    let (mut h, bridge) = embedded();
+    open(&mut h, &bridge, "lines.pdf", two_lines());
+    // Glyphs of the first line: "The" 0–2, a space 3, "quick" 4–8, a space 9, "brown" 10–14.
+    let at = |h: &Harness<'static, PdfCraftApp>, glyph: usize| h.state().views[0].glyph_screen_pos(0, glyph).expect("on screen");
+    let (q, k) = (at(&h, 4), at(&h, 8));
+    drag_and_hold(&mut h, q, k);
+    // The jump lands under the held button and selects its match, the editor's own selection.
+    bridge.send(HostCommand::JumpTo(text_target("brown", None)));
+    settle(&mut h);
+    // The held drag moves its end on the match's line, then ends on the match's own end.
+    let n = at(&h, 14);
+    for k in 1..=4 {
+        h.event(Event::PointerMoved(k_to(at(&h, 6), n, k)));
+        h.run_steps(1);
+    }
+    release(&mut h, n);
+    h.run_steps(3);
+    let events = selections(&bridge.take_events());
+    assert!(events.is_empty(), "the jump's own selection is never reported: {events:?}");
+    assert_eq!(h.state().views[0].selected_text().as_deref(), Some("brown"));
+}
+
+/// The `k`th of four steps from `a` to `b`.
+fn k_to(a: egui::Pos2, b: egui::Pos2, k: usize) -> egui::Pos2 {
+    a + (b - a) * (k as f32 / 4.0)
 }
