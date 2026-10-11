@@ -293,6 +293,15 @@ pub(crate) struct PageFacts {
     /// for assistive technology and copying (see [`Span`]): a rewrite may take spans or text
     /// away, never add, change or move any.
     pub text: Vec<Span>,
+    /// The levels of marked content the page's own content and the forms it draws open, in
+    /// drawing order (see [`Level`], R6b-47).
+    pub levels: Vec<Level>,
+    /// hayro opened the same levels (each with its tag, inside the same level) around the glyphs
+    /// it drew, and marked content was balanced in every content stream, for both: which
+    /// glyph is in which level is then known (set in `inspect::read_side`).
+    pub levels_agree: bool,
+    /// A level closed that its content stream did not open, or left open at its end.
+    pub levels_unbalanced: bool,
     /// The page dictionary's own entries (not in [`PAGE_OWN_KEYS`] or [`PAGE_IGNORED`]), by
     /// their values' digests: in a rewrite they must be the same, but for [`PAGE_REMOVABLE`]
     /// ones removed.
@@ -338,6 +347,9 @@ impl PageFacts {
             form_layers: Vec::new(),
             layers: PageLayers::default(),
             text: Vec::new(),
+            levels: Vec::new(),
+            levels_agree: true,
+            levels_unbalanced: false,
             entries: BTreeMap::new(),
             type3: BTreeSet::new(),
             render_risk: None,
@@ -577,6 +589,8 @@ pub(crate) struct Structure {
     pub sections: Vec<Section>,
     /// The structure tree (see [`StructFacts`]).
     pub structure_tree: StructFacts,
+    /// Where the structure tree's marked content is (see [`StructLinks`]).
+    pub structure_links: StructLinks,
     /// The named destinations' tree nodes' entries other than `/Kids`, `/Names` and `/Limits`,
     /// in the tree's order: no fact reports them, so they may not change.
     pub name_tree_keys: Vec<(Vec<u8>, Digest)>,
@@ -642,6 +656,31 @@ pub(crate) struct StructFacts {
     /// The same without the text and the marked-content kids: what a rewrite may not change
     /// (a redaction takes away text and the marked content it removed).
     pub shape: Digest,
+}
+
+/// Where the structure tree's elements and marked content are (R6b-47): with the shape the same
+/// in both files (see [`tags_kept`]), the base's say which elements a glyph belongs to.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StructLinks {
+    /// Each element's parent (by its place in the tree's order, as [`StructFacts::text`] names
+    /// it; [`STRUCT_ROOT`]: the root), in that order.
+    pub parents: Vec<u32>,
+    /// Each marked-content kid (an MCID, or a marked-content reference), in the tree's order.
+    pub kids: Vec<MarkedKid>,
+}
+
+/// One marked-content kid of the structure tree (R6b-47).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MarkedKid {
+    /// The element it belongs to ([`STRUCT_ROOT`]: the root).
+    pub element: u32,
+    /// The page it is on: a marked-content reference's own `/Pg`, else its element's or the
+    /// nearest ancestor's (`None`: none names one).
+    pub page: Option<ObjRef>,
+    /// The form XObject whose content holds it (a marked-content reference's `/Stm`; `None`:
+    /// the page's own content).
+    pub form: Option<ObjRef>,
+    pub mcid: i64,
 }
 
 /// Whether a rewrite kept the structure tree as a redaction may keep it, and if so how many
@@ -724,8 +763,14 @@ enum Item {
     /// Any other resource named: a font (`Tf`), a shading (`sh`), a colour space (`cs`, `CS`);
     /// the resource dictionary's key, and the name.
     Named(&'static [u8], Vec<u8>),
-    /// A marked-content property list (`BDC`, `DP`): its tag, and the list.
-    Span(Option<Vec<u8>>, PropertyList),
+    /// A marked-content property list (`BDC`, `DP`): its tag, the list, and whether it opens a
+    /// level of marked content (`BDC`).
+    Span(Option<Vec<u8>>, PropertyList, bool),
+    /// A level of marked content opened without a property list (`BMC`, or a `BDC` whose operand
+    /// is neither a name nor a dictionary): its tag (R6b-47).
+    Level(Option<Vec<u8>>),
+    /// `EMC`: the innermost level closed (R6b-47).
+    End,
 }
 
 /// A marked-content property list: named in the resources (`/Properties`), or written in the
@@ -780,6 +825,55 @@ struct Drawn {
     masks: BTreeSet<(ObjRef, bool, bool)>,
     /// See [`PageFacts::text`].
     text: Vec<Span>,
+    /// See [`PageFacts::levels`].
+    levels: Vec<Level>,
+    /// The levels open now (indices in `levels`), innermost last, and how many of them the
+    /// content stream being drawn may not close (opened outside it).
+    open: Vec<u32>,
+    floor: usize,
+    /// A level closed that its content stream did not open, or left open at its end.
+    unbalanced: bool,
+}
+
+/// One level of marked content (`BDC`, `BMC`) the page's own content or a form it draws opens
+/// (not a tiling pattern's cell or a soft mask's group, whose glyphs are not the page's text), in
+/// drawing order (R6b-47): what a glyph drawn inside it belongs to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Level {
+    /// The tag (`None`: the scan found no name before the operator).
+    pub tag: Option<Vec<u8>>,
+    /// The level it opened inside (an index in the page's levels; [`NO_LEVEL`]: none).
+    pub parent: u32,
+    /// Its property list's span (an index in [`PageFacts::text`]; `None`: no property list, or
+    /// one that could not be found).
+    pub span: Option<u32>,
+    /// Its property list's `/MCID`, written as a whole number.
+    pub mcid: Option<i64>,
+    /// The form XObject whose content opened it (`None`: the page's own content): where its
+    /// `/MCID` belongs (a form's marked content is the structure tree's through `/Stm`).
+    pub form: Option<ObjRef>,
+}
+
+/// No level of marked content.
+pub(crate) const NO_LEVEL: u32 = u32::MAX;
+
+impl Drawn {
+    /// Open a level (in the page's own content or a form it draws).
+    fn open_level(&mut self, tag: Option<Vec<u8>>, span: Option<u32>, mcid: Option<i64>, form: Option<ObjRef>) -> Result<(), Fail> {
+        let index = u32::try_from(self.levels.len()).ok().filter(|index| *index != NO_LEVEL).ok_or(Fail::TooComplex)?;
+        let parent = self.open.last().copied().unwrap_or(NO_LEVEL);
+        self.levels.push(Level { tag, parent, span, mcid, form });
+        self.open.push(index);
+        Ok(())
+    }
+
+    fn close_level(&mut self) {
+        if self.open.len() > self.floor {
+            self.open.pop();
+        } else {
+            self.unbalanced = true;
+        }
+    }
 }
 
 fn require(required: &mut Required, key: ImageKey, patterned: bool) {
@@ -802,6 +896,9 @@ struct Context {
     masked: bool,
     /// The digest of the resource chain the content is drawn with (see `Reader::type3_key`).
     chain: Digest,
+    /// The form XObject whose content this is (`None`: the page's own content), for the
+    /// marked-content levels it opens (R6b-47).
+    form: Option<ObjRef>,
 }
 
 struct Reader<'d, 'b> {
@@ -1463,12 +1560,18 @@ impl<'d, 'b> Reader<'d, 'b> {
                 }
                 // The tag is the operand before the property list (a name, or a dictionary).
                 b"BDC" | b"DP" => {
+                    let level = keyword == b"BDC";
                     if let Some(resource) = name.take() {
-                        items.push(Item::Span(before.take(), PropertyList::Named(resource)));
+                        items.push(Item::Span(before.take(), PropertyList::Named(resource), level));
                     } else if let Some(list) = dict.take() {
-                        items.push(Item::Span(before.take(), PropertyList::Inline(list)));
+                        items.push(Item::Span(before.take(), PropertyList::Inline(list), level));
+                    } else if level {
+                        // Embed build: a level all the same (R6b-47).
+                        items.push(Item::Level(before.take()));
                     }
                 }
+                b"BMC" => items.push(Item::Level(name.take())),
+                b"EMC" => items.push(Item::End),
                 _ => {}
             }
             name = None;
@@ -1596,7 +1699,7 @@ impl<'d, 'b> Reader<'d, 'b> {
                         }
                     }
                 }
-                Item::Span(tag, list) => {
+                Item::Span(tag, list, level) => {
                     let found = match list {
                         PropertyList::Named(name) => match self.resource_entry(chain, b"Properties", name)? {
                             Some(entry) => match &*self.resolve(&entry)? {
@@ -1608,9 +1711,28 @@ impl<'d, 'b> Reader<'d, 'b> {
                         },
                         PropertyList::Inline(dict) => Some(dict.clone()),
                     };
-                    if let Some(dict) = found {
-                        self.note_keys(b"Properties", &dict, drawn)?;
-                        self.note_span(tag.as_deref(), &dict, drawn)?;
+                    let span = u32::try_from(drawn.text.len()).ok();
+                    let mcid = found.as_ref().and_then(|dict| match dict.get(b"MCID") {
+                        Some(Object::Int(mcid)) => Some(*mcid),
+                        _ => None,
+                    });
+                    if let Some(dict) = &found {
+                        self.note_keys(b"Properties", dict, drawn)?;
+                        self.note_span(tag.as_deref(), dict, drawn)?;
+                    }
+                    // Embed build: a level glyphs are drawn in (R6b-47).
+                    if *level && !at.patterned && !at.masked {
+                        drawn.open_level(tag.clone(), found.is_some().then_some(span).flatten(), mcid, at.form)?;
+                    }
+                }
+                Item::Level(tag) => {
+                    if !at.patterned && !at.masked {
+                        drawn.open_level(tag.clone(), None, None, at.form)?;
+                    }
+                }
+                Item::End => {
+                    if !at.patterned && !at.masked {
+                        drawn.close_level();
                     }
                 }
                 Item::Inline(digest, pixels) => {
@@ -1651,7 +1773,14 @@ impl<'d, 'b> Reader<'d, 'b> {
                             drawn.interpreted = drawn.interpreted.saturating_add(scan.len);
                             let (inner, key) = self.inner_chain(stream.dict.get(b"Resources"), "a form's /Resources", chain, &at.chain)?;
                             self.type3_fonts(&inner, &key, drawn)?;
-                            self.draw(&scan.items, &inner, Context { depth: at.depth.saturating_add(1), chain: key, ..at }, drawn)?;
+                            // Embed build: the form's content may close only the levels it opened.
+                            let floor = std::mem::replace(&mut drawn.floor, drawn.open.len());
+                            self.draw(&scan.items, &inner, Context { depth: at.depth.saturating_add(1), chain: key, form: Some(r), ..at }, drawn)?;
+                            if !at.patterned && !at.masked {
+                                drawn.unbalanced |= drawn.open.len() != drawn.floor;
+                                drawn.open.truncate(drawn.floor);
+                            }
+                            drawn.floor = floor;
                         }
                         _ => {}
                     }
@@ -1918,9 +2047,9 @@ impl<'d, 'b> Reader<'d, 'b> {
                 Item::Pattern(name) => (b"Pattern", name),
                 Item::State(name) => (b"ExtGState", name),
                 Item::Named(kind, name) => (kind, name),
-                Item::Span(_, PropertyList::Named(name)) => (b"Properties", name),
-                // Its data is the procedure's own.
-                Item::Inline(..) | Item::Span(_, PropertyList::Inline(_)) => continue,
+                Item::Span(_, PropertyList::Named(name), _) => (b"Properties", name),
+                // Its data is the procedure's own; marked-content levels name nothing.
+                Item::Inline(..) | Item::Span(_, PropertyList::Inline(_), _) | Item::Level(_) | Item::End => continue,
             };
             parts.extend_from_slice(&(kind.len() as u64).to_le_bytes());
             parts.extend_from_slice(kind);
@@ -2041,7 +2170,8 @@ impl<'d, 'b> Reader<'d, 'b> {
             self.note_keys(b"Resources", level, &mut drawn)?;
         }
         self.type3_fonts(&chain, &resources, &mut drawn)?;
-        self.draw(&scan.items, &chain, Context { depth: 0, patterned: false, masked: false, chain: resources }, &mut drawn)?;
+        self.draw(&scan.items, &chain, Context { depth: 0, patterned: false, masked: false, chain: resources, form: None }, &mut drawn)?;
+        drawn.unbalanced |= !drawn.open.is_empty();
         drawn.images.sort_unstable();
         let (annots, annots_in_array) = self.annotations(node, widgets, annotation_ids, pages)?;
         Ok(PageFacts {
@@ -2053,6 +2183,9 @@ impl<'d, 'b> Reader<'d, 'b> {
             other,
             images: drawn.images,
             text: drawn.text,
+            levels: drawn.levels,
+            levels_agree: false,
+            levels_unbalanced: drawn.unbalanced,
             entries,
             image_pixels: drawn.pixels,
             render_risk: drawn.render_risk,
@@ -2145,21 +2278,26 @@ impl<'d, 'b> Reader<'d, 'b> {
 
     /// The structure tree's facts (see [`StructFacts`]), read through `/K` from the root, every
     /// element once (a tree that loops is refused).
-    fn structure_tree(&mut self, catalog: &Dict) -> Result<StructFacts, Fail> {
-        let Some(root) = self.dict_of(catalog.get(b"StructTreeRoot"), "/StructTreeRoot")? else { return Ok(StructFacts::default()) };
+    fn structure_tree(&mut self, catalog: &Dict) -> Result<(StructFacts, StructLinks), Fail> {
+        let Some(root) = self.dict_of(catalog.get(b"StructTreeRoot"), "/StructTreeRoot")? else {
+            return Ok((StructFacts::default(), StructLinks::default()));
+        };
         let mut facts = StructFacts::default();
+        let mut links = StructLinks::default();
         let mut parts: Vec<u8> = Vec::new();
         let mut shape: Vec<u8> = Vec::new();
         let root_digest = self.digest_without(&root, &[b"K", b"ParentTree", b"ParentTreeNextKey", b"IDTree"])?;
         parts.extend_from_slice(&root_digest);
         shape.extend_from_slice(&root_digest);
         let mut seen: BTreeSet<ObjRef> = BTreeSet::new();
-        // (kid, depth, the element it belongs to), depth first in the tree's order. An element is
-        // named by its place in that order and its parent's (R6b-44): with the shape the same in
-        // both files, the same place is the same element.
-        let mut todo: Vec<(Object, usize, u32)> = root.get(b"K").cloned().map(|kid| (kid, 0, STRUCT_ROOT)).into_iter().collect();
+        // (kid, depth, the element it belongs to, the page that element or its nearest ancestor
+        // names), depth first in the tree's order. An element is named by its place in that order
+        // and its parent's (R6b-44): with the shape the same in both files, the same place is the
+        // same element.
+        let mut todo: Vec<(Object, usize, u32, Option<ObjRef>)> =
+            root.get(b"K").cloned().map(|kid| (kid, 0, STRUCT_ROOT, None)).into_iter().collect();
         let mut elements: u32 = 0;
-        while let Some((kid, depth, owner)) = todo.pop() {
+        while let Some((kid, depth, owner, page)) = todo.pop() {
             self.budget.tick()?;
             if depth > MAX_REFERENCE_DEPTH || seen.len() > MAX_STRUCT_ELEMENTS {
                 return Err(Fail::TooComplex);
@@ -2172,13 +2310,14 @@ impl<'d, 'b> Reader<'d, 'b> {
             match &*self.resolve(&kid)? {
                 Object::Array(items) => {
                     parts.push(b'[');
-                    todo.extend(items.iter().rev().map(|item| (item.clone(), depth.saturating_add(1), owner)));
+                    todo.extend(items.iter().rev().map(|item| (item.clone(), depth.saturating_add(1), owner, page)));
                 }
                 Object::Int(mcid) => {
                     if facts.marked.len() >= MAX_STRUCT_MARKED {
                         return Err(Fail::TooComplex);
                     }
                     facts.marked.push((owner, *mcid));
+                    links.kids.push(MarkedKid { element: owner, page, form: None, mcid: *mcid });
                     parts.push(b'm');
                     parts.extend_from_slice(&owner.to_le_bytes());
                     parts.extend_from_slice(&mcid.to_le_bytes());
@@ -2186,6 +2325,26 @@ impl<'d, 'b> Reader<'d, 'b> {
                 Object::Dict(element) => {
                     let index = elements;
                     elements = elements.checked_add(1).filter(|count| *count as usize <= MAX_STRUCT_ELEMENTS).ok_or(Fail::TooComplex)?;
+                    links.parents.push(owner);
+                    let page = match element.get(b"Pg") {
+                        Some(Object::Ref(own)) => Some(*own),
+                        _ => page,
+                    };
+                    // A marked-content reference: its element's content on `/Pg`, or in the
+                    // form `/Stm` names (R6b-47).
+                    if element.name(b"Type") == Some(b"MCR")
+                        && let Some(mcid) = element.get(b"MCID")
+                        && let Object::Int(mcid) = &*self.resolve(mcid)?
+                    {
+                        if links.kids.len() >= MAX_STRUCT_MARKED {
+                            return Err(Fail::TooComplex);
+                        }
+                        let form = match element.get(b"Stm") {
+                            Some(Object::Ref(form)) => Some(*form),
+                            _ => None,
+                        };
+                        links.kids.push(MarkedKid { element: owner, page, form, mcid: *mcid });
+                    }
                     // Its text, whatever the value is (a reader may show a value that is not a
                     // string; a value of another kind is still compared).
                     for (key_index, key) in (0u8..).zip(STRUCT_TEXT_KEYS) {
@@ -2206,7 +2365,7 @@ impl<'d, 'b> Reader<'d, 'b> {
                     left_out.extend(STRUCT_TEXT_KEYS);
                     shape.extend_from_slice(&self.digest_without(element, &left_out)?);
                     if let Some(kids) = element.get(b"K") {
-                        todo.push((kids.clone(), depth.saturating_add(1), index));
+                        todo.push((kids.clone(), depth.saturating_add(1), index, page));
                     }
                 }
                 Object::Null => {}
@@ -2215,7 +2374,7 @@ impl<'d, 'b> Reader<'d, 'b> {
         }
         facts.digest = sha256(&[b"structure", &parts]);
         facts.shape = sha256(&[b"structure shape", &shape]);
-        Ok(facts)
+        Ok((facts, links))
     }
 
     /// The document information dictionary (the trailer's `/Info`), key by key, each value by
@@ -3608,7 +3767,7 @@ pub(crate) fn read(
         None => ((BTreeMap::new(), Vec::new()), None),
     };
     let layers = catalog.get(b"OCProperties").map(|layers| reader.digest(layers)).transpose()?;
-    let structure_tree = reader.structure_tree(&catalog)?;
+    let (structure_tree, structure_links) = reader.structure_tree(&catalog)?;
     let layer_config = reader.layer_config(&catalog)?;
     let page_index: HashMap<ObjRef, usize> = nodes.iter().enumerate().map(|(index, node)| (node.obj, index)).collect();
     let outline = reader.outline(&catalog, &page_index)?;
@@ -3664,6 +3823,7 @@ pub(crate) fn read(
             named_destinations,
             sections,
             structure_tree,
+            structure_links,
             name_tree_keys,
             misdeclared: BTreeSet::new(),
             info,
@@ -3700,4 +3860,109 @@ pub(crate) fn page_removals(base: &PageFacts, edited: &PageFacts) -> Option<Page
     }
     let gone = |key: &[u8]| base.entries.contains_key(key) && !edited.entries.contains_key(key);
     Some(PageRemovals { text, actions: gone(b"AA"), thumbnail: gone(b"Thumb") })
+}
+
+/// The structure tree's marked-content kids by where their content is: the form XObject that
+/// holds it (`None`: a page's own content) and the MCID (R6b-47). Built once, for the base.
+pub(crate) struct MarkedIndex<'a> {
+    links: &'a StructLinks,
+    by_mcid: HashMap<(Option<ObjRef>, i64), Vec<u32>>,
+}
+
+impl<'a> MarkedIndex<'a> {
+    pub fn new(links: &'a StructLinks, budget: &mut Budget) -> Result<Self, Fail> {
+        let mut by_mcid: HashMap<(Option<ObjRef>, i64), Vec<u32>> = HashMap::new();
+        for (index, kid) in links.kids.iter().enumerate() {
+            budget.tick()?;
+            by_mcid.entry((kid.form, kid.mcid)).or_default().push(u32::try_from(index).map_err(|_| Fail::TooComplex)?);
+        }
+        Ok(Self { links, by_mcid })
+    }
+}
+
+/// Whether a key of [`STRUCT_TEXT_KEYS`] is text standing for the content (`/ActualText`,
+/// `/Alt`, `/E`), which may spell out what a redaction removed (R6b-47); `/Lang` and `/T` do
+/// not.
+fn stands_for_content(key: u8) -> bool {
+    key <= 2
+}
+
+/// R6b-47: whether a rewrite kept text standing for content it removed. A glyph removed from the
+/// base page (`removed`, indices in its glyphs) takes away from every marked-content span it was
+/// drawn in (each level of marked content around it, innermost to outermost) and from every
+/// structure element that span's MCID belongs to, with their ancestors: each must have lost its
+/// `/ActualText`, `/Alt` and `/E` in `edited` (the span's: the edited page's spans must be the
+/// base page's with that text taken away, see [`spans_kept`]; the elements': `edited_tree` has
+/// none of theirs). Otherwise the redacted words survive for copying and assistive technology,
+/// and `true` is returned: the page counts outside the redactions.
+///
+/// Where the readers do not agree on the page's levels (see [`PageFacts::levels_agree`]) no
+/// glyph can be placed in a span: any such text left on the edited page's spans, or anywhere in
+/// the edited structure tree, counts.
+pub(crate) fn alternate_text_kept(
+    base: &PageFacts,
+    edited: &PageFacts,
+    removed: &[usize],
+    index: &MarkedIndex<'_>,
+    edited_tree: &StructFacts,
+    budget: &mut Budget,
+) -> Result<bool, Fail> {
+    if removed.is_empty() {
+        return Ok(false);
+    }
+    if !base.levels_agree {
+        let on_spans = edited.text.iter().any(|span| span.text.iter().any(|(key, _)| stands_for_content(*key)));
+        let in_tree = edited_tree.text.iter().any(|(_, key, _)| stands_for_content(*key));
+        return Ok(on_spans || in_tree);
+    }
+    // Every level a removed glyph was drawn in, its own and those around it.
+    let marked = &base.glyphs.page.marked;
+    let mut hit = vec![false; base.levels.len()];
+    for &glyph in removed {
+        budget.tick()?;
+        let Ok(glyph) = u32::try_from(glyph) else { return Err(Fail::TooComplex) };
+        let Ok(at) = marked.binary_search_by_key(&glyph, |(drawn, _)| *drawn) else { continue };
+        let mut level = marked.get(at).map_or(NO_LEVEL, |(_, level)| *level);
+        while let Some(seen) = hit.get_mut(level as usize) {
+            if *seen {
+                break;
+            }
+            *seen = true;
+            level = base.levels.get(level as usize).map_or(NO_LEVEL, |level| level.parent);
+        }
+    }
+    // Spans: their text standing for the content taken away.
+    let mut stripped = base.text.clone();
+    let mut elements: HashSet<u32> = HashSet::new();
+    let mut todo: Vec<u32> = Vec::new();
+    for (level, _) in base.levels.iter().zip(&hit).filter(|(_, hit)| **hit) {
+        budget.tick()?;
+        if let Some(span) = level.span.and_then(|span| stripped.get_mut(span as usize)) {
+            span.text.retain(|(key, _)| !stands_for_content(*key));
+        }
+        // Elements: those the level's marked content belongs to.
+        let Some(mcid) = level.mcid else { continue };
+        for &kid in index.by_mcid.get(&(level.form, mcid)).map(Vec::as_slice).unwrap_or_default() {
+            budget.tick()?;
+            let Some(kid) = index.links.kids.get(kid as usize) else { continue };
+            // A page's MCID is the page's: a kid on another page is another's content (a kid
+            // naming no page is taken as this page's).
+            if level.form.is_none() && kid.page.is_some_and(|page| page != base.object) {
+                continue;
+            }
+            todo.push(kid.element);
+        }
+    }
+    // With their ancestors: an ancestor's text stands for its descendants' content too.
+    while let Some(element) = todo.pop() {
+        budget.tick()?;
+        if element == STRUCT_ROOT || !elements.insert(element) {
+            continue;
+        }
+        if let Some(parent) = index.links.parents.get(element as usize) {
+            todo.push(*parent);
+        }
+    }
+    let element_kept = edited_tree.text.iter().any(|(element, key, _)| stands_for_content(*key) && elements.contains(element));
+    Ok(element_kept || spans_kept(&stripped, &edited.text).is_none())
 }

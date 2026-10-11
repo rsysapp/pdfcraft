@@ -1187,3 +1187,189 @@ fn a_session_redaction_reports_the_tag_text_it_took_away() {
     assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{inspection:?}");
     assert_eq!(inspection.structure_removed, StructureRemovals { tagged_text: 2, ..StructureRemovals::default() }, "{inspection:?}");
 }
+
+// ── R6b-47: text standing for removed glyphs goes with them ─────────────────────────────────
+
+/// The text standing for "SECRET" in the base of [`alternate_text`].
+const SECRET_SPAN: &str = "/ActualText (SECRET) /Alt (the secret) /E (SECRET)";
+
+/// A one-page tagged file drawing "SECRET" at (20, 200) in `/Span << /MCID 0 {first} >>` (with
+/// `named`, a list named `/S0` in the resources) and "Public" at (20, 100) in
+/// `/Span << /MCID 1 /ActualText (Public) >>`, both in an outer level `/Div << {outer} >>`. The
+/// structure tree: a section (`{section}`) holding a paragraph for each MCID, the first with
+/// `{element}`, the second `/ActualText (Public)`. With `redacted`, "SECRET" is gone and a black
+/// box lies over its place; `tail` is drawn last.
+fn alternate_text(redacted: bool, named: bool, outer: &str, first: &str, section: &str, element: &str, tail: &str) -> Vec<u8> {
+    alternate_text_with(redacted, named, outer, first, section, element, "/ActualText (Public)", tail)
+}
+
+/// [`alternate_text`], the text of "Public" (its span's and its element's) `public`.
+#[allow(clippy::too_many_arguments)]
+fn alternate_text_with(redacted: bool, named: bool, outer: &str, first: &str, section: &str, element: &str, public: &str, tail: &str) -> Vec<u8> {
+    let mut b = Builder::new();
+    b.object(1, b"<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 5 0 R /MarkInfo << /Marked true >> >>");
+    b.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 300] >>");
+    let (list, properties) = if named {
+        ("/S0".to_string(), format!("/Properties << /S0 << /MCID 0 {first} >> >>"))
+    } else {
+        (format!("<< /MCID 0 {first} >>"), String::new())
+    };
+    b.object(
+        3,
+        format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> {properties} >> /StructParents 0 >>")
+            .as_bytes(),
+    );
+    let (secret, boxed) = if redacted { ("", "0 g 16 190 70 26 re f\n") } else { ("(SECRET) Tj", "") };
+    let content = format!(
+        "/Div << {outer} >> BDC\n/Span {list} BDC BT /F1 12 Tf 20 200 Td {secret} ET EMC\n/Span << /MCID 1 {public} >> BDC BT /F1 12 Tf 20 100 Td (Public) Tj ET EMC\nEMC\n{boxed}{tail}"
+    );
+    b.object(4, &stream("", content.as_bytes()));
+    b.object(5, b"<< /Type /StructTreeRoot /K 6 0 R >>");
+    b.object(6, format!("<< /S /Sect /P 5 0 R /Pg 3 0 R /K [7 0 R 8 0 R] {section} >>").as_bytes());
+    b.object(7, format!("<< /S /P /P 6 0 R /K 0 {element} >>").as_bytes());
+    b.object(8, format!("<< /S /P /P 6 0 R /K 1 {public} >>").as_bytes());
+    let rows = b.offsets.clone();
+    b.finish(9, &rows, "")
+}
+
+#[test]
+fn a_rewrite_keeping_text_that_stands_for_removed_glyphs_is_outside_the_redactions() {
+    // R6b-47: 1d93b91 accepted a redaction that kept an inline property list's /ActualText
+    // around the removed glyphs (follow-up 5, concern 5): the redacted words survived for
+    // copying and assistive technology.
+    let outside = |base: &[u8], edited: &[u8]| inspect(base, edited, InspectLimits::default()).unwrap().content.pages_changed_outside_redactions;
+    let section = "/Alt (A section about the SECRET)";
+    let base = alternate_text(false, false, "", SECRET_SPAN, section, "/ActualText (SECRET)", "");
+    // Everything standing for "SECRET" taken away: a redaction, the text taken away reported.
+    let clean = alternate_text(true, false, "", "", "", "", "");
+    let inspection = inspect(&base, &clean, InspectLimits::default()).unwrap();
+    assert_eq!((inspection.content.pages_changed_outside_redactions, inspection.structure_removed.tagged_text), (0, 5), "{inspection:?}");
+    assert_eq!(inspection.text.pages_with_text_removed, 1, "{inspection:?}");
+    // Any of it kept: the span's, the element's, or an ancestor's.
+    for (case, first, section, element) in [
+        ("the span's /ActualText", "/ActualText (SECRET)", "", ""),
+        ("the span's /Alt", "/Alt (the secret)", "", ""),
+        ("the span's /E", "/E (SECRET)", "", ""),
+        ("the element's /ActualText", "", "", "/ActualText (SECRET)"),
+        ("the section's /Alt", "", section, ""),
+    ] {
+        assert_eq!(outside(&base, &alternate_text(true, false, "", first, section, element, "")), 1, "{case}");
+    }
+    // /Lang and /T do not stand for the content: kept, they are no leak.
+    let base = alternate_text(false, false, "", "/ActualText (SECRET) /Lang (en)", "", "/T (Heading)", "");
+    assert_eq!(outside(&base, &alternate_text(true, false, "", "/Lang (en)", "", "/T (Heading)", "")), 0);
+    // A list named in the resources, and a level around the span.
+    let base = alternate_text(false, true, "", SECRET_SPAN, "", "", "");
+    assert_eq!(outside(&base, &alternate_text(true, true, "", "/ActualText (SECRET)", "", "", "")), 1, "named, kept");
+    assert_eq!(outside(&base, &alternate_text(true, true, "", "", "", "", "")), 0, "named, taken away");
+    let base = alternate_text(false, false, "/ActualText (SECRET Public)", "", "", "", "");
+    assert_eq!(outside(&base, &alternate_text(true, false, "/ActualText (SECRET Public)", "", "", "", "")), 1, "outer level, kept");
+    assert_eq!(outside(&base, &alternate_text(true, false, "", "", "", "", "")), 0, "outer level, taken away");
+    // Text standing for glyphs that stay is kept: "Public" keeps its /ActualText throughout.
+}
+
+#[test]
+fn where_the_readers_disagree_on_marked_content_no_such_text_may_stay() {
+    // An `EMC` closing what its stream did not open: which glyph is in which span is each
+    // reader's guess, so any text standing for content left on the page's spans, or in the
+    // structure tree, counts outside the redactions once glyphs were removed.
+    let base = alternate_text(false, false, "", "/ActualText (SECRET)", "", "", "EMC\n");
+    let edited = |public: &str| alternate_text_with(true, false, "", "", "", "", public, "EMC\n");
+    let outside = |edited: &[u8]| inspect(&base, edited, InspectLimits::default()).unwrap().content.pages_changed_outside_redactions;
+    assert_eq!(outside(&edited("/ActualText (Public)")), 1);
+    assert_eq!(outside(&edited("")), 0);
+}
+
+/// A one-page file drawing form `/Fm1` once, whose content is "SECRET" at (20, 200) in
+/// `/Span << {span} >>` and "Public" at (20, 100); with `redacted`, "SECRET" is gone and a black
+/// box lies over its place.
+fn form_with_span(redacted: bool, span: &str) -> Vec<u8> {
+    let mut b = Builder::new();
+    head(&mut b);
+    b.object(3, b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /XObject << /Fm1 5 0 R >> >> >>");
+    let boxed = if redacted { "\n0 g 16 190 70 26 re f" } else { "" };
+    b.object(4, &stream("", format!("/Fm1 Do{boxed}").as_bytes()));
+    let secret = if redacted { "" } else { "(SECRET) Tj" };
+    let form = format!("/Span << {span} >> BDC BT /F1 12 Tf 20 200 Td {secret} ET EMC BT /F1 12 Tf 20 100 Td (Public) Tj ET");
+    b.object(5, &stream(&format!("/Type /XObject /Subtype /Form /BBox [0 0 200 300] {RESOURCES}"), form.as_bytes()));
+    let rows = b.offsets.clone();
+    b.finish(6, &rows, "")
+}
+
+#[test]
+fn a_span_in_a_form_loses_its_text_with_its_glyphs() {
+    let base = form_with_span(false, "/ActualText (SECRET)");
+    let outside = |edited: &[u8]| inspect(&base, edited, InspectLimits::default()).unwrap().content.pages_changed_outside_redactions;
+    assert_eq!(outside(&form_with_span(true, "/ActualText (SECRET)")), 1);
+    assert_eq!(outside(&form_with_span(true, "")), 0);
+}
+
+/// Every text `bytes` exposes, lower-cased: the glyphs hayro extracts from each page, and every
+/// string of every object in the file (decoded stream data included: a property list written
+/// in a content stream is there).
+fn exposed_text(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    let hayro = pdfcraft_render::content::ContentDocument::open(std::sync::Arc::new(bytes.to_vec()), u64::MAX).unwrap();
+    for page in 0..hayro.page_count() {
+        out.extend(hayro.content(page).unwrap().glyphs.chars);
+        out.push('\n');
+    }
+    fn walk(object: &pdfcraft_cos::Object, out: &mut String) {
+        match object {
+            pdfcraft_cos::Object::String(string) => out.push_str(&String::from_utf8_lossy(&string.bytes)),
+            pdfcraft_cos::Object::Array(items) => items.iter().for_each(|item| walk(item, out)),
+            pdfcraft_cos::Object::Dict(dict) => dict.iter().for_each(|(_, value)| walk(value, out)),
+            pdfcraft_cos::Object::Stream(stream) => {
+                stream.dict.iter().for_each(|(_, value)| walk(value, out));
+                out.push_str(&String::from_utf8_lossy(&stream.decoded().unwrap()));
+            }
+            _ => {}
+        }
+        out.push('\n');
+    }
+    let doc = pdfcraft_cos::Document::open(std::sync::Arc::new(bytes.to_vec())).unwrap();
+    let size = doc.trailer().int(b"Size").unwrap();
+    for num in 1..u32::try_from(size).unwrap() {
+        if let Ok(object) = doc.try_get(num) {
+            walk(&object, &mut out);
+        }
+    }
+    out.to_lowercase()
+}
+
+#[test]
+fn a_session_redaction_takes_away_the_text_standing_for_what_it_removed() {
+    // R6b-47, the redactor's side: a real redaction of "SECRET" on a tagged page whose spans,
+    // their enclosing level, the paragraph and its section all carry text standing for it is
+    // accepted, and no text the file exposes (extracted, /ActualText, /Alt, /E) says it any more;
+    // "Public" keeps its own.
+    use crate::{Edit, NewAnnotation, Session, Shape, Style, rect_quad};
+    for named in [false, true] {
+        let base = alternate_text(
+            false,
+            named,
+            "/ActualText (SECRET Public) /E (the SECRET and the Public)",
+            SECRET_SPAN,
+            "/Alt (A section about the SECRET)",
+            "/ActualText (SECRET) /Alt (the secret) /E (SECRET)",
+            "",
+        );
+        assert!(exposed_text(&base).contains("secret"));
+        let mark = Shape::Redact { quads: vec![rect_quad([16.0, 190.0, 120.0, 220.0])], overlay: String::new(), look: Default::default() };
+        let mut session = Session::new().with_clock(|| 1_700_000_000);
+        session.set_keep_document_information(true);
+        let id = session.open("base.pdf", None, std::sync::Arc::new(base.clone()), None).unwrap();
+        let note = NewAnnotation { page: 0, style: Style::default_for(&mark), shape: mark, contents: String::new(), author: "Sari".into() };
+        session.apply(id, Edit::AddAnnotation(note)).unwrap();
+        session.apply(id, Edit::ApplyRedactions { pages: None }).unwrap();
+        let redacted = session.save_bytes(id).unwrap();
+        let inspection = inspect(&base, &redacted, InspectLimits::default()).unwrap();
+        assert!(!inspection.base_kept, "named {named}: {inspection:?}");
+        assert_eq!(inspection.text, TextChanges { pages_with_text_removed: 1, pages_with_text_added: 0 }, "named {named}: {inspection:?}");
+        assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "named {named}: {inspection:?}");
+        let exposed = exposed_text(&redacted);
+        let leaks: Vec<&str> = exposed.lines().filter(|line| line.contains("secret")).collect();
+        assert!(leaks.is_empty(), "named {named}: {leaks:?}");
+        assert!(exposed.contains("public"), "named {named}");
+    }
+}

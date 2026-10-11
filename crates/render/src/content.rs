@@ -87,6 +87,14 @@ pub struct PageGlyphs {
     /// The glyphs drawn inside optional content, in order: (index in `glyphs`, index in
     /// [`PageContent::layers`]).
     pub layers: Vec<(u32, u32)>,
+    /// Embed build: every level of marked content (`BDC`, `BMC`) the page's own content and the
+    /// forms it draws open, in the order they open: its tag and the level it opened inside
+    /// (an index here; `u32::MAX`: none). Not a tiling pattern's cell's, a soft mask's group's or
+    /// a Type 3 glyph procedure's (their glyphs are not text on the page).
+    pub marked_levels: Vec<(Vec<u8>, u32)>,
+    /// Embed build: the glyphs drawn inside marked content, in order: (index in `glyphs`, the
+    /// innermost level open, an index in `marked_levels`).
+    pub marked: Vec<(u32, u32)>,
 }
 
 impl PageGlyphs {
@@ -268,6 +276,9 @@ struct PageDevice<'a> {
     /// The optional-content memberships met, and the last one looked up (by its `Arc`).
     layers: Vec<Arc<[LayerMark]>>,
     last_layer: Option<(Arc<[LayerMark]>, u32)>,
+    /// Embed build: the levels of marked content open now (indices in `found.marked_levels`),
+    /// innermost last.
+    open_marked: Vec<u32>,
 }
 
 impl<'a> PageDevice<'a> {
@@ -286,6 +297,7 @@ impl<'a> PageDevice<'a> {
             inline: HashMap::new(),
             layers: Vec::new(),
             last_layer: None,
+            open_marked: Vec::new(),
         }
     }
 
@@ -426,6 +438,9 @@ impl<'a> Device<'a> for PageDevice<'a> {
         if let Some(layer) = self.layer() {
             self.found.layers.push((index, layer));
         }
+        if let Some(level) = self.open_marked.last() {
+            self.found.marked.push((index, *level));
+        }
         self.found.chars.extend(text.chars());
         let end = u32::try_from(self.found.chars.len()).unwrap_or(u32::MAX);
         self.found.glyphs.push((end, [b.x0 as f32, b.y0 as f32, b.x1 as f32, b.y1 as f32]));
@@ -457,6 +472,22 @@ impl<'a> Device<'a> for PageDevice<'a> {
     }
     fn pop_clip_path(&mut self) {}
     fn pop_transparency_group(&mut self) {}
+    // Embed build: which level of marked content each glyph is drawn in (the save inspector's
+    // R6b-47). Only the page's own content and its forms (`with_glyphs`).
+    fn begin_marked_content(&mut self, tag: &[u8], _mcid: Option<i32>) {
+        if !self.with_glyphs {
+            return;
+        }
+        let parent = self.open_marked.last().copied().unwrap_or(u32::MAX);
+        let index = u32::try_from(self.found.marked_levels.len()).unwrap_or(u32::MAX);
+        self.found.marked_levels.push((tag.to_vec(), parent));
+        self.open_marked.push(index);
+    }
+    fn end_marked_content(&mut self) {
+        if self.with_glyphs {
+            self.open_marked.pop();
+        }
+    }
     fn draw_form(&mut self, id: Option<ObjectIdentifier>, bbox: &BezPath) {
         let Some((num, generation)) = id.and_then(|id| u32::try_from(id.obj_number).ok().zip(u16::try_from(id.gen_number).ok())) else {
             self.unidentified = self.unidentified.saturating_add(1);

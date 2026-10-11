@@ -866,6 +866,9 @@ fn read_side(bytes: &[u8], against: Option<(&[u8], &Structure, bool)>, placement
         let page_data = content.decoded.take().unwrap_or_default();
         budget.hashed(page_data.len())?;
         budget.glyphs(content.glyphs.len().saturating_add(content.glyphs.chars.len()))?;
+        // The levels of marked content around the glyphs (R6b-47), each with its tag.
+        let tags = content.glyphs.marked_levels.iter().map(|(tag, _)| tag.len().saturating_add(1)).fold(0usize, usize::saturating_add);
+        budget.glyphs(tags.saturating_add(content.glyphs.marked.len()))?;
         contents.push((content, structure::sha256(&[&page_data])));
     }
     // A /Length that disagrees with `endstream` is tolerated only in the base's own objects:
@@ -913,6 +916,17 @@ fn read_side(bytes: &[u8], against: Option<(&[u8], &Structure, bool)>, placement
         known.agree(&doc, budget, &content.resolved)?;
         // Every image and form the content draws (as `pdfcraft_cos` reads it) is one hayro drew.
         structure::check_drawn(page, &content, number)?;
+        // R6b-47: which glyph is in which level of marked content (and so in which span and
+        // structure element) is known only where both readers open the same levels, each with
+        // its tag inside the same level, and marked content is balanced.
+        page.levels_agree = !page.levels_unbalanced
+            && !content.layers_unbalanced
+            && page.levels.len() == content.glyphs.marked_levels.len()
+            && page
+                .levels
+                .iter()
+                .zip(&content.glyphs.marked_levels)
+                .all(|(ours, (tag, parent))| ours.tag.as_deref() == Some(tag.as_slice()) && ours.parent == *parent);
         // A glyph without text is named by its font's content, which a rewrite does not renumber.
         let mut unnamed = HashMap::with_capacity(content.glyphs.unnamed.len());
         for (glyph, (num, generation), id) in &content.glyphs.unnamed {
@@ -1625,6 +1639,8 @@ fn compare_pages(
     inspection: &mut Inspection,
 ) -> Result<(), InspectError> {
     let mut counts = PageCounts::default();
+    // The base's structure tree's marked content by where it is, once a rewrite needs it (R6b-47).
+    let mut marked_index: Option<structure::MarkedIndex<'_>> = None;
     for &(old, new) in pairs {
         budget.time().map_err(|fail| fail.of(Role::Edited))?;
         let (Some(b), Some(e)) = (before.structure.pages.get(old), after.structure.pages.get(new)) else {
@@ -1682,6 +1698,18 @@ fn compare_pages(
                         taken.thumbnails = taken.thumbnails.saturating_add(u32::from(removed.thumbnail));
                     }
                     None => outside = true,
+                }
+                // R6b-47: the spans and structure elements whose glyphs were removed may not
+                // keep text standing for them (the redacted words would survive for copying and
+                // assistive technology).
+                if !pairing.removed.is_empty() {
+                    let index = match marked_index.take() {
+                        Some(index) => index,
+                        None => structure::MarkedIndex::new(&before.structure.structure_links, budget).map_err(|fail| fail.of(Role::Base))?,
+                    };
+                    outside |= structure::alternate_text_kept(b, e, &pairing.removed, &index, &after.structure.structure_tree, budget)
+                        .map_err(|fail| fail.of(Role::Edited))?;
+                    marked_index = Some(index);
                 }
                 // Text kept but drawn in another order reads otherwise.
                 outside |= !pairing.in_order;
