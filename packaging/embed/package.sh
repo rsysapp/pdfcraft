@@ -163,13 +163,32 @@ cp "$ROOT/LICENSE-MIT" "$ROOT/LICENSE-APACHE" "$ROOT/ATTRIBUTION.md" "$OUT/"
 # The licence texts of the third-party assets compiled into the module (NOTICE and ATTRIBUTION.md
 # name them): published name <- source. Registry crates are found through cargo's own resolution,
 # since their folder differs per machine.
+# Only packages the module links count: the normal dependencies reachable from pdfcraft-embed in
+# the wasm32 resolve graph, not every package of the workspace (which also holds the desktop apps'
+# dependencies). A name that resolves to more than one package there is refused, since the licence
+# copied could be the wrong version's.
 METADATA="$(cargo metadata --format-version 1 --locked --filter-platform wasm32-unknown-unknown)"
 crate_dir() {
-  local dir
-  dir="$(printf '%s' "$METADATA" | grep -o "\"manifest_path\":\"[^\"]*/$1-[0-9][^\"/]*/Cargo.toml\"" | head -n 1 \
-    | sed -e 's/^"manifest_path":"//' -e 's#/Cargo.toml"$##')"
-  [ -n "$dir" ] || { echo "error: $1 is not among the module's dependencies" >&2; exit 1; }
-  echo "$dir"
+  local dirs count
+  dirs="$(printf '%s' "$METADATA" | jq -r --arg name "$1" '
+    (.resolve.nodes | map({key: .id, value: .}) | from_entries) as $nodes
+    | [.packages[] | select(.name == "pdfcraft-embed") | .id] as $roots
+    | if ($roots | length) != 1 then error("pdfcraft-embed is not one package of the workspace") else . end
+    | ({seen: {($roots[0]): true}, queue: $roots}
+       | until(.queue | length == 0;
+           .queue[0] as $id
+           | .queue |= .[1:]
+           | reduce ($nodes[$id].deps[]? | select(any(.dep_kinds[]; .kind == null)) | .pkg) as $dep (.;
+               if .seen[$dep] then . else .seen[$dep] = true | .queue += [$dep] end))
+       | .seen) as $linked
+    | .packages[] | select(.name == $name and $linked[.id]) | .manifest_path | rtrimstr("/Cargo.toml")')"
+  count="$(printf '%s' "$dirs" | grep -c . || true)"
+  case "$count" in
+    1) echo "$dirs" ;;
+    0) echo "error: $1 is not among the module's dependencies" >&2; exit 1 ;;
+    *) echo "error: $1 resolves to $count packages in the module's dependencies; this script must name the one whose licence ships:" >&2
+       printf '%s\n' "$dirs" >&2; exit 1 ;;
+  esac
 }
 CMAP="$(crate_dir hayro-cmap)"
 EGUI_FONTS="$(crate_dir epaint_default_fonts)/fonts"
