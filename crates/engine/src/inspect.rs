@@ -103,6 +103,8 @@ pub struct Inspection {
     pub destinations: DestinationChanges,
     /// The document information (title, author, …), compared in both kinds of save (R6b-42).
     pub info: InfoChanges,
+    /// What a rewrite took away that no viewer draws on a page (R6b-41).
+    pub structure_removed: StructureRemovals,
     /// Rewrites only (empty for appended updates): the applied redaction boxes that explain the
     /// changes, as (page number in the edited file, from 1; rectangle `[x0, y0, x1, y1]` in that
     /// page's user space, PDF points). Boxes that overlap (the line boxes of one mark) are one
@@ -229,9 +231,11 @@ pub struct ContentChanges {
     ///   text in);
     /// - a page entry no fact reports (any but its content, resources, boxes, rotation,
     ///   annotations and what no viewer draws) added, removed or changed, but for its actions
-    ///   (`/AA`) and thumbnail (`/Thumb`) removed; text for assistive technology and copying in
-    ///   a property list it draws with (`/ActualText`, `/Alt`, `/E`, `/Lang`, `/T`) added or
-    ///   changed;
+    ///   (`/AA`) and thumbnail (`/Thumb`) removed (reported in [`StructureRemovals`]); text for
+    ///   assistive technology and copying in a property list it draws with (`/ActualText`,
+    ///   `/Alt`, `/E`, `/Lang`, `/T`) added, changed or moved to another marked-content span,
+    ///   the spans taken in drawing order, each with its tag and its list's other entries
+    ///   (R6b-41; text taken away is reported in [`StructureRemovals::tagged_text`]);
     /// - a glyph, image or form in other optional content than at its place in the base, or shown
     ///   otherwise by default (R6b-29), whatever the boxes cover;
     /// - where content is in optional content: the page in any combination of the states of the
@@ -314,6 +318,33 @@ pub struct InfoChanges {
     /// base's when the edited file has no document information; every key of the edited file's
     /// when the base has none. Empty: unchanged.
     pub changed: Vec<String>,
+}
+
+/// What a rewrite (an applied redaction) took away that no viewer draws on a page, each
+/// accepted as part of the rewrite and reported so that a host can show it (R6b-41): a
+/// redaction cleans the tags of the text it removed, and an editor's sanitising removes the
+/// XMP packet, pages' actions and thumbnails. Counts, all 0 for an appended update, which may
+/// take none of these away (there, each is a change: the structure tree and the XMP packet fail
+/// the inspection, a page's entries count in `content.pages_with_content_changed`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StructureRemovals {
+    /// Text for assistive technology and copying taken away, entry by entry (an `/ActualText`,
+    /// `/Alt`, `/E`, `/Lang` or `/T`): the structure tree's elements' (R6b-44), and the
+    /// marked-content property lists' that pages present in both files draw with (R6b-41).
+    /// Such text may only be taken away: text added, changed or moved to another structure
+    /// element fails the inspection (an element is its place in the tree's order and its
+    /// parent's), and text added, changed or moved to another marked-content span (the spans
+    /// taken in drawing order) counts the page in `content.pages_changed_outside_redactions`.
+    pub tagged_text: u32,
+    /// The document's XMP metadata packet (the catalog's `/Metadata`) taken away: 0 or 1. A
+    /// page's or form's own XMP packet is not compared (no viewer shows it).
+    pub metadata: u32,
+    /// Pages present in both files whose actions (`/AA`: what runs when the page opens or
+    /// closes) were taken away.
+    pub actions: u32,
+    /// Pages present in both files whose thumbnail image (`/Thumb`, which shows the page as it
+    /// was) was taken away.
+    pub thumbnails: u32,
 }
 
 /// Why a comparison has no answer. The host refuses the edited file on every one of them.
@@ -629,20 +660,24 @@ fn compare(base: &[u8], edited: &[u8], limits: Limits) -> Result<Inspection, Ins
         return Err(InspectError::Edited("an entry of the named destinations' tree changed, which this comparison does not report".into()));
     }
     // The structure tree: an appended update leaves it as it was; a rewrite may only take text
-    // and marked content away from it (a redaction cleans the tags of what it removed), never
-    // add or change text, nor change anything else in it.
+    // and marked content away from it (a redaction cleans the tags of what it removed), element
+    // by element (R6b-44), never add, change or move text, nor change anything else in it.
     let (tags_before, tags_after) = (&before.structure.structure_tree, &after.structure.structure_tree);
-    let tags_changed = if base_kept {
-        tags_before != tags_after
-    } else {
-        tags_before.shape != tags_after.shape
-            || tags_after.text.iter().any(|(entry, count)| tags_before.text.get(entry).is_none_or(|was| count > was))
-    };
-    if tags_changed {
+    let tags_removed = if base_kept { (tags_before == tags_after).then_some(0) } else { structure::tags_kept(tags_before, tags_after) };
+    let Some(tags_removed) = tags_removed else {
         return Err(InspectError::Edited("the structure tree's text or tags changed, which this comparison does not report".into()));
-    }
+    };
     let mut inspection = Inspection { base_kept, ..Inspection::default() };
     inspection.info = InfoChanges { changed: info_changed(&before.structure.info, &after.structure.info) };
+    inspection.structure_removed = StructureRemovals {
+        tagged_text: count(tags_removed),
+        metadata: u32::from(
+            !base_kept
+                && before.structure.catalog.contains_key(b"Metadata".as_slice())
+                && !after.structure.catalog.contains_key(b"Metadata".as_slice()),
+        ),
+        ..StructureRemovals::default()
+    };
     let edited_fail = |fail: Fail| fail.of(Role::Edited);
     // Outline entries pair by title, not by page: where their destinations went says, between
     // changed pages equally alike, which went where.
@@ -1582,7 +1617,15 @@ fn compare_pages(
             // assistive technology added or changed, or a page entry no fact reports changed.
             if drawn_differently {
                 outside |= layers_changed_for(b, e, &pairing, budget).map_err(|fail| fail.of(Role::Edited))?;
-                outside |= structure::page_keys_changed(b, e);
+                match structure::page_removals(b, e) {
+                    Some(removed) => {
+                        let taken = &mut inspection.structure_removed;
+                        taken.tagged_text = taken.tagged_text.saturating_add(count(removed.text));
+                        taken.actions = taken.actions.saturating_add(u32::from(removed.actions));
+                        taken.thumbnails = taken.thumbnails.saturating_add(u32::from(removed.thumbnail));
+                    }
+                    None => outside = true,
+                }
                 // Text kept but drawn in another order reads otherwise.
                 outside |= !pairing.in_order;
             }

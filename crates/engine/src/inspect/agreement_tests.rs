@@ -972,3 +972,218 @@ fn the_document_information_is_compared_in_both_kinds_of_save() {
     let odd = informed(false, b"null", "/Info << /Title (Supply Agreement 2027) >>");
     assert!(matches!(inspect(&odd, &odd, InspectLimits::default()), Err(InspectError::Base(_))));
 }
+
+// ── R6b-41: every removal accepted is reported ──────────────────────────────────────────────
+
+/// A one-page tagged file: "Alpha" drawn in a span (`/Span << /MCID 0 {span} >> BDC`) and,
+/// unless `boxed`, a word at (150, 20) (with `boxed`, a black box over it: a rewrite redacting
+/// it). The page has the entries `page`; the catalog `catalog`, a structure tree (8, with one
+/// figure element 9 having the entries `element`) and an XMP packet (6); a thumbnail is
+/// object 7.
+fn removable(boxed: bool, catalog: &str, page: &str, span: &str, element: &str) -> Vec<u8> {
+    let mut b = Builder::new();
+    b.object(1, format!("<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 8 0 R /MarkInfo << /Marked true >> {catalog} >>").as_bytes());
+    b.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 300] >>");
+    b.object(3, format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R {RESOURCES} /StructParents 0 {page} >>").as_bytes());
+    let last = if boxed { "0 g 146 14 16 18 re f" } else { "BT /F1 12 Tf 150 20 Td (X) Tj ET" };
+    let content = format!("/Span << /MCID 0 {span} >> BDC\n{}\nEMC\n{last}", String::from_utf8(text("Alpha")).unwrap());
+    b.object(4, &stream("", content.as_bytes()));
+    b.object(5, b"null");
+    b.object(6, &stream("/Type /Metadata /Subtype /XML", b"<x:xmpmeta xmlns:x='adobe:ns:meta/'/>"));
+    b.object(7, &stream("/Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", b"\xff"));
+    b.object(8, b"<< /Type /StructTreeRoot /K 9 0 R >>");
+    b.object(9, format!("<< /S /Figure /P 8 0 R /Pg 3 0 R /K 0 {element} >>").as_bytes());
+    let rows = b.offsets.clone();
+    b.finish(10, &rows, "")
+}
+
+#[test]
+fn every_removal_a_rewrite_makes_is_reported() {
+    // Follow-up 4 accepted these removals without a fact (aedee8c had no field for them).
+    const CATALOG: &str = "/Metadata 6 0 R";
+    const PAGE: &str = "/AA << /O << /S /URI /URI (https://example.com/opened) >> >> /Thumb 7 0 R";
+    const SPAN: &str = "/ActualText (Alpha)";
+    const ELEMENT: &str = "/Alt (A signature)";
+    let base = removable(false, CATALOG, PAGE, SPAN, ELEMENT);
+    assert_eq!(inspect(&base, &base, InspectLimits::default()).unwrap().structure_removed, StructureRemovals::default());
+    let removals = |tagged_text, metadata, actions, thumbnails| StructureRemovals { tagged_text, metadata, actions, thumbnails };
+    // (case, catalog, page, span, element, what is reported)
+    for (case, catalog, page, span, element, expected) in [
+        ("nothing taken away", CATALOG, PAGE, SPAN, ELEMENT, removals(0, 0, 0, 0)),
+        ("the element's text", CATALOG, PAGE, SPAN, "", removals(1, 0, 0, 0)),
+        ("the span's text", CATALOG, PAGE, "", ELEMENT, removals(1, 0, 0, 0)),
+        ("both texts", CATALOG, PAGE, "", "", removals(2, 0, 0, 0)),
+        ("the XMP packet", "", PAGE, SPAN, ELEMENT, removals(0, 1, 0, 0)),
+        ("the page's actions", CATALOG, "/Thumb 7 0 R", SPAN, ELEMENT, removals(0, 0, 1, 0)),
+        ("the page's thumbnail", CATALOG, "/AA << /O << /S /URI /URI (https://example.com/opened) >> >>", SPAN, ELEMENT, removals(0, 0, 0, 1)),
+        ("everything", "", "", "", "", removals(2, 1, 1, 1)),
+    ] {
+        let edited = removable(true, catalog, page, span, element);
+        let inspection = inspect(&base, &edited, InspectLimits::default()).unwrap_or_else(|error| panic!("{case}: {error:?}"));
+        assert_eq!(inspection.structure_removed, expected, "{case}: {inspection:?}");
+        assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{case}: {inspection:?}");
+        assert_eq!(inspection.redaction_areas.len(), 1, "{case}: {inspection:?}");
+    }
+    // An appended update may take none of these away: a page's entries count as its content
+    // changed (and the tags and the XMP packet fail), never as a removal.
+    let prev = Some(last_section(&base));
+    let page = format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R {RESOURCES} /StructParents 0 /Thumb 7 0 R >>");
+    let inspection = inspect(&base, &update_section(&base, &[(3, page.as_bytes())], prev, ""), InspectLimits::default()).unwrap();
+    assert_eq!((inspection.structure_removed, inspection.content.pages_with_content_changed), (StructureRemovals::default(), 1), "{inspection:?}");
+}
+
+/// A one-page file drawing two spans, `/Span << {first} >> BDC … EMC` around "Price" and
+/// `/Span << {second} >> BDC … EMC` around "Total", and, unless `boxed`, a word at (150, 20)
+/// (with `boxed`, a black box over it).
+fn two_spans(boxed: bool, first: &str, second: &str) -> Vec<u8> {
+    let mut b = Builder::new();
+    head(&mut b);
+    b.object(3, format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R {RESOURCES} >>").as_bytes());
+    let last = if boxed { "0 g 146 14 16 18 re f" } else { "BT /F1 12 Tf 150 20 Td (X) Tj ET" };
+    let content = format!(
+        "/Span << {first} >> BDC BT /F1 12 Tf 20 150 Td (Price) Tj ET EMC\n/Span << {second} >> BDC BT /F1 12 Tf 20 100 Td (Total) Tj ET EMC\n{last}"
+    );
+    b.object(4, &stream("", content.as_bytes()));
+    let rows = b.offsets.clone();
+    b.finish(5, &rows, "")
+}
+
+#[test]
+fn property_list_text_is_compared_span_by_span_in_drawing_order() {
+    // R6b-41: aedee8c compared a page's property-list text as one multiset, so text swapped
+    // between spans, or moved from one span to another, passed a rewrite as a redaction.
+    let base = two_spans(false, "/ActualText (Price 100)", "/ActualText (Price 900)");
+    // (case, first span, second span, accepted, text entries taken away)
+    for (case, first, second, accepted, taken) in [
+        ("as it was", "/ActualText (Price 100)", "/ActualText (Price 900)", true, 0),
+        ("one taken away", "", "/ActualText (Price 900)", true, 1),
+        ("swapped", "/ActualText (Price 900)", "/ActualText (Price 100)", false, 0),
+        ("one changed", "/ActualText (Price 100)", "/ActualText (Price 1)", false, 0),
+        ("one added", "/ActualText (Price 100) /Alt (Price)", "/ActualText (Price 900)", false, 0),
+    ] {
+        let inspection =
+            inspect(&base, &two_spans(true, first, second), InspectLimits::default()).unwrap_or_else(|error| panic!("{case}: {error:?}"));
+        let outside = u32::from(!accepted);
+        assert_eq!(inspection.content.pages_changed_outside_redactions, outside, "{case}: {inspection:?}");
+        if accepted {
+            assert_eq!(inspection.structure_removed.tagged_text, taken, "{case}: {inspection:?}");
+        }
+    }
+    // Text moved from the first span to the second (one only: the multiset is the same).
+    let one = two_spans(false, "/ActualText (Price 100)", "");
+    let moved = inspect(&one, &two_spans(true, "", "/ActualText (Price 100)"), InspectLimits::default()).unwrap();
+    assert_eq!(moved.content.pages_changed_outside_redactions, 1, "{moved:?}");
+}
+
+// ── R6b-44: the structure tree's text, element by element ───────────────────────────────────
+
+/// A tagged one-page file as [`tagged`] makes it (a rewrite with `boxed`), whose structure tree
+/// (object 6) has the kids `kids` and the elements `elements` (objects 7 onwards).
+fn tree(boxed: bool, kids: &str, elements: &[String]) -> Vec<u8> {
+    let mut objects = vec![format!("<< /Type /StructTreeRoot /K {kids} >>").into_bytes()];
+    objects.extend(elements.iter().map(|element| element.clone().into_bytes()));
+    tagged(boxed, "/StructTreeRoot 6 0 R /MarkInfo << /Marked true >>", &objects.iter().map(Vec::as_slice).collect::<Vec<_>>())
+}
+
+#[test]
+fn structure_tree_text_is_compared_element_by_element() {
+    // The reviewer's I-3: aedee8c compared the tags' text as one multiset for the document, so
+    // a rewrite with a word redaction could swap it between elements or reorder like elements.
+    let element = |role: &str, parent: u32, text: &str, kids: &str| format!("<< /S /{role} /P {parent} 0 R /Pg 3 0 R {text} /K {kids} >>");
+    let figures = |first: &str, second: &str| vec![element("Figure", 6, first, "0"), element("Figure", 6, second, "1")];
+    let seller = "/Alt (Signature of the Seller)";
+    let buyer = "/Alt (Signature of the Buyer)";
+    let base = tree(false, "[7 0 R 8 0 R]", &figures(seller, buyer));
+    let spans = |first: &str, second: &str| vec![element("Span", 6, first, "0"), element("Span", 6, second, "1")];
+    let priced = tree(false, "[7 0 R 8 0 R]", &spans("/ActualText (Price 100)", "/ActualText (Price 900)"));
+    let plain = tree(false, "[7 0 R 8 0 R]", &figures("", ""));
+    let named = tree(false, "[7 0 R 8 0 R]", &figures("/Alt /Seller", ""));
+    // (case, base, rewrite, text entries taken away; `None`: refused)
+    type Case<'a> = (&'a str, &'a Vec<u8>, Vec<u8>, Option<u32>);
+    let cases: Vec<Case<'_>> = vec![
+        ("as it was", &base, tree(true, "[7 0 R 8 0 R]", &figures(seller, buyer)), Some(0)),
+        ("one alternate text taken away", &base, tree(true, "[7 0 R 8 0 R]", &figures("", buyer)), Some(1)),
+        (
+            "a marked-content kid taken away",
+            &base,
+            tree(true, "[7 0 R 8 0 R]", &[element("Figure", 6, seller, "[]"), element("Figure", 6, buyer, "1")]),
+            Some(0),
+        ),
+        ("/Alt swapped between the figures", &base, tree(true, "[7 0 R 8 0 R]", &figures(buyer, seller)), None),
+        (
+            "/ActualText swapped between the spans",
+            &priced,
+            tree(true, "[7 0 R 8 0 R]", &spans("/ActualText (Price 900)", "/ActualText (Price 100)")),
+            None,
+        ),
+        ("the figures reordered in the root's /K", &base, tree(true, "[8 0 R 7 0 R]", &figures(seller, buyer)), None),
+        (
+            "figures without text, their content swapped",
+            &plain,
+            tree(true, "[7 0 R 8 0 R]", &[element("Figure", 6, "", "1"), element("Figure", 6, "", "0")]),
+            None,
+        ),
+        (
+            "the second figure moved under the first",
+            &plain,
+            tree(true, "[7 0 R]", &[element("Figure", 6, "", "[0 8 0 R]"), element("Figure", 7, "", "1")]),
+            None,
+        ),
+        ("an alternate text that is not a string changed", &named, tree(true, "[7 0 R 8 0 R]", &figures("/Alt /Buyer", "")), None),
+    ];
+    for (case, base, edited, taken) in cases {
+        let result = inspect(base, &edited, InspectLimits::default());
+        match taken {
+            Some(taken) => {
+                let inspection = result.unwrap_or_else(|error| panic!("{case}: {error:?}"));
+                assert_eq!(inspection.structure_removed.tagged_text, taken, "{case}: {inspection:?}");
+                assert_eq!(inspection.redaction_areas.len(), 1, "{case}: {inspection:?}");
+            }
+            None => match result {
+                Err(InspectError::Edited(message)) => assert!(message.contains("structure tree"), "{case}: {message}"),
+                other => panic!("{case}: {other:?}"),
+            },
+        }
+    }
+}
+
+#[test]
+fn a_session_redaction_reports_the_tag_text_it_took_away() {
+    // The redactor cleans the tags of what it removed: the element whose marked content it
+    // emptied loses its alternate and actual text, and that marked-content kid. Accepted as a
+    // redaction, the text taken away reported (R6b-41, R6b-44); the other element keeps its own.
+    use crate::{Edit, NewAnnotation, Session, Shape, Style, rect_quad};
+    let mut b = Builder::new();
+    b.object(1, b"<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 5 0 R /MarkInfo << /Marked true >> >>");
+    b.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 300] >>");
+    b.object(3, format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R {RESOURCES} /StructParents 0 >>").as_bytes());
+    let content = b"/P << /MCID 0 >> BDC BT /F1 12 Tf 20 200 Td (SECRET) Tj ET EMC\n/P << /MCID 1 >> BDC BT /F1 12 Tf 20 100 Td (Public) Tj ET EMC";
+    b.object(4, &stream("", content));
+    b.object(5, b"<< /Type /StructTreeRoot /K [6 0 R 7 0 R] >>");
+    b.object(6, b"<< /S /P /P 5 0 R /Pg 3 0 R /ActualText (SECRET) /Alt (the secret) /K 0 >>");
+    b.object(7, b"<< /S /P /P 5 0 R /Pg 3 0 R /ActualText (Public) /K 1 >>");
+    let rows = b.offsets.clone();
+    let base = b.finish(8, &rows, "");
+    let mark = Shape::Redact { quads: vec![rect_quad([16.0, 190.0, 120.0, 220.0])], overlay: String::new(), look: Default::default() };
+    let mut session = Session::new().with_clock(|| 1_700_000_000);
+    let id = session.open("base.pdf", None, std::sync::Arc::new(base.clone()), None).unwrap();
+    session
+        .apply(
+            id,
+            Edit::AddAnnotation(NewAnnotation {
+                page: 0,
+                style: Style::default_for(&mark),
+                shape: mark,
+                contents: String::new(),
+                author: "Sari".into(),
+            }),
+        )
+        .unwrap();
+    session.apply(id, Edit::ApplyRedactions { pages: None }).unwrap();
+    let redacted = session.save_bytes(id).unwrap();
+    let inspection = inspect(&base, &redacted, InspectLimits::default()).unwrap();
+    assert!(!inspection.base_kept, "{inspection:?}");
+    assert_eq!(inspection.text, TextChanges { pages_with_text_removed: 1, pages_with_text_added: 0 }, "{inspection:?}");
+    assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{inspection:?}");
+    assert_eq!(inspection.structure_removed, StructureRemovals { tagged_text: 2, ..StructureRemovals::default() }, "{inspection:?}");
+}

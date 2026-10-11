@@ -47,7 +47,7 @@ const PAGE_OWN_KEYS: [&[u8]; 7] = [b"Parent", b"Annots", b"Rotate", b"Contents",
 // images, which compare what hayro draws: a (c) key of a dictionary a changed page draws with
 // (one hayro does not apply, which another viewer may) makes the page a render risk, so the
 // page counts outside the redactions on either side; text for assistive technology and copying
-// in property lists may be taken away, never added or changed (see [`PageFacts::text`]); the
+// in property lists may be taken away, never added, changed or moved (see [`PageFacts::text`]); the
 // page dictionary's own (c) entries must stay as they were (see [`PageFacts::entries`]).
 
 /// Page entries ignored (b): what no viewer draws on the page (`/Type`; `/LastModified`,
@@ -167,16 +167,37 @@ fn drawn_keys(kind: &[u8]) -> &'static [&'static [u8]] {
         ],
         // A marked-content property list: optional content's entries are evaluated (see
         // `Reader::evaluate_mark`); `/MCID` (b) links it to the structure tree, compared on its
-        // own. Its text for assistive technology and copying is kept as text (see
-        // [`STRUCT_TEXT_KEYS`]).
-        b"Properties" => &[b"Type", b"OCGs", b"P", b"VE", b"Name", b"Intent", b"Usage", b"MCID"],
+        // own. Its text for assistive technology and copying is kept span by span (see
+        // [`Span`]).
+        b"Properties" => &[b"Type", b"OCGs", b"P", b"VE", b"Name", b"Intent", b"Usage", b"MCID", b"ActualText", b"Alt", b"E", b"Lang", b"T"],
         _ => &[],
     }
 }
 
-/// Text for assistive technology and copying in a property list a page draws with: the key and
-/// its value's digest.
-pub(crate) type DrawnText = (Vec<u8>, Digest);
+/// One use of a marked-content property list in a page's content (`BDC` or `DP`, the list named
+/// in the resources or written in the content), in drawing order (R6b-41): what it is but for
+/// its text, and its text for assistive technology and copying.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Span {
+    /// The tag and the list's entries but its text (its `/MCID` and optional content among them).
+    pub identity: Digest,
+    /// Each text entry (`/ActualText`, `/Alt`, `/E`, `/Lang`, `/T`) present: the key's place in
+    /// [`STRUCT_TEXT_KEYS`] and the value's digest, in that key order.
+    pub text: Vec<(u8, Digest)>,
+}
+
+/// Whether a rewrite kept a page's property-list text as a redaction may keep it, and if so how
+/// many text entries it took away: the edited page's spans, in drawing order, are the base
+/// page's with some spans taken away whole and some text taken away from others; none added,
+/// changed or moved to another span (R6b-41).
+fn spans_kept(base: &[Span], edited: &[Span]) -> Option<usize> {
+    let mut rest = base.iter();
+    let matched = edited
+        .iter()
+        .all(|span| rest.any(|candidate| candidate.identity == span.identity && span.text.iter().all(|entry| candidate.text.contains(entry))));
+    let total = |spans: &[Span]| spans.iter().map(|span| span.text.len()).sum::<usize>();
+    matched.then(|| total(base).saturating_sub(total(edited)))
+}
 
 /// Catalog entries the document-level check leaves out; a change to any other entry (actions,
 /// names, page labels, permissions, …) fails the inspection, since no fact reports it.
@@ -266,10 +287,10 @@ pub(crate) struct PageFacts {
     /// The optional content the page's content is inside (R6b-36): a changed page is rendered
     /// in every combination of its groups' states.
     pub layers: PageLayers,
-    /// The text for assistive technology and copying in the property lists the page draws with
-    /// (`/ActualText`, `/Alt`, `/E`, `/Lang`, `/T`), counted: a rewrite may take some away, never
-    /// add or change any.
-    pub text: BTreeMap<DrawnText, u32>,
+    /// The property lists the page's content draws with, in drawing order, each with its text
+    /// for assistive technology and copying (see [`Span`]): a rewrite may take spans or text
+    /// away, never add, change or move any.
+    pub text: Vec<Span>,
     /// The page dictionary's own entries (not in [`PAGE_OWN_KEYS`] or [`PAGE_IGNORED`]), by
     /// their values' digests: in a rewrite they must be the same, but for [`PAGE_REMOVABLE`]
     /// ones removed.
@@ -314,7 +335,7 @@ impl PageFacts {
             form_draws: Vec::new(),
             form_layers: Vec::new(),
             layers: PageLayers::default(),
-            text: BTreeMap::new(),
+            text: Vec::new(),
             entries: BTreeMap::new(),
             type3: BTreeSet::new(),
             render_risk: None,
@@ -570,24 +591,50 @@ pub(crate) fn catalog_change(before: &Structure, after: &Structure, base_kept: b
         .map(|key| String::from_utf8_lossy(key).into_owned())
 }
 
-/// The document's structure tree (tags), as far as the comparison goes: the text it gives
-/// assistive technology and copying (each element's `/ActualText`, `/Alt`, `/E`, `/Lang` and
-/// `/T`, as a multiset of (key, value)), and a digest of everything else in it (each element's
-/// entries but its kids, parent and page, in the tree's order, with its marked-content kids; the
-/// root's but for its parent tree and ID tree).
+/// The document's structure tree (tags), as far as the comparison goes. Its elements are taken
+/// in the tree's order (depth first through `/K`), each named by its place in that order and
+/// its parent's place (R6b-44). Kept: the text each element gives assistive technology and
+/// copying (`/ActualText`, `/Alt`, `/E`, `/Lang`, `/T`), element by element; each marked-content
+/// kid (an MCID) with its element, in order; a digest of everything (each element's entries but
+/// its kids, parent and page, with its parent's place and its marked-content kids; the root's
+/// but for its parent tree and ID tree); and the same without the text and the marked-content
+/// kids.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct StructFacts {
-    pub text: BTreeMap<(Vec<u8>, Vec<u8>), u32>,
+    /// (element, the key's place in [`STRUCT_TEXT_KEYS`], the value's digest), in the tree's
+    /// order and, within an element, in that key order.
+    pub text: Vec<(u32, u8, Digest)>,
+    /// (element, or [`STRUCT_ROOT`] for a kid of the root, the MCID), in the tree's order.
+    pub marked: Vec<(u32, i64)>,
     pub digest: Digest,
     /// The same without the text and the marked-content kids: what a rewrite may not change
     /// (a redaction takes away text and the marked content it removed).
     pub shape: Digest,
 }
 
+/// Whether a rewrite kept the structure tree as a redaction may keep it, and if so how many
+/// text entries it took away: the same elements in the same places (the shape), each with its
+/// text but for entries taken away (none added, changed or moved to another element), and each
+/// element's marked-content kids in their order but for kids taken away (R6b-44).
+pub(crate) fn tags_kept(base: &StructFacts, edited: &StructFacts) -> Option<usize> {
+    let kept = base.shape == edited.shape && subsequence(&edited.text, &base.text) && subsequence(&edited.marked, &base.marked);
+    kept.then(|| base.text.len().saturating_sub(edited.text.len()))
+}
+
+/// Whether `part` is `whole` with some items taken away, the rest in their order.
+fn subsequence<T: PartialEq>(part: &[T], whole: &[T]) -> bool {
+    let mut rest = whole.iter();
+    part.iter().all(|item| rest.any(|candidate| candidate == item))
+}
+
 /// The entries of a structure element that hold text for assistive technology and copying.
 const STRUCT_TEXT_KEYS: [&[u8]; 5] = [b"ActualText", b"Alt", b"E", b"Lang", b"T"];
-/// The most structure elements read.
+/// The most structure elements read, and the most text entries kept from them.
 const MAX_STRUCT_ELEMENTS: usize = 1_000_000;
+/// The most marked-content kids kept from the structure tree.
+const MAX_STRUCT_MARKED: usize = 4_000_000;
+/// The owner of a marked-content kid of the structure tree's root (no element).
+const STRUCT_ROOT: u32 = u32::MAX;
 
 /// The edited file's cross-reference chain: an appended update must chain onto the base's
 /// sections exactly, every section it adds pointing backwards; a rewrite's sections all point
@@ -642,11 +689,18 @@ enum Item {
     Pattern(Vec<u8>),
     /// `/Name gs`: a graphics state, which may set a soft mask.
     State(Vec<u8>),
-    /// Any other resource named: a font (`Tf`), a shading (`sh`), a colour space (`cs`, `CS`),
-    /// a property list (`BDC`, `DP`); the resource dictionary's key, and the name.
+    /// Any other resource named: a font (`Tf`), a shading (`sh`), a colour space (`cs`, `CS`);
+    /// the resource dictionary's key, and the name.
     Named(&'static [u8], Vec<u8>),
-    /// A property list written in the content (`BDC`, `DP`).
-    Properties(Dict),
+    /// A marked-content property list (`BDC`, `DP`): its tag, and the list.
+    Span(Option<Vec<u8>>, PropertyList),
+}
+
+/// A marked-content property list: named in the resources (`/Properties`), or written in the
+/// content.
+enum PropertyList {
+    Named(Vec<u8>),
+    Inline(Dict),
 }
 
 /// A transformation matrix `[a b c d e f]` (ISO 32000-2 §8.3.3).
@@ -693,7 +747,7 @@ struct Drawn {
     patterns: BTreeSet<(ObjRef, bool, bool)>,
     masks: BTreeSet<(ObjRef, bool, bool)>,
     /// See [`PageFacts::text`].
-    text: BTreeMap<DrawnText, u32>,
+    text: Vec<Span>,
 }
 
 fn require(required: &mut Required, key: ImageKey, patterned: bool) {
@@ -1369,18 +1423,18 @@ impl<'d, 'b> Reader<'d, 'b> {
                         items.push(Item::Named(b"Font", font));
                     }
                 }
-                b"sh" | b"cs" | b"CS" | b"BDC" | b"DP" => {
-                    let kind: &'static [u8] = match keyword {
-                        b"sh" => b"Shading",
-                        b"cs" | b"CS" => b"ColorSpace",
-                        _ => b"Properties",
-                    };
+                b"sh" | b"cs" | b"CS" => {
+                    let kind: &'static [u8] = if keyword == b"sh" { b"Shading" } else { b"ColorSpace" };
                     if let Some(resource) = name.take() {
                         items.push(Item::Named(kind, resource));
-                    } else if kind == b"Properties"
-                        && let Some(list) = dict.take()
-                    {
-                        items.push(Item::Properties(list));
+                    }
+                }
+                // The tag is the operand before the property list (a name, or a dictionary).
+                b"BDC" | b"DP" => {
+                    if let Some(resource) = name.take() {
+                        items.push(Item::Span(before.take(), PropertyList::Named(resource)));
+                    } else if let Some(list) = dict.take() {
+                        items.push(Item::Span(before.take(), PropertyList::Inline(list)));
                     }
                 }
                 _ => {}
@@ -1499,7 +1553,6 @@ impl<'d, 'b> Reader<'d, 'b> {
                     let kind: &'static [u8] = match *kind {
                         b"Font" => b"Font",
                         b"Shading" => b"Shading",
-                        b"Properties" => b"Properties",
                         // Colour spaces are names or arrays: what they mean, hayro draws.
                         _ => continue,
                     };
@@ -1511,7 +1564,23 @@ impl<'d, 'b> Reader<'d, 'b> {
                         }
                     }
                 }
-                Item::Properties(list) => self.note_keys(b"Properties", list, drawn)?,
+                Item::Span(tag, list) => {
+                    let found = match list {
+                        PropertyList::Named(name) => match self.resource_entry(chain, b"Properties", name)? {
+                            Some(entry) => match &*self.resolve(&entry)? {
+                                Object::Dict(dict) => Some(dict.clone()),
+                                Object::Stream(stream) => Some(stream.dict.clone()),
+                                _ => None,
+                            },
+                            None => None,
+                        },
+                        PropertyList::Inline(dict) => Some(dict.clone()),
+                    };
+                    if let Some(dict) = found {
+                        self.note_keys(b"Properties", &dict, drawn)?;
+                        self.note_span(tag.as_deref(), &dict, drawn)?;
+                    }
+                }
                 Item::Inline(digest, pixels) => {
                     drawn.images.push(*digest);
                     drawn.pixels = drawn.pixels.saturating_add(*pixels);
@@ -1651,17 +1720,12 @@ impl<'d, 'b> Reader<'d, 'b> {
     }
 
     /// Check the keys of `dict` (a dictionary of `kind` the page draws with, see
-    /// [`drawn_keys`]): a key neither compared nor ignored makes the page a render risk; a
-    /// property list's text for assistive technology and copying is kept.
+    /// [`drawn_keys`]): a key neither compared nor ignored makes the page a render risk.
     fn note_keys(&mut self, kind: &'static [u8], dict: &Dict, drawn: &mut Drawn) -> Result<(), Fail> {
         let known = drawn_keys(kind);
-        for (key, value) in dict.iter() {
+        for (key, _) in dict.iter() {
             self.budget.tick()?;
-            if kind == b"Properties" && STRUCT_TEXT_KEYS.contains(&key.as_slice()) {
-                let digest = self.digest(value)?;
-                let slot = drawn.text.entry((key.clone(), digest)).or_default();
-                *slot = slot.saturating_add(1);
-            } else if !known.contains(&key.as_slice()) && drawn.render_risk.is_none() {
+            if !known.contains(&key.as_slice()) && drawn.render_risk.is_none() {
                 drawn.render_risk = Some(format!(
                     "/{} in a {} dictionary, which this comparison does not know",
                     String::from_utf8_lossy(key),
@@ -1669,6 +1733,20 @@ impl<'d, 'b> Reader<'d, 'b> {
                 ));
             }
         }
+        Ok(())
+    }
+
+    /// Keep one use of a property list, tagged `tag`, in drawing order (see [`Span`]).
+    fn note_span(&mut self, tag: Option<&[u8]>, list: &Dict, drawn: &mut Drawn) -> Result<(), Fail> {
+        let rest = self.digest_without(list, &STRUCT_TEXT_KEYS)?;
+        let tag = tag.map_or_else(|| sha256(&[b"no tag"]), |tag| sha256(&[b"tag", tag]));
+        let mut text = Vec::new();
+        for (key_index, key) in (0u8..).zip(STRUCT_TEXT_KEYS) {
+            if let Some(value) = list.get(key) {
+                text.push((key_index, self.digest(value)?));
+            }
+        }
+        drawn.text.push(Span { identity: sha256(&[b"span", &tag, &rest]), text });
         Ok(())
     }
 
@@ -1808,8 +1886,9 @@ impl<'d, 'b> Reader<'d, 'b> {
                 Item::Pattern(name) => (b"Pattern", name),
                 Item::State(name) => (b"ExtGState", name),
                 Item::Named(kind, name) => (kind, name),
+                Item::Span(_, PropertyList::Named(name)) => (b"Properties", name),
                 // Its data is the procedure's own.
-                Item::Inline(..) | Item::Properties(..) => continue,
+                Item::Inline(..) | Item::Span(_, PropertyList::Inline(_)) => continue,
             };
             parts.extend_from_slice(&(kind.len() as u64).to_le_bytes());
             parts.extend_from_slice(kind);
@@ -2043,9 +2122,12 @@ impl<'d, 'b> Reader<'d, 'b> {
         parts.extend_from_slice(&root_digest);
         shape.extend_from_slice(&root_digest);
         let mut seen: BTreeSet<ObjRef> = BTreeSet::new();
-        // (kid, depth), depth first in the tree's order.
-        let mut todo: Vec<(Object, usize)> = root.get(b"K").cloned().map(|kid| (kid, 0)).into_iter().collect();
-        while let Some((kid, depth)) = todo.pop() {
+        // (kid, depth, the element it belongs to), depth first in the tree's order. An element is
+        // named by its place in that order and its parent's (R6b-44): with the shape the same in
+        // both files, the same place is the same element.
+        let mut todo: Vec<(Object, usize, u32)> = root.get(b"K").cloned().map(|kid| (kid, 0, STRUCT_ROOT)).into_iter().collect();
+        let mut elements: u32 = 0;
+        while let Some((kid, depth, owner)) = todo.pop() {
             self.budget.tick()?;
             if depth > MAX_REFERENCE_DEPTH || seen.len() > MAX_STRUCT_ELEMENTS {
                 return Err(Fail::TooComplex);
@@ -2058,29 +2140,41 @@ impl<'d, 'b> Reader<'d, 'b> {
             match &*self.resolve(&kid)? {
                 Object::Array(items) => {
                     parts.push(b'[');
-                    todo.extend(items.iter().rev().map(|item| (item.clone(), depth.saturating_add(1))));
+                    todo.extend(items.iter().rev().map(|item| (item.clone(), depth.saturating_add(1), owner)));
                 }
                 Object::Int(mcid) => {
+                    if facts.marked.len() >= MAX_STRUCT_MARKED {
+                        return Err(Fail::TooComplex);
+                    }
+                    facts.marked.push((owner, *mcid));
                     parts.push(b'm');
+                    parts.extend_from_slice(&owner.to_le_bytes());
                     parts.extend_from_slice(&mcid.to_le_bytes());
                 }
                 Object::Dict(element) => {
-                    for key in STRUCT_TEXT_KEYS {
-                        if let Some(value) = element.get(key)
-                            && let Object::String(text) = &*self.resolve(value)?
-                        {
-                            let slot = facts.text.entry((key.to_vec(), text.bytes.clone())).or_default();
-                            *slot = slot.saturating_add(1);
+                    let index = elements;
+                    elements = elements.checked_add(1).filter(|count| *count as usize <= MAX_STRUCT_ELEMENTS).ok_or(Fail::TooComplex)?;
+                    // Its text, whatever the value is (a reader may show a value that is not a
+                    // string; a value of another kind is still compared).
+                    for (key_index, key) in (0u8..).zip(STRUCT_TEXT_KEYS) {
+                        if let Some(value) = element.get(key) {
+                            if facts.text.len() >= MAX_STRUCT_ELEMENTS {
+                                return Err(Fail::TooComplex);
+                            }
+                            let digest = self.digest(value)?;
+                            facts.text.push((index, key_index, digest));
                         }
                     }
                     parts.push(b'{');
+                    parts.extend_from_slice(&owner.to_le_bytes());
                     parts.extend_from_slice(&self.digest_without(element, &[b"K", b"P", b"Pg", b"Obj"])?);
                     shape.push(b'{');
+                    shape.extend_from_slice(&owner.to_le_bytes());
                     let mut left_out: Vec<&[u8]> = vec![b"K", b"P", b"Pg", b"Obj"];
                     left_out.extend(STRUCT_TEXT_KEYS);
                     shape.extend_from_slice(&self.digest_without(element, &left_out)?);
                     if let Some(kids) = element.get(b"K") {
-                        todo.push((kids.clone(), depth.saturating_add(1)));
+                        todo.push((kids.clone(), depth.saturating_add(1), index));
                     }
                 }
                 Object::Null => {}
@@ -3406,15 +3500,29 @@ pub(crate) fn read(
     ))
 }
 
-/// Whether, in a rewrite, a page's text in property lists or its own entries changed other than
-/// as a rewrite may change them (see [`PageFacts::text`], [`PageFacts::entries`]).
-pub(crate) fn page_keys_changed(base: &PageFacts, edited: &PageFacts) -> bool {
-    if edited.text.iter().any(|(entry, count)| base.text.get(entry).is_none_or(|was| count > was)) {
-        return true;
-    }
+/// What a rewrite took away from a page that no viewer draws on it (R6b-41).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PageRemovals {
+    /// Text entries for assistive technology and copying, from its property lists.
+    pub text: usize,
+    /// Its actions (`/AA`).
+    pub actions: bool,
+    /// Its thumbnail (`/Thumb`).
+    pub thumbnail: bool,
+}
+
+/// In a rewrite, what was taken away from a page's property-list text and its own entries
+/// (see [`PageFacts::text`], [`PageFacts::entries`]); `None` when either changed otherwise
+/// than a rewrite may change it.
+pub(crate) fn page_removals(base: &PageFacts, edited: &PageFacts) -> Option<PageRemovals> {
+    let text = spans_kept(&base.text, &edited.text)?;
     let kept = base.entries.iter().all(|(key, value)| match edited.entries.get(key) {
         Some(now) => now == value,
         None => PAGE_REMOVABLE.contains(&key.as_slice()),
     });
-    !kept || edited.entries.keys().any(|key| !base.entries.contains_key(key))
+    if !kept || edited.entries.keys().any(|key| !base.entries.contains_key(key)) {
+        return None;
+    }
+    let gone = |key: &[u8]| base.entries.contains_key(key) && !edited.entries.contains_key(key);
+    Some(PageRemovals { text, actions: gone(b"AA"), thumbnail: gone(b"Thumb") })
 }
