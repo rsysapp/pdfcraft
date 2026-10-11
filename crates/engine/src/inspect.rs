@@ -367,8 +367,11 @@ pub struct InspectLimits {
     /// a page render, a batch of objects). Not measured on wasm32, which has no clock here.
     /// The work bounds hold on every target and do not depend on a clock. They are what bounds
     /// the time on wasm32: each page's text and render, and the comparison as a whole, may do
-    /// only a fixed amount of interpreter work, at most about half a second a page and half a
-    /// minute in all, as measured natively.
+    /// only a fixed amount of work, at most about half a second a page. Measured natively in a
+    /// release build without a clock, the worst whole comparison found (hundreds to 2,000
+    /// changed pages that share no glyph or image, paired by their renders, R6b-38) ends in
+    /// [`InspectError::TooComplex`] within 45 seconds; wasm32 runs slower than that by its own
+    /// factor. Natively this deadline (60 seconds by default) still applies on top.
     pub deadline: Duration,
 }
 
