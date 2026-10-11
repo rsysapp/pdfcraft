@@ -398,6 +398,9 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
                 d.set(b"Annots".to_vec(), Object::Array(kept));
             }
         })?;
+        // Embed build: the tags naming a removed annotation lose its text, and the reference
+        // (follow-up 7 audit, item 10).
+        report.tags += tags::clean_objects(doc, &removed)?;
     }
 
     // 3. Form fields with a widget under a mark (all their widgets go).

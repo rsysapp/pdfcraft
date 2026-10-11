@@ -309,3 +309,42 @@ pub(crate) fn clean_forms(doc: &mut Document, page: ObjRef, forms: &[crate::inte
     }
     strip_with_ancestors(doc, &hits, &parents)
 }
+
+/// Embed build (follow-up 7 audit, item 10): the elements naming one of the `removed`
+/// annotations through an object reference (`/Type /OBJR`) lose the text standing for it (with
+/// their ancestors), and the reference goes: kept, it would keep the removed annotation, and
+/// what it said, in the file. Returns how many elements changed.
+pub(crate) fn clean_objects(doc: &mut Document, removed: &[ObjRef]) -> Result<usize, pdfcraft_cos::CosError> {
+    if removed.is_empty() {
+        return Ok(0);
+    }
+    let (elements, parents) = elements(doc);
+    let mut hits: Vec<ObjRef> = Vec::new();
+    for element in &elements {
+        let kids = kids_of(doc, &element.dict);
+        let names_removed = |kid: &Object| match kid {
+            Object::Dict(reference) if reference.name(b"Type") == Some(b"OBJR") => {
+                reference.get(b"Obj").and_then(Object::as_ref).is_some_and(|target| removed.contains(&target))
+            }
+            _ => false,
+        };
+        if !kids.iter().any(|(_, kid)| names_removed(kid)) {
+            continue;
+        }
+        hits.push(element.obj);
+        let keep: Vec<Object> = kids.iter().filter(|(_, kid)| !names_removed(kid)).map(|(written, _)| written.clone()).collect();
+        let array = matches!(element.dict.get(b"K"), Some(Object::Array(_)));
+        doc.update_dict(element.obj, |e| match (array, keep.len()) {
+            (true, _) | (false, 2..) => e.set(b"K".to_vec(), Object::Array(keep)),
+            (false, 0) => {
+                e.remove(b"K");
+            }
+            (false, _) => {
+                if let Some(only) = keep.into_iter().next() {
+                    e.set(b"K".to_vec(), only);
+                }
+            }
+        })?;
+    }
+    strip_with_ancestors(doc, &hits, &parents)
+}

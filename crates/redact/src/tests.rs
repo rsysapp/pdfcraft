@@ -753,3 +753,27 @@ fn unbalanced_marked_content_takes_every_span_s_text_away() {
     let element = doc.get(pdfcraft_cos::ObjRef::new(8, 0)).as_dict().cloned().unwrap();
     assert!(element.get(b"ActualText").is_none());
 }
+
+#[test]
+fn an_annotation_removed_under_a_mark_takes_its_tags_text_and_reference() {
+    // Embed build (follow-up 7 audit, item 10): the link under the mark goes; its element named
+    // it through an object reference, with /Alt spelling out the address.
+    let mut doc = pdf(vec![
+        b"<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 7 0 R /MarkInfo << /Marked true >> >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Annots [10 0 R] /Resources << /Font << /F1 5 0 R >> >> >>".to_vec(),
+        stream("", b"BT /F1 10 Tf 10 200 Td (SECRET) Tj ET"),
+        FONT.replace("95 0 R", "6 0 R").into_bytes(),
+        widths(),
+        b"<< /Type /StructTreeRoot /K 8 0 R >>".to_vec(),
+        b"<< /S /Sect /P 7 0 R /Alt (About the SECRET) /K 9 0 R >>".to_vec(),
+        b"<< /S /Link /P 8 0 R /Pg 3 0 R /Alt (https://secret.example) /K << /Type /OBJR /Obj 10 0 R >> >>".to_vec(),
+        b"<< /Type /Annot /Subtype /Link /Rect [8 195 60 212] /A << /S /URI /URI (https://secret.example) >> >>".to_vec(),
+    ]);
+    mark(&mut doc, 0, &[[5.0, 195.0, 60.0, 212.0]], "");
+    apply(&mut doc, None).unwrap();
+    let element = |num: u32| doc.get(pdfcraft_cos::ObjRef::new(num, 0)).as_dict().cloned().unwrap();
+    assert!(element(9).get(b"Alt").is_none() && element(9).get(b"K").is_none(), "{:?}", element(9));
+    assert!(element(8).get(b"Alt").is_none());
+    assert!(!written_text(&doc).contains("secret.example"));
+}
