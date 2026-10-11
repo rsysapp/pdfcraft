@@ -43,6 +43,8 @@ mod types;
 mod x_object;
 /// PdfCraft patch: exported for its regression test.
 pub use x_object::image_size_ok;
+// Embed build: optional-content marks recorded while every layer is drawn.
+pub use ocg::{LayerMark, current_layers, layers_report};
 
 pub mod color;
 pub mod encode;

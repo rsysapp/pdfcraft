@@ -120,6 +120,12 @@ pub struct InterpreterSettings {
     /// shows is the viewer's choice (a Layers panel shows hidden ones), and readers disagree on
     /// which marked content is optional content.
     pub all_layers_visible: bool,
+    /// Embed build: with [`InterpreterSettings::all_layers_visible`], the optional-content
+    /// groups and membership dictionaries (number, generation) that hide what is inside them
+    /// (a level naming one, by `BDC` or an XObject's `/OC`): for a caller that evaluated the
+    /// document's default visibility itself and renders it. Every level opened is recorded
+    /// (`crate::current_layers`, `crate::layers_report`). Empty by default.
+    pub hidden_layers: Arc<Vec<(i32, i32)>>,
     /// Embed build: hand the device each glyph shown in text rendering mode 7 (clip only) as an
     /// invisible glyph (`false` by default: such a glyph only adds to the clip). For a caller
     /// that must see all of a page's text: other readers extract it.
@@ -146,6 +152,7 @@ impl Default for InterpreterSettings {
             ocg_overrides: Arc::new(Vec::new()),
             work_budget: u64::MAX,
             all_layers_visible: false,
+            hidden_layers: Arc::new(Vec::new()),
             report_clip_glyphs: false,
         }
     }
@@ -593,29 +600,36 @@ pub fn interpret<'a>(
 
                 let mcid = dict_or_stream(bdc.1).and_then(|(props, _)| props.get::<i32>(MCID));
 
-                let oc = bdc
-                    .1
-                    .clone()
-                    .into_name()
-                    .and_then(|name| {
-                        let r = resources.properties.get_ref(name.as_ref())?;
-                        let d = resources
-                            .properties
-                            .get::<Dict<'_>>(name)
-                            .unwrap_or_default();
-                        Some((d, r))
-                    })
-                    .or_else(|| {
-                        let (props, _) = dict_or_stream(bdc.1)?;
+                let named = bdc.1.clone().into_name().and_then(|name| {
+                    let r = resources.properties.get_ref(name.as_ref())?;
+                    let d = resources
+                        .properties
+                        .get::<Dict<'_>>(name)
+                        .unwrap_or_default();
+                    Some((d, r))
+                });
+                let inline = if named.is_some() {
+                    None
+                } else {
+                    dict_or_stream(bdc.1).and_then(|(props, _)| {
                         let r = props.get_ref(OC)?;
                         let d = props.get::<Dict<'_>>(OC).unwrap_or_default();
                         Some((d, r))
-                    });
+                    })
+                };
 
-                if let Some((dict, oc_ref)) = oc {
-                    context.ocg_state.begin_ocg(&dict, oc_ref.into());
-                } else {
-                    context.ocg_state.begin_marked_content();
+                // Embed build: say what this level is (see `crate::LayerMark`): what hayro takes
+                // for optional content, and any `/OC` tag whatever hayro makes of it.
+                let tag: &[u8] = bdc.0.as_ref();
+                let mark = |object: Option<hayro_syntax::object::ObjRef>, inline: bool| crate::LayerMark {
+                    tag: Some(tag.to_vec()),
+                    object: object.map(|r| (r.obj_number, r.gen_number)),
+                    inline,
+                };
+                match (named, inline) {
+                    (Some((dict, oc_ref)), _) => context.ocg_state.begin_ocg(&dict, oc_ref.into(), Some(mark(Some(oc_ref), false))),
+                    (None, Some((dict, oc_ref))) => context.ocg_state.begin_ocg(&dict, oc_ref.into(), Some(mark(Some(oc_ref), true))),
+                    (None, None) => context.ocg_state.begin_marked_content((tag == b"OC").then(|| mark(None, false))),
                 }
 
                 device.begin_marked_content(bdc.0, mcid);
@@ -627,7 +641,7 @@ pub fn interpret<'a>(
             }
             TypedInstruction::MarkedContentPoint(_) => {}
             TypedInstruction::BeginMarkedContent(bmc) => {
-                context.ocg_state.begin_marked_content();
+                context.ocg_state.begin_marked_content(None);
                 device.begin_marked_content(bmc.0, None);
             }
             TypedInstruction::BeginText(_) => {

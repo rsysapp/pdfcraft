@@ -172,12 +172,15 @@ pub(crate) fn draw_form_xobject<'a, 'b>(
     );
     device.push_clip_path(&clip);
 
+    // Embed build: the form's content may close only the marked content it opened.
+    let marked = context.ocg_state.enter();
     interpret(
         iter,
         &Resources::from_parent(x_object.resources.clone(), resources.clone()),
         context,
         device,
     );
+    context.ocg_state.leave(marked);
 
     device.pop_clip_path();
 
@@ -279,14 +282,26 @@ pub(crate) fn draw_image_xobject<'a, 'b>(
 }
 
 fn xobject_oc(dict: &Dict<'_>, context: &mut Context<'_>) -> bool {
+    // Embed build: say what the `/OC` is (see `crate::LayerMark`).
+    let mark = |object: Option<hayro_syntax::object::ObjRef>| crate::LayerMark {
+        tag: None,
+        object: object.map(|r| (r.obj_number, r.gen_number)),
+        inline: false,
+    };
     let Some(oc_dict) = dict.get::<Dict<'_>>(OC) else {
+        // Embed build: an `/OC` hayro cannot take for a dictionary hides nothing here, but is
+        // recorded while every layer is drawn (a level that hides nothing either).
+        if context.ocg_state.all_visible && dict.contains_key(OC) {
+            context.ocg_state.begin_marked_content(Some(mark(None)));
+            return true;
+        }
         return false;
     };
 
     if let Some(oc_ref) = dict.get_ref(OC) {
-        context.ocg_state.begin_ocg(&oc_dict, oc_ref.into());
+        context.ocg_state.begin_ocg(&oc_dict, oc_ref.into(), Some(mark(Some(oc_ref))));
     } else {
-        context.ocg_state.begin_ocmd(&oc_dict);
+        context.ocg_state.begin_ocmd(&oc_dict, None, Some(mark(None)));
     }
 
     true

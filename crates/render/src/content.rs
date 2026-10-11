@@ -2,7 +2,10 @@
 //! count, the glyphs and images its content draws (page content only, see [`PageContent`]) and an
 //! upright render of its content (no annotations, `/Rotate` ignored). Every optional-content
 //! layer is drawn, whatever the document's configuration says: which layers show is a viewer's
-//! choice, and an inspection must see all of the content. Every answer is certain or an error: a
+//! choice, and an inspection must see all of the content. Each glyph, image and form drawn says
+//! which optional content it is inside, as hayro met it (see [`PageContent::layers`]), for a
+//! caller that evaluates it itself; [`ContentDocument::render_upright_hiding`] renders a page
+//! with the content of chosen layers left out. Every answer is certain or an error: a
 //! glyph that can be identified neither by its text nor by its font and glyph, an image that
 //! cannot be identified, an interpreter warning (an unsupported font, an image that does not
 //! decode) or a renderer panic fails the call instead of being skipped, and
@@ -25,7 +28,7 @@ use hayro::hayro_interpret::font::Glyph;
 use hayro::hayro_interpret::pattern::Pattern;
 use hayro::hayro_interpret::{
     BlendMode, ClipPath, Context, Device, GlyphDrawMode, Image, InterpreterCache, InterpreterSettings, InterpreterWarning, Paint, PathDrawMode,
-    SoftMask, TransformExt, interpret_page, work_spent,
+    SoftMask, TransformExt, current_layers, interpret_page, layers_report, work_spent,
 };
 use hayro::hayro_syntax::budget::{decode_budget_exceeded, decode_spent, set_decode_budget};
 use hayro::hayro_syntax::object::{Array, Dict, Object, ObjectIdentifier};
@@ -34,6 +37,9 @@ use hayro::hayro_syntax::{LoadPdfError, Pdf};
 use hayro::vello_cpu::color::palette::css::WHITE;
 use hayro::{RenderCache, RenderSettings, render_upright};
 use kurbo::{BezPath, Shape};
+
+/// An optional-content mark content is drawn inside (see [`PageContent::layers`]).
+pub use hayro::hayro_interpret::LayerMark;
 
 use crate::raster::{RenderConfig, panic_message};
 
@@ -78,6 +84,9 @@ pub struct PageGlyphs {
     /// object (number, generation), the glyph's ID in the font; for a Type 3 font, the code that
     /// selects its procedure).
     pub unnamed: Vec<(u32, (u32, u16), u32)>,
+    /// The glyphs drawn inside optional content, in order: (index in `glyphs`, index in
+    /// [`PageContent::layers`]).
+    pub layers: Vec<(u32, u32)>,
 }
 
 impl PageGlyphs {
@@ -123,6 +132,8 @@ pub struct ImageDraw {
     /// Drawn in a tiling pattern's cell, which repeats it over what the pattern paints: `matrix`
     /// is in the cell's pattern space, not the page's.
     pub tiled: bool,
+    /// Drawn inside optional content: its index in [`PageContent::layers`].
+    pub layer: Option<u32>,
 }
 
 /// One form XObject hayro's interpreter drew: which, and where its `/BBox` (the clip its content
@@ -137,6 +148,9 @@ pub struct FormDraw {
     pub rect: [f64; 4],
     /// Drawn in a tiling pattern's cell.
     pub tiled: bool,
+    /// Drawn inside optional content (its own `/OC` included): its index in
+    /// [`PageContent::layers`].
+    pub layer: Option<u32>,
 }
 
 /// What a page's content draws that a save inspector compares: its glyphs (the page's own
@@ -155,6 +169,16 @@ pub struct PageContent {
     pub decoded: Option<Vec<u8>>,
     /// Every object hayro read while interpreting the page.
     pub resolved: Resolved,
+    /// The optional content glyphs, images and forms were drawn inside: each entry the marks
+    /// open around one of them, outermost first (see `hayro_interpret::LayerMark`).
+    pub layers: Vec<Vec<LayerMark>>,
+    /// Every optional-content mark met while interpreting the page (around anything, paths and
+    /// shadings included).
+    pub layer_marks: Vec<LayerMark>,
+    /// Marked content was unbalanced in a content stream (an `EMC` closing what the stream did
+    /// not open, a level left open at its end): which content is in which layer is then each
+    /// reader's guess.
+    pub layers_unbalanced: bool,
 }
 
 /// Where hayro read an object.
@@ -241,6 +265,9 @@ struct PageDevice<'a> {
     /// Inline image bytes already copied, by where hayro holds them: one copy for the uses of an
     /// inline image in a form drawn many times (checked byte for byte: an address can be reused).
     inline: HashMap<(usize, usize), Arc<[u8]>>,
+    /// The optional-content memberships met, and the last one looked up (by its `Arc`).
+    layers: Vec<Arc<[LayerMark]>>,
+    last_layer: Option<(Arc<[LayerMark]>, u32)>,
 }
 
 impl<'a> PageDevice<'a> {
@@ -257,7 +284,29 @@ impl<'a> PageDevice<'a> {
             masks: Vec::new(),
             mask_keys: HashSet::new(),
             inline: HashMap::new(),
+            layers: Vec::new(),
+            last_layer: None,
         }
+    }
+
+    /// The optional content what is drawn now is inside: its index in `layers` (`None`: none).
+    fn layer(&mut self) -> Option<u32> {
+        let current = current_layers()?;
+        if let Some((last, index)) = &self.last_layer
+            && Arc::ptr_eq(last, &current)
+        {
+            return Some(*index);
+        }
+        let index = match self.layers.iter().position(|known| **known == *current) {
+            Some(index) => index,
+            None => {
+                self.layers.push(current.clone());
+                self.layers.len().saturating_sub(1)
+            }
+        };
+        let index = u32::try_from(index).unwrap_or(u32::MAX);
+        self.last_layer = Some((current, index));
+        Some(index)
     }
 
     fn copied(&mut self, bytes: &[u8]) -> Arc<[u8]> {
@@ -279,10 +328,12 @@ impl<'a> PageDevice<'a> {
         inner.mask_keys = std::mem::take(&mut self.mask_keys);
         inner.masks = std::mem::take(&mut self.masks);
         inner.inline = std::mem::take(&mut self.inline);
+        inner.layers = std::mem::take(&mut self.layers);
         draw(&mut inner);
         self.mask_keys = inner.mask_keys;
         self.masks = inner.masks;
         self.inline = inner.inline;
+        self.layers = inner.layers;
         self.images.append(&mut inner.images);
         self.forms.append(&mut inner.forms);
         self.unidentified = self.unidentified.saturating_add(inner.unidentified);
@@ -368,8 +419,12 @@ impl<'a> Device<'a> for PageDevice<'a> {
             self.unread = self.unread.saturating_add(1);
             return;
         }
+        let index = u32::try_from(self.found.glyphs.len()).unwrap_or(u32::MAX);
         if let Some((font, id)) = unnamed {
-            self.found.unnamed.push((u32::try_from(self.found.glyphs.len()).unwrap_or(u32::MAX), font, id));
+            self.found.unnamed.push((index, font, id));
+        }
+        if let Some(layer) = self.layer() {
+            self.found.layers.push((index, layer));
         }
         self.found.chars.extend(text.chars());
         let end = u32::try_from(self.found.chars.len()).unwrap_or(u32::MAX);
@@ -397,7 +452,8 @@ impl<'a> Device<'a> for PageDevice<'a> {
         // hayro hands the device the transformation of the image's pixel grid (row 0 at the top):
         // the unit square's is that after (u, v) ↦ (u · width, (1 − v) · height).
         let unit = self.to_user * transform * kurbo::Affine::new([width, 0.0, 0.0, -height, 0.0, height]);
-        self.images.push(ImageDraw { source, matrix: unit.as_coeffs(), tiled: self.tiled });
+        let layer = self.layer();
+        self.images.push(ImageDraw { source, matrix: unit.as_coeffs(), tiled: self.tiled, layer });
     }
     fn pop_clip_path(&mut self) {}
     fn pop_transparency_group(&mut self) {}
@@ -407,7 +463,8 @@ impl<'a> Device<'a> for PageDevice<'a> {
             return;
         };
         let b = (self.to_user * bbox.clone()).bounding_box();
-        self.forms.push(FormDraw { num, generation, rect: [b.x0, b.y0, b.x1, b.y1], tiled: self.tiled });
+        let layer = self.layer();
+        self.forms.push(FormDraw { num, generation, rect: [b.x0, b.y0, b.x1, b.y1], tiled: self.tiled, layer });
     }
 }
 
@@ -708,8 +765,22 @@ impl ContentDocument {
             let decoded = p.page_stream().map(<[u8]>::to_vec);
             interpret_page(p, &mut ctx, &mut device);
             let read = Resolved::from_log(resolved::close_log());
+            // What the page's content left open is closed (and counted unbalanced) with it.
+            drop(ctx);
+            let (layer_marks, layers_unbalanced) = layers_report();
             let page = p.raw().obj_id().and_then(|id| u32::try_from(id.obj_number).ok().zip(u16::try_from(id.gen_number).ok()));
-            let content = PageContent { glyphs: device.found, images: device.images, forms: device.forms, page, decoded, resolved: read };
+            let layers = device.layers.iter().map(|layer| layer.to_vec()).collect();
+            let content = PageContent {
+                glyphs: device.found,
+                images: device.images,
+                forms: device.forms,
+                page,
+                decoded,
+                resolved: read,
+                layers,
+                layer_marks,
+                layers_unbalanced,
+            };
             Some(Ok((content, device.unread, device.unidentified)))
         }));
         // A panic above leaves the log open: close it.
@@ -768,6 +839,14 @@ impl ContentDocument {
     /// document lives (tens of megabytes for a page of heavy content), so rendering every page of
     /// one document would hold all of it at once.
     pub fn render_upright(&self, page: usize, long_side: u32) -> Result<UprightRaster, ContentError> {
+        self.render_upright_hiding(page, long_side, &[])
+    }
+
+    /// [`ContentDocument::render_upright`], with the content inside the optional-content groups
+    /// and membership dictionaries `hidden` (number, generation) left out: the page as a viewer
+    /// shows it by default, where the caller evaluated which those are.
+    pub fn render_upright_hiding(&self, page: usize, long_side: u32, hidden: &[(i32, i32)]) -> Result<UprightRaster, ContentError> {
+        let settings = InterpreterSettings { hidden_layers: Arc::new(hidden.to_vec()), ..self.settings.clone() };
         let before = self.counts();
         let number = page.saturating_add(1);
         // A file is parsed afresh without a decoding budget (an interpretation sets its own).
@@ -787,6 +866,7 @@ impl ContentDocument {
             let scale = side / width_pt.max(height_pt);
             let pixels = |pt: f32| crate::raster::device_pixels(pt, scale).min(side as u32);
             let (width, height) = (pixels(width_pt), pixels(height_pt));
+            let interpreter = &settings;
             let settings = RenderSettings {
                 x_scale: scale,
                 y_scale: scale,
@@ -796,7 +876,7 @@ impl ContentDocument {
                 ..Default::default()
             };
             let cache = RenderCache::new();
-            let pixmap = render_upright(page, &cache, &self.settings, &settings);
+            let pixmap = render_upright(page, &cache, interpreter, &settings);
             let crop = page.intersected_crop_box();
             Ok(UprightRaster {
                 width: u32::from(pixmap.width()),

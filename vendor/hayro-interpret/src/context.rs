@@ -196,6 +196,8 @@ impl<'a> Context<'a> {
         WORK_BUDGET.with(|b| b.set(settings.work_budget));
         ALLOCATED.with(|a| a.set(0));
         WORK_SINK.with(|s| *s.borrow_mut() = Some(settings.warning_sink.clone()));
+        // Embed build: and with no marked content open (see `crate::current_layers`).
+        crate::ocg::reset_layers();
         // Embed build: and with its stream decoding bounded too (`MAX_DECODED`).
         if settings.work_budget == u64::MAX {
             hayro_syntax::budget::set_decode_budget(u64::MAX, u64::MAX);
@@ -226,7 +228,9 @@ impl<'a> Context<'a> {
             ocg_state.set_active(hayro_syntax::object::ObjectIdentifier::new(*num, *generation), *visible);
         }
         // Embed build: see `InterpreterSettings::all_layers_visible`.
-        ocg_state.all_visible = settings.all_layers_visible;
+        if settings.all_layers_visible {
+            ocg_state.draw_every_layer(&settings.hidden_layers);
+        }
 
         Self {
             states: vec![state],

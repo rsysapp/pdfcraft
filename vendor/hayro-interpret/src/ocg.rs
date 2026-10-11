@@ -1,13 +1,130 @@
 use hayro_syntax::object::dict::keys::{BASE_STATE, D, OCGS, OCMD, OCPROPERTIES, OFF, ON, P, TYPE};
 use hayro_syntax::object::{Array, Dict, Name, ObjectIdentifier};
+use std::cell::RefCell;
 use std::collections::HashSet;
+use std::sync::Arc;
+
+/// Embed build: an optional-content construct that content is drawn inside, as hayro met it
+/// while drawing every layer (`InterpreterSettings::all_layers_visible`): what hayro took as
+/// optional content (a `BDC` whose property list resolved, an XObject's `/OC`), and every `BDC`
+/// tagged `/OC` whatever hayro made of it. For a caller that evaluates each against the
+/// document's `/OCProperties` itself and refuses what it cannot (readers differ on these).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct LayerMark {
+    /// The marked-content tag (`BDC`'s first operand); `None` for an XObject's `/OC`.
+    pub tag: Option<Vec<u8>>,
+    /// The object hayro took for the optional content (number, generation): a property list
+    /// named in `/Properties`, the `/OC` entry of a property list written inline, an XObject's
+    /// `/OC`. `None`: written directly, not a dictionary, or no property list at all.
+    pub object: Option<(i32, i32)>,
+    /// `object` is the `/OC` entry of a property list written inline in the content.
+    pub inline: bool,
+}
+
+/// Embed build: the marked content open while every layer is drawn, per thread (nested
+/// interpretations — patterns, soft masks, Type 3 glyphs — add to what encloses them).
+#[derive(Default)]
+struct Layers {
+    /// One level per open `BDC`/`BMC`/`/OC`, with its mark where it has one.
+    stack: Vec<Option<LayerMark>>,
+    /// How many levels have a mark.
+    open: usize,
+    /// The marks open now, outermost first, once asked for.
+    snapshot: Option<Arc<[LayerMark]>>,
+    /// Every mark met since the interpretation began.
+    seen: HashSet<LayerMark>,
+    /// An `EMC` closed a level its content stream did not open, or a content stream left one
+    /// open at its end.
+    unbalanced: bool,
+}
+
+std::thread_local! {
+    static LAYERS: RefCell<Layers> = RefCell::new(Layers::default());
+}
+
+/// Embed build: start an interpretation with no marked content open (`Context::new`).
+pub(crate) fn reset_layers() {
+    LAYERS.with(|layers| *layers.borrow_mut() = Layers::default());
+}
+
+/// Embed build: the marks the content being drawn now is inside, outermost first (`None`: none),
+/// while every layer is drawn. The same `Arc` until a mark opens or closes.
+pub fn current_layers() -> Option<Arc<[LayerMark]>> {
+    LAYERS.with(|layers| {
+        let mut layers = layers.borrow_mut();
+        if layers.open == 0 {
+            return None;
+        }
+        if layers.snapshot.is_none() {
+            layers.snapshot = Some(layers.stack.iter().flatten().cloned().collect());
+        }
+        layers.snapshot.clone()
+    })
+}
+
+/// Embed build: since the interpretation began (`Context::new`), every distinct mark met, and
+/// whether marked content was unbalanced in a content stream (see [`current_layers`]).
+pub fn layers_report() -> (Vec<LayerMark>, bool) {
+    LAYERS.with(|layers| {
+        let layers = layers.borrow();
+        (layers.seen.iter().cloned().collect(), layers.unbalanced)
+    })
+}
+
+fn push_layer(mark: Option<LayerMark>) {
+    LAYERS.with(|layers| {
+        let mut layers = layers.borrow_mut();
+        if let Some(mark) = &mark {
+            layers.open += 1;
+            layers.snapshot = None;
+            if !layers.seen.contains(mark) {
+                layers.seen.insert(mark.clone());
+            }
+        }
+        layers.stack.push(mark);
+    });
+}
+
+fn pop_layer() {
+    LAYERS.with(|layers| {
+        let mut layers = layers.borrow_mut();
+        if let Some(Some(_)) = layers.stack.pop() {
+            layers.open = layers.open.saturating_sub(1);
+            layers.snapshot = None;
+        }
+    });
+}
+
+fn mark_unbalanced() {
+    LAYERS.with(|layers| layers.borrow_mut().unbalanced = true);
+}
 
 pub(crate) struct OcgState {
     inactive_ocgs: HashSet<ObjectIdentifier>,
     visibility_stack: Vec<bool>,
     /// Embed build: every layer shows, whatever the configuration or marked content says (see
-    /// `InterpreterSettings::all_layers_visible`).
+    /// `InterpreterSettings::all_layers_visible`), but for the groups and membership
+    /// dictionaries in `hidden` (`InterpreterSettings::hidden_layers`); every level opened is
+    /// recorded (see [`current_layers`]).
     pub(crate) all_visible: bool,
+    hidden: HashSet<ObjectIdentifier>,
+    /// Embed build: the levels the content stream being read opened above (a form's content
+    /// may close only what it opened).
+    floor: usize,
+}
+
+impl Drop for OcgState {
+    fn drop(&mut self) {
+        // Embed build: what the content left open is unbalanced, and closed here.
+        if self.all_visible {
+            if !self.visibility_stack.is_empty() {
+                mark_unbalanced();
+            }
+            for _ in self.visibility_stack.drain(..) {
+                pop_layer();
+            }
+        }
+    }
 }
 
 impl OcgState {
@@ -16,7 +133,42 @@ impl OcgState {
             inactive_ocgs: HashSet::default(),
             visibility_stack: vec![],
             all_visible: false,
+            hidden: HashSet::default(),
+            floor: 0,
         }
+    }
+
+    /// Embed build: draw every layer but `hidden` ((number, generation) of groups and
+    /// membership dictionaries), and record what is opened (see `all_visible`).
+    pub(crate) fn draw_every_layer(&mut self, hidden: &[(i32, i32)]) {
+        self.all_visible = true;
+        self.hidden = hidden.iter().map(|(num, generation)| ObjectIdentifier::new(*num, *generation)).collect();
+    }
+
+    /// Embed build: open a level, visible when its enclosing level is and `active` (the
+    /// document's configuration says it shows) or, drawing every layer, when `id` is not hidden.
+    fn push(&mut self, active: bool, id: Option<ObjectIdentifier>, mark: Option<LayerMark>) {
+        let parent = self.is_visible();
+        let visible = if self.all_visible { parent && !id.is_some_and(|id| self.hidden.contains(&id)) } else { parent && active };
+        self.visibility_stack.push(visible);
+        if self.all_visible {
+            push_layer(mark);
+        }
+    }
+
+    /// Embed build: before a form's content: what it may close (returned, for [`OcgState::leave`]).
+    pub(crate) fn enter(&mut self) -> (usize, usize) {
+        let saved = (self.floor, self.visibility_stack.len());
+        self.floor = self.visibility_stack.len();
+        saved
+    }
+
+    /// Embed build: after a form's content, which must have closed what it opened.
+    pub(crate) fn leave(&mut self, (floor, depth): (usize, usize)) {
+        if self.all_visible && self.visibility_stack.len() != depth {
+            mark_unbalanced();
+        }
+        self.floor = floor;
     }
 
     pub(crate) fn from_catalog(catalog: &Dict<'_>) -> Self {
@@ -67,16 +219,17 @@ impl OcgState {
             inactive_ocgs: inactive,
             visibility_stack: Vec::new(),
             all_visible: false,
+            hidden: HashSet::default(),
+            floor: 0,
         }
     }
 
-    pub(crate) fn begin_single_oc(&mut self, ocg_id: ObjectIdentifier) {
+    pub(crate) fn begin_single_oc(&mut self, ocg_id: ObjectIdentifier, mark: Option<LayerMark>) {
         let is_active = !self.inactive_ocgs.contains(&ocg_id);
-        let visible = self.is_visible() && is_active;
-        self.visibility_stack.push(visible);
+        self.push(is_active, Some(ocg_id), mark);
     }
 
-    pub(crate) fn begin_ocmd(&mut self, ocmd: &Dict<'_>) {
+    pub(crate) fn begin_ocmd(&mut self, ocmd: &Dict<'_>, id: Option<ObjectIdentifier>, mark: Option<LayerMark>) {
         let policy = ocmd
             .get::<Name<'_>>(P)
             .and_then(|n| OcmdPolicy::from_name(n.as_ref()))
@@ -105,24 +258,28 @@ impl OcgState {
             }
         };
 
-        let visible = self.is_visible() && is_active;
-        self.visibility_stack.push(visible);
+        self.push(is_active, id, mark);
     }
 
-    pub(crate) fn begin_ocg(&mut self, props: &Dict<'_>, ref_id: ObjectIdentifier) {
+    pub(crate) fn begin_ocg(&mut self, props: &Dict<'_>, ref_id: ObjectIdentifier, mark: Option<LayerMark>) {
         match props.get::<Name<'_>>(TYPE).as_deref() {
-            Some(OCMD) => self.begin_ocmd(props),
-            _ => self.begin_single_oc(ref_id),
+            Some(OCMD) => self.begin_ocmd(props, Some(ref_id), mark),
+            _ => self.begin_single_oc(ref_id, mark),
         }
     }
 
-    pub(crate) fn begin_marked_content(&mut self) {
-        let visible = self.is_visible();
-        self.visibility_stack.push(visible);
+    pub(crate) fn begin_marked_content(&mut self, mark: Option<LayerMark>) {
+        self.push(true, None, mark);
     }
 
     pub(crate) fn end_marked_content(&mut self) {
-        self.visibility_stack.pop();
+        // Embed build: an `EMC` closing what its content stream did not open is unbalanced.
+        if self.all_visible && self.visibility_stack.len() <= self.floor {
+            mark_unbalanced();
+        }
+        if self.visibility_stack.pop().is_some() && self.all_visible {
+            pop_layer();
+        }
     }
 
     /// PdfCraft patch: override one group's state (viewer layer toggles).
@@ -135,8 +292,9 @@ impl OcgState {
     }
 
     pub(crate) fn is_visible(&self) -> bool {
-        // Embed build: marked content is still tracked (balanced), but hides nothing.
-        self.all_visible || self.visibility_stack.last().copied().unwrap_or(true)
+        // Embed build: drawing every layer, a level hides only what is in a hidden group (see
+        // `push`).
+        self.visibility_stack.last().copied().unwrap_or(true)
     }
 }
 
