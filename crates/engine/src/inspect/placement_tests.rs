@@ -252,8 +252,10 @@ fn with_change(pixels: &[u8], (x0, x1): (usize, usize), (y0, y1): (usize, usize)
 /// A word the edited files redact, with the box that covers it. The word comes before the
 /// images: after an inline image, a text operator within twenty operators makes hayro take the
 /// first `EI` in the data for the image's end.
-const WORD: &str = "BT /F1 12 Tf 150 20 Td (X) Tj ET";
-const WORD_BOX: &str = "0 g 146 14 16 18 re f";
+// In the page's top left corner, where no case's image reaches: a box over an image's pixels
+// that keeps them is no redaction (follow-up 7 audit, item 10).
+const WORD: &str = "BT /F1 12 Tf 6 280 Td (X) Tj ET";
+const WORD_BOX: &str = "0 g 2 274 16 18 re f";
 
 fn outside_redactions(base: &[u8], edited: &[u8]) -> u32 {
     let inspection = inspect(base, edited, InspectLimits::default()).unwrap();

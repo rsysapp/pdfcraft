@@ -760,9 +760,10 @@ fn compare(base: &[u8], edited: &[u8], limits: Limits) -> Result<Inspection, Ins
         }
     }
     let mut rasters = Rasters::default();
-    compare_pages(&before, &after, &pairs, base_kept, layers_changed, &mut budget, &mut rasters, &mut inspection)?;
+    let outside_pages = compare_pages(&before, &after, &pairs, base_kept, layers_changed, &mut budget, &mut rasters, &mut inspection)?;
     inspection.redaction_areas.sort_by(|(page_a, a), (page_b, b)| page_a.cmp(page_b).then(b[3].total_cmp(&a[3])).then(a[0].total_cmp(&b[0])));
-    (inspection.annotations, inspection.destinations.links) = compare_annotations(&before, &after, &pairs, base_kept, &mut budget, &mut rasters)?;
+    (inspection.annotations, inspection.destinations.links) =
+        compare_annotations(&before, &after, &pairs, base_kept, &outside_pages, &mut budget, &mut rasters)?;
     if let Some(message) = after.unreached {
         return Err(InspectError::Edited(message));
     }
@@ -1775,8 +1776,10 @@ fn compare_pages(
     budget: &mut Budget,
     rasters: &mut Rasters,
     inspection: &mut Inspection,
-) -> Result<(), InspectError> {
+) -> Result<BTreeSet<usize>, InspectError> {
     let mut counts = PageCounts::default();
+    // The pages (edited indices) counted outside their redactions: no mark of theirs is applied.
+    let mut outside_pages = BTreeSet::new();
     // The base's structure tree's marked content by where it is, once a rewrite needs it (R6b-47).
     let mut marked_index: Option<structure::MarkedIndex<'_>> = None;
     for &(old, new) in pairs {
@@ -1881,9 +1884,12 @@ fn compare_pages(
                 || layers_changed
                 // Changed, and drawn with something other viewers may show otherwise than
                 // hayro's pixels, on either side (R6b-32).
-                || (drawn_differently && (b.render_risk.is_some() || e.render_risk.is_some()));
+                || (drawn_differently && (b.render_risk.is_some() || e.render_risk.is_some()))
+                // Follow-up 7 audit (item 10): what a box covers is gone, not kept under it.
+                || (drawn_differently && kept_under_boxes(b, e, &pairing, &boxes, budget).map_err(|fail| fail.of(Role::Edited))?);
             if outside {
                 counts.outside_redactions += 1;
+                outside_pages.insert(new);
             } else {
                 let page = u32::try_from(new.saturating_add(1)).unwrap_or(u32::MAX);
                 // An area that explains no removal is not a redaction.
@@ -1912,7 +1918,96 @@ fn compare_pages(
         pages_with_content_changed: count(counts.content_changed),
         pages_changed_outside_redactions: count(counts.outside_redactions),
     };
-    Ok(())
+    Ok(outside_pages)
+}
+
+/// Whether a pixel of a `width` × `height` image placed by `matrix` has its centre inside one of
+/// `boxes`; `None` where the placement is neither upright nor a quarter turn (not told here).
+fn pixel_centre_under(matrix: &structure::Matrix, width: usize, height: usize, boxes: &[[f32; 4]]) -> Option<bool> {
+    let [a, b, c, d, e, f] = *matrix;
+    let tiny = |value: f64| value.abs() < 1e-9;
+    // Which image axis each user axis follows: x from u (and y from v), or x from v (y from u).
+    let (x_scale, y_scale, x_count, y_count) = if tiny(b) && tiny(c) && !tiny(a) && !tiny(d) {
+        (a, d, width, height)
+    } else if tiny(a) && tiny(d) && !tiny(b) && !tiny(c) {
+        (c, b, height, width)
+    } else {
+        return None;
+    };
+    if x_count == 0 || y_count == 0 {
+        return Some(false);
+    }
+    // Some centre (i + 0.5) / count strictly between the two unit-space bounds.
+    let centre_between = |p: f64, q: f64, count: usize| {
+        let (low, high) = (p.min(q).max(0.0), p.max(q).min(1.0));
+        let count = count as f64;
+        let first = (low * count - 0.5).floor() + 1.0;
+        first < count && (first + 0.5) / count < high && (first + 0.5) / count > low
+    };
+    Some(boxes.iter().any(|bx| {
+        let (x0, x1) = ((f64::from(bx[0]) - e) / x_scale, (f64::from(bx[2]) - e) / x_scale);
+        let (y0, y1) = ((f64::from(bx[1]) - f) / y_scale, (f64::from(bx[3]) - f) / y_scale);
+        centre_between(x0, x1, x_count) && centre_between(y0, y1, y_count)
+    }))
+}
+
+/// Follow-up 7 audit (item 10): whether a rewrite kept, under one of the page's redaction boxes,
+/// something the base page had there: a glyph whose em box's centre lies inside a box (paired,
+/// not removed), an image drawn at the same place and the same, or an annotation unchanged
+/// whose rectangle reaches into a box. A box drawn over content that survives under it
+/// (copied, searched, read aloud, or shown as a comment) is no redaction.
+fn kept_under_boxes(base: &PageFacts, edited: &PageFacts, pairing: &glyphs::Pairing, boxes: &[[f32; 4]], budget: &mut Budget) -> Result<bool, Fail> {
+    if boxes.is_empty() {
+        return Ok(false);
+    }
+    let inside = |x: f32, y: f32| boxes.iter().any(|b| x > b[0] && x < b[2] && y > b[1] && y < b[3]);
+    // More than a point into a box, both ways.
+    let reaches = |rect: [f64; 4]| {
+        boxes.iter().any(|b| {
+            let width = rect[2].min(f64::from(b[2])) - rect[0].max(f64::from(b[0]));
+            let height = rect[3].min(f64::from(b[3])) - rect[1].max(f64::from(b[1]));
+            width > 1.0 && height > 1.0
+        })
+    };
+    let removed: BTreeSet<usize> = pairing.removed.iter().copied().collect();
+    for index in 0..base.glyphs.len() {
+        budget.tick()?;
+        if removed.contains(&index) {
+            continue;
+        }
+        if let Some((_, rect)) = base.glyphs.glyph(index)
+            && inside((rect[0] + rect[2]) / 2.0, (rect[1] + rect[3]) / 2.0)
+        {
+            return Ok(true);
+        }
+    }
+    for image in edited.image_uses.iter().filter(|image| !image.tiled) {
+        budget.tick()?;
+        let kept = base.image_uses.iter().any(|old| !old.tiled && old.digest == image.digest && images::same_placement(&old.matrix, &image.matrix));
+        if !kept {
+            continue;
+        }
+        // A pixel whose centre lies under a box (what the redactor clears) kept; where that
+        // cannot be told exactly (an inline image, a rotated or skewed placement), any reach.
+        let under = match image.image.as_deref() {
+            Some(info) => match pixel_centre_under(&image.matrix, info.width as usize, info.height as usize, boxes) {
+                Some(under) => under,
+                None => reaches(structure::unit_square(&image.matrix)),
+            },
+            None => reaches(structure::unit_square(&image.matrix)),
+        };
+        if under {
+            return Ok(true);
+        }
+    }
+    for annot in edited.annots.iter().filter(|annot| annot.tracked) {
+        budget.tick()?;
+        let kept = base.annots.iter().any(|old| old.digest == annot.digest);
+        if kept && annot.rect.is_some_and(reaches) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Whether the forms the base page draws and the edited page draws differ only under the areas:
@@ -2060,6 +2155,11 @@ struct AnnotationContext<'s> {
     before: &'s Side,
     after: &'s Side,
     base_kept: bool,
+    /// The pages counted outside their redactions (edited indices): no mark of theirs counts
+    /// as applied (follow-up 7 audit, item 10).
+    outside_pages: &'s BTreeSet<usize>,
+    /// Base annotations a rewrite took away from pages present in both files, by object.
+    gone: std::cell::RefCell<BTreeSet<ObjRef>>,
 }
 
 impl AnnotationContext<'_> {
@@ -2074,9 +2174,16 @@ impl AnnotationContext<'_> {
         changes: &mut AnnotationChanges,
     ) -> Result<(), InspectError> {
         if !self.base_kept
+            && pair.is_some()
+            && let Some(id) = annot.id
+        {
+            self.gone.borrow_mut().insert(id);
+        }
+        if !self.base_kept
             && annot.subtype == b"Redact"
             && !annot.areas.is_empty()
             && let Some(pair) = pair
+            && !self.outside_pages.contains(&pair.1)
         {
             let (base_raster, edited_raster) = rasters.get(self.before, self.after, pair, budget)?;
             if annot.areas.iter().all(|area| visual::area_filled(&base_raster, &edited_raster, *area)) {
@@ -2095,10 +2202,11 @@ fn compare_annotations(
     after: &Side,
     pairs: &Pairs,
     base_kept: bool,
+    outside_pages: &BTreeSet<usize>,
     budget: &mut Budget,
     rasters: &mut Rasters,
 ) -> Result<(AnnotationChanges, u32), InspectError> {
-    let context = AnnotationContext { before, after, base_kept };
+    let context = AnnotationContext { before, after, base_kept, outside_pages, gone: std::cell::RefCell::new(BTreeSet::new()) };
     let mut changes = AnnotationChanges::default();
     let mut links = 0u32;
     let to_edited: HashMap<usize, usize> = pairs.iter().copied().collect();
@@ -2181,6 +2289,15 @@ fn compare_annotations(
     }
     for annot in by_content.values().flatten() {
         add_kind(&mut changes, &annot.subtype);
+    }
+    // Follow-up 7 audit (item 10): what stands for an annotation a rewrite took away goes too.
+    if !base_kept
+        && structure::object_text_kept(&context.gone.borrow(), &before.structure.structure_links, &after.structure.structure_tree, budget)
+            .map_err(|fail| fail.of(Role::Edited))?
+    {
+        return Err(InspectError::Edited(
+            "the structure tree keeps text standing for an annotation the rewrite took away, which this comparison does not report".into(),
+        ));
     }
     Ok((changes, links))
 }

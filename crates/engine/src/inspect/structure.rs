@@ -659,6 +659,8 @@ pub(crate) struct StructFacts {
     pub text: Vec<(u32, u8, Digest)>,
     /// (element, or [`STRUCT_ROOT`] for a kid of the root, the MCID), in the tree's order.
     pub marked: Vec<(u32, i64)>,
+    /// (element, the digest of the object an object reference names), in the tree's order.
+    pub objects: Vec<(u32, Digest)>,
     pub digest: Digest,
     /// The same without the text and the marked-content kids: what a rewrite may not change
     /// (a redaction takes away text and the marked content it removed).
@@ -674,6 +676,9 @@ pub(crate) struct StructLinks {
     pub parents: Vec<u32>,
     /// Each marked-content kid (an MCID, or a marked-content reference), in the tree's order.
     pub kids: Vec<MarkedKid>,
+    /// Each object reference (`/Type /OBJR`): the element it belongs to and the object it
+    /// names (an annotation), in the tree's order (follow-up 7 audit, item 10).
+    pub objects: Vec<(u32, ObjRef)>,
 }
 
 /// One marked-content kid of the structure tree (R6b-47).
@@ -695,7 +700,10 @@ pub(crate) struct MarkedKid {
 /// text but for entries taken away (none added, changed or moved to another element), and each
 /// element's marked-content kids in their order but for kids taken away (R6b-44).
 pub(crate) fn tags_kept(base: &StructFacts, edited: &StructFacts) -> Option<usize> {
-    let kept = base.shape == edited.shape && subsequence(&edited.text, &base.text) && subsequence(&edited.marked, &base.marked);
+    let kept = base.shape == edited.shape
+        && subsequence(&edited.text, &base.text)
+        && subsequence(&edited.marked, &base.marked)
+        && subsequence(&edited.objects, &base.objects);
     kept.then(|| base.text.len().saturating_sub(edited.text.len()))
 }
 
@@ -2466,6 +2474,53 @@ impl<'d, 'b> Reader<'d, 'b> {
                     parts.extend_from_slice(&owner.to_le_bytes());
                     parts.extend_from_slice(&mcid.to_le_bytes());
                 }
+                // Follow-up 7 audit (item 10): a marked-content reference is its element's marked
+                // content, as an MCID is (on its own `/Pg` or in the form `/Stm` names, R6b-47); an
+                // object reference names an annotation (or another object) the element stands
+                // for. Each may be taken away by a rewrite, as marked content is; neither may hold
+                // an entry of its own.
+                Object::Dict(reference) if reference.name(b"Type") == Some(b"MCR") => {
+                    if reference.iter().any(|(key, _)| !matches!(key.as_slice(), b"Type" | b"Pg" | b"Stm" | b"StmOwn" | b"MCID")) {
+                        return Err(read_error("a marked-content reference holds an entry no reference has"));
+                    }
+                    let mcid = match reference.get(b"MCID").map(|mcid| self.resolve(mcid)).transpose()?.as_deref() {
+                        Some(Object::Int(mcid)) => *mcid,
+                        _ => return Err(read_error("a marked-content reference has no whole-number /MCID")),
+                    };
+                    if facts.marked.len() >= MAX_STRUCT_MARKED {
+                        return Err(Fail::TooComplex);
+                    }
+                    let page = match reference.get(b"Pg") {
+                        Some(Object::Ref(own)) => Some(*own),
+                        _ => page,
+                    };
+                    let form = match reference.get(b"Stm") {
+                        Some(Object::Ref(form)) => Some(*form),
+                        _ => None,
+                    };
+                    facts.marked.push((owner, mcid));
+                    links.kids.push(MarkedKid { element: owner, page, form, mcid });
+                    parts.push(b'm');
+                    parts.extend_from_slice(&owner.to_le_bytes());
+                    parts.extend_from_slice(&mcid.to_le_bytes());
+                }
+                Object::Dict(reference) if reference.name(b"Type") == Some(b"OBJR") => {
+                    if reference.iter().any(|(key, _)| !matches!(key.as_slice(), b"Type" | b"Pg" | b"Obj")) {
+                        return Err(read_error("an object reference holds an entry no reference has"));
+                    }
+                    let Some(Object::Ref(target)) = reference.get(b"Obj") else {
+                        return Err(read_error("an object reference does not name an object"));
+                    };
+                    if facts.objects.len() >= MAX_STRUCT_MARKED {
+                        return Err(Fail::TooComplex);
+                    }
+                    let (digest, _) = self.digest_ref(*target)?;
+                    facts.objects.push((owner, digest));
+                    links.objects.push((owner, *target));
+                    parts.push(b'o');
+                    parts.extend_from_slice(&owner.to_le_bytes());
+                    parts.extend_from_slice(&digest);
+                }
                 Object::Dict(element) => {
                     let index = elements;
                     elements = elements.checked_add(1).filter(|count| *count as usize <= MAX_STRUCT_ELEMENTS).ok_or(Fail::TooComplex)?;
@@ -2477,21 +2532,6 @@ impl<'d, 'b> Reader<'d, 'b> {
                         Some(Object::Ref(own)) => Some(*own),
                         _ => page,
                     };
-                    // A marked-content reference: its element's content on `/Pg`, or in the
-                    // form `/Stm` names (R6b-47).
-                    if element.name(b"Type") == Some(b"MCR")
-                        && let Some(mcid) = element.get(b"MCID")
-                        && let Object::Int(mcid) = &*self.resolve(mcid)?
-                    {
-                        if links.kids.len() >= MAX_STRUCT_MARKED {
-                            return Err(Fail::TooComplex);
-                        }
-                        let form = match element.get(b"Stm") {
-                            Some(Object::Ref(form)) => Some(*form),
-                            _ => None,
-                        };
-                        links.kids.push(MarkedKid { element: owner, page, form, mcid: *mcid });
-                    }
                     // Its text, whatever the value is (a reader may show a value that is not a
                     // string; a value of another kind is still compared).
                     for (key_index, key) in (0u8..).zip(STRUCT_TEXT_KEYS) {
@@ -4117,6 +4157,25 @@ fn with_ancestors(mut todo: Vec<u32>, links: &StructLinks, budget: &mut Budget) 
         }
     }
     Ok(elements)
+}
+
+/// Follow-up 7 audit (item 10): whether a rewrite kept text standing for an annotation it
+/// removed: an element whose object reference names one of `gone` (base annotations), or an
+/// ancestor of one, still has `/ActualText`, `/Alt` or `/E` in `edited_tree` (a link's or a
+/// widget's description can spell out what the annotation said).
+pub(crate) fn object_text_kept(gone: &BTreeSet<ObjRef>, links: &StructLinks, edited_tree: &StructFacts, budget: &mut Budget) -> Result<bool, Fail> {
+    if gone.is_empty() {
+        return Ok(false);
+    }
+    let mut todo = Vec::new();
+    for (element, target) in &links.objects {
+        budget.tick()?;
+        if gone.contains(target) {
+            todo.push(*element);
+        }
+    }
+    let elements = with_ancestors(todo, links, budget)?;
+    Ok(edited_tree.text.iter().any(|(element, key, _)| stands_for_content(*key) && elements.contains(element)))
 }
 
 /// Whether a key of [`STRUCT_TEXT_KEYS`] is text standing for the content (`/ActualText`,

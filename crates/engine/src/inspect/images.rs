@@ -146,7 +146,7 @@ fn corners(m: &Matrix) -> [(f64, f64); 4] {
     [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)].map(|(u, v)| (m[0] * u + m[2] * v + m[4], m[1] * u + m[3] * v + m[5]))
 }
 
-fn same_placement(a: &Matrix, b: &Matrix) -> bool {
+pub(crate) fn same_placement(a: &Matrix, b: &Matrix) -> bool {
     corners(a).iter().zip(corners(b)).all(|(p, q)| (p.0 - q.0).abs() <= PLACEMENT_TOLERANCE && (p.1 - q.1).abs() <= PLACEMENT_TOLERANCE)
 }
 

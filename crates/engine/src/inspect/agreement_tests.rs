@@ -1911,3 +1911,98 @@ fn the_page_s_boxes_rotation_and_unit_are_compared() {
     }
     assert_eq!(inspection("/CropBox [-100 -100 400 400]").content.pages_changed_outside_redactions, 0);
 }
+
+// ── follow-up 7 audit, item 10: a redaction is applied only where nothing survives under it ──
+
+const MARK: &str = "<< /Type /Annot /Subtype /Redact /Rect [146 14 162 32] /QuadPoints [146 32 162 32 146 14 162 14] /IC [0 0 0] >>";
+/// An image placed over the mark's area.
+const IMAGE_THERE: &str = "q 16 0 0 18 146 14 cm /Im Do Q";
+
+/// A page drawing "Alpha" and `last`, with `annots` (objects 10…) and the image `/Im` (object 6).
+fn marked_page(last: &str, annots: &[&str]) -> Vec<u8> {
+    let mut b = Builder::new();
+    head(&mut b);
+    let list: Vec<String> = (0..annots.len()).map(|i| format!("{} 0 R", 10 + i)).collect();
+    b.object(
+        3,
+        format!(
+            "<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Annots [{}] /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> /XObject << /Im 6 0 R >> >> >>",
+            list.join(" ")
+        )
+        .as_bytes(),
+    );
+    b.object(4, &stream("", &[text("Alpha"), b"\n".to_vec(), last.as_bytes().to_vec()].concat()));
+    b.object(5, b"null");
+    b.object(6, &stream("/Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 8", &[0, 80, 160, 240]));
+    for (i, annot) in annots.iter().enumerate() {
+        b.object(10 + i as u32, annot.as_bytes());
+    }
+    for num in 7..10 {
+        b.object(num, b"null");
+    }
+    let rows = b.offsets.clone();
+    b.finish(10 + annots.len() as u32, &rows, "")
+}
+
+#[test]
+fn a_box_over_content_that_survives_is_no_redaction() {
+    // Forged rewrites: the mark gone, a black box drawn over its area, and what was under it
+    // kept (still copied, searched, read aloud or shown in a comment). 206f2ce counted each
+    // redaction applied, the page inside its redactions.
+    let note = "<< /Type /Annot /Subtype /FreeText /Rect [148 16 160 30] /Contents (X) /DA (/Helv 12 Tf 0 g) >>";
+    for (case, base, edited, expected) in [
+        ("the text removed", marked_page(X, &[MARK]), marked_page(X_BOX, &[]), (0, 1)),
+        ("the text kept under the box", marked_page(X, &[MARK]), marked_page(&format!("{X}\n{X_BOX}"), &[]), (1, 0)),
+        ("an image kept under the box", marked_page(IMAGE_THERE, &[MARK]), marked_page(&format!("{IMAGE_THERE}\n{X_BOX}"), &[]), (1, 0)),
+        ("a comment kept over the box", marked_page(X, &[MARK, note]), marked_page(X_BOX, &[note]), (1, 0)),
+    ] {
+        let inspection = inspect(&base, &edited, InspectLimits::default()).unwrap_or_else(|error| panic!("{case}: {error:?}"));
+        assert_eq!(
+            (inspection.content.pages_changed_outside_redactions, inspection.annotations.redactions_applied),
+            expected,
+            "{case}: {inspection:?}"
+        );
+    }
+}
+
+#[test]
+fn text_standing_for_a_removed_annotation_goes_with_it() {
+    // Follow-up 7 audit, item 10: a link under the mark removed, its element's /Alt (naming it
+    // through /OBJR) kept. 206f2ce accepted it.
+    let link = "<< /Type /Annot /Subtype /Link /Rect [148 16 160 30] /A << /S /URI /URI (https://x.example) >> >>";
+    let tagged_page = |last: &str, annots: &[&str], alt: &str| {
+        let mut b = Builder::new();
+        b.object(1, b"<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 7 0 R /MarkInfo << /Marked true >> >>");
+        b.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 300] >>");
+        let list: Vec<String> = (0..annots.len()).map(|i| format!("{} 0 R", 10 + i)).collect();
+        b.object(3, format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Annots [{}] {RESOURCES} >>", list.join(" ")).as_bytes());
+        b.object(4, &stream("", &[text("Alpha"), b"\n".to_vec(), last.as_bytes().to_vec()].concat()));
+        for num in [5, 6, 9] {
+            b.object(num, b"null");
+        }
+        b.object(7, b"<< /Type /StructTreeRoot /K 8 0 R >>");
+        let kid = if annots.len() > 1 { "/K << /Type /OBJR /Obj 11 0 R >>" } else { "" };
+        b.object(8, format!("<< /S /Link /P 7 0 R /Pg 3 0 R {alt} {kid} >>").as_bytes());
+        for (i, annot) in annots.iter().enumerate() {
+            b.object(10 + i as u32, annot.as_bytes());
+        }
+        let rows = b.offsets.clone();
+        b.finish(10 + annots.len() as u32, &rows, "")
+    };
+    let base = tagged_page(X, &[MARK, link], "/Alt (https://x.example)");
+    let result = |alt: &str| inspect(&base, &tagged_page(X_BOX, &[], alt), InspectLimits::default());
+    assert_eq!(result("").unwrap().content.pages_changed_outside_redactions, 0);
+    match result("/Alt (https://x.example)") {
+        Err(InspectError::Edited(message)) => assert!(message.contains("annotation the rewrite took away"), "{message}"),
+        other => panic!("{other:?}"),
+    }
+    // The Session applying the mark: the link, its element's text and reference go; accepted.
+    let mut session = crate::Session::new().with_clock(|| 1_700_000_000);
+    session.set_keep_document_information(true);
+    let id = session.open("base.pdf", None, std::sync::Arc::new(base.clone()), None).unwrap();
+    session.apply(id, crate::Edit::ApplyRedactions { pages: None }).unwrap();
+    let redacted = session.save_bytes(id).unwrap();
+    let inspection = inspect(&base, &redacted, InspectLimits::default()).unwrap();
+    assert_eq!((inspection.content.pages_changed_outside_redactions, inspection.annotations.redactions_applied), (0, 1), "{inspection:?}");
+    assert!(!exposed_text(&redacted).contains("x.example"));
+}
