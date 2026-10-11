@@ -15,7 +15,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use hayro::hayro_interpret::{InterpreterSettings, InterpreterWarning, work_spent};
+use hayro::hayro_interpret::{InterpreterSettings, InterpreterWarning, TransformExt, work_spent};
 use hayro::hayro_syntax::object::{Array, Dict};
 use hayro::hayro_syntax::{LoadPdfError, Pdf};
 use hayro::vello_cpu::color::palette::css::WHITE;
@@ -45,6 +45,14 @@ impl From<String> for ContentError {
     fn from(message: String) -> Self {
         ContentError::Unreadable(message)
     }
+}
+
+/// A page's text: its characters in reading order, whitespace left out, and where each was drawn
+/// (the centre of its box, in the page's user space, PDF points).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PageChars {
+    pub chars: Vec<char>,
+    pub centres: Vec<[f32; 2]>,
 }
 
 /// A page's content rendered upright: `rgba` is premultiplied RGBA8, `width` × `height` pixels.
@@ -145,7 +153,7 @@ impl ContentDocument {
     /// The page's text in reading order, without whitespace. Fails when a drawn glyph gives no
     /// text (no Unicode mapping, or no usable box), on an interpreter warning, on a panic, when the
     /// parser had to rebuild the cross-reference data, and past the work budget.
-    pub fn text(&self, page: usize) -> Result<Vec<char>, ContentError> {
+    pub fn text(&self, page: usize) -> Result<PageChars, ContentError> {
         let before = self.counts();
         let number = page.saturating_add(1);
         let extracted = catch_unwind(AssertUnwindSafe(|| crate::text::extract_page_counted(&self.pdf, page, &self.settings)));
@@ -161,7 +169,25 @@ impl ContentDocument {
         if self.repaired() {
             return Err(ContentError::Unreadable("the file's cross-reference data is damaged".into()));
         }
-        Ok(text.glyphs.iter().flat_map(|glyph| glyph.text.chars()).filter(|c| !c.is_whitespace()).collect())
+        // Glyph boxes are in view space (the displayed page, y down): back to user space.
+        let to_user = self
+            .pdf
+            .pages()
+            .get(page)
+            .map(|p| p.initial_transform(true).to_kurbo())
+            .filter(|t| t.determinant().abs() > f64::EPSILON)
+            .map(|t| t.inverse());
+        let Some(to_user) = to_user else { return Err(format!("page {number} has no usable page box").into()) };
+        let mut found = PageChars::default();
+        for glyph in &text.glyphs {
+            let [x0, y0, x1, y1] = glyph.rect;
+            let centre = to_user * kurbo::Point::new(f64::from(x0 + x1) / 2.0, f64::from(y0 + y1) / 2.0);
+            for c in glyph.text.chars().filter(|c| !c.is_whitespace()) {
+                found.chars.push(c);
+                found.centres.push([centre.x as f32, centre.y as f32]);
+            }
+        }
+        Ok(found)
     }
 
     /// The page box hayro renders upright (intersected crop box), in points: width, height.
