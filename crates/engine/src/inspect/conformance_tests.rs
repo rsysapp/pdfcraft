@@ -1030,3 +1030,13 @@ fn annotation_flags_states_and_layers_are_reported() {
     let inspection = run(&base, &annotated("/D 6 0 R")).unwrap();
     assert_eq!((inspection.annotations.removed, inspection.annotations.drawings), (1, 1), "{inspection:?}");
 }
+
+#[test]
+fn text_kept_under_a_box_in_a_layer_that_is_off_is_no_redaction() {
+    // Follow-up 7 audit, item 11 (pinned): every layer's glyphs are compared, so a word kept in
+    // a hidden layer under the box is kept, not redacted.
+    let base = layer_page("6 0 R", "/OFF [6 0 R]", &format!("/OC /L BDC {WORD} EMC"));
+    let edited = layer_page("6 0 R", "/OFF [6 0 R]", &format!("/OC /L BDC {WORD} EMC\n{WORD_BOX}"));
+    let inspection = run(&base, &edited).unwrap();
+    assert_eq!((inspection.content.pages_changed_outside_redactions, inspection.annotations.redactions_applied), (1, 0), "{inspection:?}");
+}

@@ -1951,12 +1951,18 @@ fn pixel_centre_under(matrix: &structure::Matrix, width: usize, height: usize, b
     }))
 }
 
-/// Follow-up 7 audit (item 10): whether a rewrite kept, under one of the page's redaction boxes,
+/// Follow-up 7 audit (items 10, 11): whether a rewrite added a glyph, or kept, under one of the
+/// page's redaction boxes,
 /// something the base page had there: a glyph whose em box's centre lies inside a box (paired,
 /// not removed), an image drawn at the same place and the same, or an annotation unchanged
 /// whose rectangle reaches into a box. A box drawn over content that survives under it
 /// (copied, searched, read aloud, or shown as a comment) is no redaction.
 fn kept_under_boxes(base: &PageFacts, edited: &PageFacts, pairing: &glyphs::Pairing, boxes: &[[f32; 4]], budget: &mut Budget) -> Result<bool, Fail> {
+    // Follow-up 7 audit (item 11): a redaction removes text and adds none; a glyph added (the
+    // redacted word written again, invisible or white, anywhere) is no redaction.
+    if !pairing.added.is_empty() {
+        return Ok(true);
+    }
     if boxes.is_empty() {
         return Ok(false);
     }

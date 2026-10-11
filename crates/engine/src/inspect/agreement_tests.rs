@@ -2006,3 +2006,21 @@ fn text_standing_for_a_removed_annotation_goes_with_it() {
     assert_eq!((inspection.content.pages_changed_outside_redactions, inspection.annotations.redactions_applied), (0, 1), "{inspection:?}");
     assert!(!exposed_text(&redacted).contains("x.example"));
 }
+
+#[test]
+fn text_added_outside_the_boxes_is_no_redaction() {
+    // Follow-up 7 audit, item 11: the redacted word removed under the box but written again
+    // elsewhere (invisible, or white on white) was counted applied, the page inside its
+    // redactions (text added was only reported).
+    let base = marked_page(X, &[MARK]);
+    let facts = |edited: &[u8]| {
+        let inspection = inspect(&base, edited, InspectLimits::default()).unwrap();
+        (inspection.content.pages_changed_outside_redactions, inspection.annotations.redactions_applied)
+    };
+    assert_eq!(facts(&marked_page(X_BOX, &[])), (0, 1));
+    for again in ["BT 3 Tr /F1 12 Tf 20 250 Td (X) Tj ET", "BT 1 g /F1 12 Tf 20 250 Td (X) Tj ET"] {
+        assert_eq!(facts(&marked_page(&format!("{X_BOX}\n{again}"), &[])), (1, 0), "{again}");
+    }
+    // (A mark's overlay label is text added too: such a page was already outside its
+    // redactions, the label breaking the box's uniform fill.)
+}
