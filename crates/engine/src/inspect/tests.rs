@@ -1408,3 +1408,33 @@ fn a_crypt_filter_on_a_stream_of_a_file_without_encryption_is_refused() {
     ]);
     assert!(matches!(run(&base, &crypted), Err(InspectError::Edited(_))), "{:?}", run(&base, &crypted));
 }
+
+// ── known failures of the redactor, not the inspector: R6b-8 and R6b-17 (redactor) ──────────
+//
+// The reviewer's I1 and I2 (follow-up 2 review). The Session redactor removes glyphs whose font
+// box its box touches and sets the rest of the line again about 0.7 pt off; it re-codes a JPEG
+// without clearing whole blocks. Each counts as a change outside the redactions under the
+// inspector's 0.5 pt glyph tolerance and per-sample JPEG check, which stay as they are: these
+// pass once the redactor keeps every kept glyph within 0.5 pt (R6b-8) and clears whole JPEG
+// blocks (R6b-17).
+
+#[test]
+#[ignore = "known failure until R6b-8 and R6b-17 (redactor): a word redacted mid-line re-sets the rest of the line"]
+fn known_failure_a_session_word_redaction_mid_line_is_a_redaction() {
+    let base = pages_pdf(&[page(&text_line(20.0, 150.0, "Buyer pays Seller the agreed price"))], &[]);
+    // A box around "Seller" (display space), inside the line.
+    let saved = session_edit(base.clone(), vec![annotation(0, redact([82.0, 138.0, 115.0, 156.0])), Edit::ApplyRedactions { pages: None }]);
+    let inspection = run(&base, &saved).unwrap();
+    assert_eq!(inspection.text, TextChanges { pages_with_text_removed: 1, pages_with_text_added: 0 }, "{inspection:?}");
+    assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{inspection:?}");
+}
+
+#[test]
+#[ignore = "known failure until R6b-8 and R6b-17 (redactor): a JPEG redaction does not clear whole blocks"]
+fn known_failure_a_session_redaction_of_a_jpeg_scan_is_a_redaction() {
+    let (width, height) = (400u32, 600u32);
+    let base = full_page_scan(dct_image(width, height, &jpeg_grey(width, height, &photo(width as usize, height as usize), 80)), "");
+    let saved = session_edit(base.clone(), vec![annotation(0, redact([40.0, 40.0, 100.0, 100.0])), Edit::ApplyRedactions { pages: None }]);
+    let inspection = run(&base, &saved).unwrap();
+    assert_eq!((inspection.content.pages_changed_outside_redactions, inspection.redaction_areas.len()), (0, 1), "{inspection:?}");
+}
