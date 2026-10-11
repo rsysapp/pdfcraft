@@ -290,22 +290,122 @@ fn a_stream_whose_length_disagrees_with_its_endstream_is_read_only_where_both_re
     let message = refused(&image_with_comment_before_endstream());
     assert!(message.contains("readers disagree: hayro read other data for stream 5 0 R"), "{message}");
     // `/Length` short of `endstream`: both readers take the data up to `endstream`, and hayro's
-    // reading is checked to be the same bytes. Tolerated (as the files signed by some tools have
-    // it), and compared as usual: the page draws what the base's does.
-    let inspection = inspect(&sound(), &length_short_of_endstream(), InspectLimits::default()).unwrap();
-    assert_eq!(inspection.text, TextChanges::default(), "{inspection:?}");
-    assert_eq!(inspection.content, ContentChanges::default(), "{inspection:?}");
-    assert!(inspect(&length_short_of_endstream(), &length_short_of_endstream(), InspectLimits::default()).is_ok());
+    // reading is checked to be the same bytes. Tolerated in the base's own objects (as the files
+    // signed by some tools have it), and compared as usual: the base against itself, and an
+    // update appended to it that keeps those objects.
+    let short = length_short_of_endstream();
+    assert!(inspect(&short, &short, InspectLimits::default()).is_ok());
+    let inspection = inspect(
+        &short,
+        &appended(&short, 3, &format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Rotate 90 {RESOURCES} >>")),
+        InspectLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        (inspection.pages.rotated, inspection.text, inspection.content),
+        (1, TextChanges::default(), ContentChanges::default()),
+        "{inspection:?}"
+    );
     // An annotation's appearance, which hayro does not draw: it reads it all the same (every
     // object `pdfcraft_cos` reads is one hayro reads), and finds the same data.
     let square = b"0 0 1 RG 2 2 56 56 re S";
-    assert!(inspect(&sound(), &appearance_with(10, square), InspectLimits::default()).is_ok());
+    let short_appearance = appearance_with(10, square);
+    assert!(inspect(&short_appearance, &short_appearance, InspectLimits::default()).is_ok());
     // The exact length and a comment before `endstream`: `pdfcraft_cos` takes the declared
     // bytes, hayro everything up to `endstream`. They disagree, on a stream nothing draws.
     let mut commented = square.to_vec();
     commented.extend_from_slice(b"\n% 0 g 0 0 60 60 re f");
     let message = refused(&appearance_with(square.len(), &commented));
     assert!(message.contains("readers disagree: hayro read other data for stream 6 0 R"), "{message}");
+}
+
+/// `base` with an update appended that replaces object `num` with `body` (the base's table has
+/// five or seven rows: the update's `/Size` is the larger).
+fn appended(base: &[u8], num: u32, body: &str) -> Vec<u8> {
+    let at = base.windows(9).rposition(|w| w == b"startxref").unwrap();
+    let prev: usize = std::str::from_utf8(&base[at + 9..]).unwrap().split_whitespace().next().unwrap().parse().unwrap();
+    let mut out = base.to_vec();
+    let offset = out.len();
+    out.extend_from_slice(format!("{num} 0 obj\n{body}\nendobj\n").as_bytes());
+    let xref = out.len();
+    out.extend_from_slice(format!("xref\n0 1\n0000000000 65535 f \n{num} 1\n{offset:010} 00000 n \n").as_bytes());
+    out.extend_from_slice(format!("trailer\n<< /Size 7 /Root 1 0 R /Prev {prev} >>\nstartxref\n{xref}\n%%EOF\n").as_bytes());
+    out
+}
+
+/// A page drawing `data` as its content, declared `length` long.
+fn page_declaring(length: usize, data: &[u8]) -> Vec<u8> {
+    let mut b = Builder::new();
+    head(&mut b);
+    b.object(3, format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R {RESOURCES} >>").as_bytes());
+    let mut body = format!("<< /Length {length} >>\nstream\n").into_bytes();
+    body.extend_from_slice(data);
+    body.extend_from_slice(b"\nendstream");
+    b.object(4, &body);
+    let rows = b.offsets.clone();
+    b.finish(5, &rows, "")
+}
+
+#[test]
+fn an_object_the_edited_file_brings_must_declare_its_length() {
+    // R6b-30. The edited content: "Alpha", a box over the word the base shows, `% endobj`, then
+    // a clause, declared 7 bytes long. `pdfcraft_cos` and hayro read to `endstream`; a reader
+    // that ends the data at the first `endobj` shows no clause (and PDFium does so).
+    let base = {
+        let data = [text("Alpha"), b"\nBT /F1 12 Tf 150 20 Td (X) Tj ET".to_vec()].concat();
+        page_declaring(data.len(), &data)
+    };
+    let data = [text("Alpha"), b"\n0 g 146 14 16 18 re f\n% endobj\nBT /F1 12 Tf 20 100 Td (Seller is liable) Tj ET".to_vec()].concat();
+    // In a rewrite, every object is the edited file's own.
+    let message = refused_against(&base, &page_declaring(7, &data));
+    assert!(message.contains("does not have the length it declares"), "{message}");
+    // In an appended update, a new object (here, the page's content written again).
+    let mut body = b"<< /Length 7 >>\nstream\n".to_vec();
+    body.extend_from_slice(&data);
+    body.extend_from_slice(b"\nendstream");
+    let message = refused_against(&base, &appended(&base, 4, &String::from_utf8(body).unwrap()));
+    assert!(message.contains("does not have the length it declares"), "{message}");
+    // The same rewrite with the exact length is read like any other.
+    assert!(inspect(&base, &page_declaring(data.len(), &data), InspectLimits::default()).is_ok());
+    // A base object whose length is wrong, written again by a rewrite with that wrong length.
+    let short = length_short_of_endstream();
+    let message = refused_against(&sound(), &short);
+    assert!(message.contains("does not have the length it declares"), "{message}");
+    let square = b"0 0 1 RG 2 2 56 56 re S";
+    let message = refused_against(&appearance_with(square.len(), square), &appearance_with(10, square));
+    assert!(message.contains("stream 6 0 R does not have the length it declares"), "{message}");
+}
+
+#[test]
+fn the_editor_writes_every_length_exactly() {
+    // A base whose content declares a short length: the editor's appended update keeps it, and
+    // its rewrite (an applied redaction) writes the content again with its exact length.
+    use crate::{Edit, NewAnnotation, Session, Shape, Style, rect_quad};
+    let short = length_short_of_endstream();
+    let save = |edits: Vec<Edit>| {
+        let mut session = Session::new().with_clock(|| 1_700_000_000);
+        let id = session.open("base.pdf", None, std::sync::Arc::new(short.clone()), None).unwrap();
+        for edit in edits {
+            session.apply(id, edit).unwrap();
+        }
+        session.save_bytes(id).unwrap().as_ref().clone()
+    };
+    let rotated = inspect(&short, &save(vec![Edit::RotatePages { pages: vec![0], degrees: 90 }]), InspectLimits::default()).unwrap();
+    assert!(rotated.base_kept && rotated.pages.rotated == 1, "{rotated:?}");
+    let mark = Shape::Redact { quads: vec![rect_quad([18.0, 144.0, 61.0, 163.0])], overlay: String::new(), look: Default::default() };
+    let redact =
+        Edit::AddAnnotation(NewAnnotation { page: 0, style: Style::default_for(&mark), shape: mark, contents: String::new(), author: "Sari".into() });
+    let redacted = inspect(&short, &save(vec![redact, Edit::ApplyRedactions { pages: None }]), InspectLimits::default()).unwrap();
+    assert!(!redacted.base_kept, "{redacted:?}");
+    assert_eq!(redacted.text, TextChanges { pages_with_text_removed: 1, pages_with_text_added: 0 }, "{redacted:?}");
+    assert_eq!(redacted.content.pages_changed_outside_redactions, 0, "{redacted:?}");
+}
+
+fn refused_against(base: &[u8], file: &[u8]) -> String {
+    match inspect(base, file, InspectLimits::default()) {
+        Err(InspectError::Edited(message)) => message,
+        other => panic!("expected Err(Edited), got {other:?}"),
+    }
 }
 
 #[test]

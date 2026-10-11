@@ -453,9 +453,17 @@ struct Reader<'d, 'b> {
     /// The digest of each content stream's data as `pdfcraft_cos` decodes it, once computed.
     decoded: HashMap<ObjRef, Digest>,
     /// Streams whose `/Length` is not the length of their data (`pdfcraft_cos` found their end at
-    /// `endstream`): certain only where hayro read the same data (see [`Known::agree`]).
+    /// `endstream`): certain only where hayro read the same data (see [`Known::agree`]), and
+    /// tolerated only in objects of the base revision (see `kept_until`).
     misdeclared: BTreeSet<ObjRef>,
+    /// How many bytes at the start of this file are the base's own: an object that lies wholly
+    /// within them is byte for byte the base's object at the same offset (the base itself: all
+    /// of it; an appended update: the base's length; a rewrite: none).
+    kept_until: usize,
 }
+
+/// How far after a stream's data its `endobj` is looked for, to say where the object ends.
+const OBJECT_END_SEARCH: usize = 256;
 
 fn read_error(what: impl std::fmt::Display) -> Fail {
     Fail::Read(what.to_string())
@@ -576,6 +584,13 @@ impl<'d, 'b> Reader<'d, 'b> {
         }
         let header = lx.object().map_err(|_| misplaced())?;
         let is_stream = matches!(header, Object::Dict(_)) && lx.eat_keyword(b"stream");
+        // Where the data starts, as `pdfcraft_cos` takes it: after the end of line that follows
+        // `stream` (CRLF, LF or a lone CR).
+        let data_start = match (self.data.get(lx.pos), self.data.get(lx.pos.saturating_add(1))) {
+            (Some(b'\r'), Some(b'\n')) => lx.pos.saturating_add(2),
+            (Some(b'\n' | b'\r'), _) => lx.pos.saturating_add(1),
+            _ => lx.pos,
+        };
         let loaded = self.doc.try_get(r.num).map_err(|error| read_error(format!("object {r} cannot be read: {error}")))?;
         match (&header, &*loaded) {
             (Object::Dict(declared), Object::Stream(stream)) if is_stream => {
@@ -588,7 +603,13 @@ impl<'d, 'b> Reader<'d, 'b> {
                     |d: &Dict| d.iter().filter(|(key, _)| key.as_slice() != b"Length").map(|(k, v)| (k.clone(), v.clone())).collect::<Dict>();
                 if length != i64::try_from(stream.raw.len()).ok() {
                     // `pdfcraft_cos` ended the data at `endstream`: a fact only where hayro read
-                    // the same data (checked once hayro has read the file).
+                    // the same data (checked once hayro has read the file), and only for an
+                    // object of the base revision. Other readers end such data elsewhere (at
+                    // the first `endobj`, say), and the editor's writer always writes the exact
+                    // length: an object the edited file brings must declare its length (R6b-30).
+                    if !self.of_the_base(data_start.saturating_add(stream.raw.len())) {
+                        return Err(read_error(format!("stream {r} does not have the length it declares, and is not the base's own object")));
+                    }
                     self.misdeclared.insert(r);
                 }
                 // `pdfcraft_cos` applies an indirect /Filter or /DecodeParms as written directly:
@@ -613,6 +634,15 @@ impl<'d, 'b> Reader<'d, 'b> {
             (header, loaded) if !is_stream && header == loaded => Ok(()),
             _ => Err(misplaced()),
         }
+    }
+
+    /// Whether the stream object whose data ends at `data_end` lies wholly within the bytes this
+    /// file keeps of the base (see `kept_until`), through its `endobj`. An object whose end is
+    /// not found nearby is not.
+    fn of_the_base(&self, data_end: usize) -> bool {
+        let window = self.data.get(data_end..data_end.saturating_add(OBJECT_END_SEARCH).min(self.data.len())).unwrap_or_default();
+        let Some(at) = window.windows(6).position(|w| w == b"endobj") else { return false };
+        data_end.saturating_add(at).saturating_add(6) <= self.kept_until
     }
 
     /// The object numbers an object stream holds, in order (decoded strictly).
@@ -1785,6 +1815,8 @@ pub(crate) struct Known {
     hayro_decoded: Arc<HashMap<ObjRef, Digest>>,
     /// Streams whose `/Length` is not their data's (see `Reader::misdeclared`).
     misdeclared: BTreeSet<ObjRef>,
+    /// See `Reader::kept_until`.
+    kept_until: usize,
     /// Streams whose data hayro read as the same bytes.
     agreed: BTreeSet<ObjRef>,
 }
@@ -1967,6 +1999,7 @@ impl Known {
             hayro_decoded: self.hayro_decoded.clone(),
             decoded: std::mem::take(&mut self.decoded),
             misdeclared: std::mem::take(&mut self.misdeclared),
+            kept_until: self.kept_until,
         }
     }
 
@@ -2100,6 +2133,7 @@ pub(crate) fn read(
     budget: &mut Budget,
     hayro_decoded: Arc<HashMap<ObjRef, Digest>>,
     sections: Vec<Section>,
+    kept_until: usize,
 ) -> Result<(Structure, Known), Fail> {
     let data = doc.bytes().as_slice();
     let mut reader = Reader {
@@ -2119,6 +2153,7 @@ pub(crate) fn read(
         hayro_decoded: hayro_decoded.clone(),
         decoded: HashMap::new(),
         misdeclared: BTreeSet::new(),
+        kept_until,
     };
     let Some(root) = doc.root() else { return Err(read_error("the trailer's /Root is not a reference")) };
     let catalog = reader.get(root)?.as_dict().cloned().ok_or_else(|| read_error("the catalog is not a dictionary"))?;
@@ -2154,6 +2189,7 @@ pub(crate) fn read(
         decoded: reader.decoded,
         hayro_decoded,
         misdeclared: reader.misdeclared,
+        kept_until,
         agreed: BTreeSet::new(),
     };
     Ok((Structure { pages, fields, form, catalog: entries, layers, outline, outline_root, sections }, known))
