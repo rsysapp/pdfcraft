@@ -870,7 +870,8 @@ fn outline_titles_entries_and_other_changes() {
     // The same destination written as a go-to action is the same destination.
     let as_action = entry("/A << /S /GoTo /D [4 0 R /XYZ 0 300 0] >>");
     assert_eq!(run(&base, &as_action).unwrap().outlines, OutlineChanges::default());
-    // What a named destination names is the catalog's /Dests or /Names, compared whole.
+    // What a named destination names is the catalog's /Dests or /Names /Dests, compared name
+    // by name: a name added is refused.
     for (case, catalog) in [
         ("/Dests", "<< /Type /Catalog /Pages 2 0 R /Outlines 3 0 R /PageMode /UseOutlines /Dests << /Parties [6 0 R /Fit] >> >>"),
         (
@@ -879,7 +880,8 @@ fn outline_titles_entries_and_other_changes() {
         ),
     ] {
         let named = update_objects(&base, &[(1, catalog.as_bytes().to_vec())], 14);
-        assert!(edited_error(run(&base, &named)).contains(case), "{case}");
+        let message = edited_error(run(&base, &named));
+        assert!(message.contains("named destination was added") || message.contains("/Names"), "{case}: {message}");
     }
     // The outline's root dictionary.
     let root = update_objects(

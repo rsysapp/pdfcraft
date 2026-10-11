@@ -25,7 +25,10 @@
 //!   every form): anything it leaves undrawn is an error;
 //! - the two read one document, checked: every object hayro reads (opening the file and drawing
 //!   each page) must be where `pdfcraft_cos`'s cross-reference data puts it and pass the same
-//!   checks, every stream's data must be the same bytes, each page must be the same object, and
+//!   checks, every object must parse to the same value in both (each dictionary entry and array
+//!   item: no value any fact rests on is read by one parser alone), every stream's data must be
+//!   the same bytes, each page must be the same object with the same inherited boxes and
+//!   rotation, and
 //!   its content as hayro decoded and joined it must be what `pdfcraft_cos` decoded; any
 //!   difference is an error; so is a content stream hayro interprets (a form, a pattern's cell, a
 //!   Type 3 glyph procedure) that it decoded to other data than `pdfcraft_cos` does; a stream
@@ -84,6 +87,7 @@ pub struct Inspection {
     pub text: TextChanges,
     pub content: ContentChanges,
     pub outlines: OutlineChanges,
+    pub destinations: DestinationChanges,
     /// Rewrites only (empty for appended updates): the applied redaction boxes that explain the
     /// changes, as (page number in the edited file, from 1; rectangle `[x0, y0, x1, y1]` in that
     /// page's user space, PDF points). Boxes that overlap (the line boxes of one mark) are one
@@ -224,6 +228,26 @@ pub struct OutlineChanges {
     pub added: u32,
     /// Base entries paired with no edited entry.
     pub removed: u32,
+}
+
+/// Named destinations and links' destinations that followed their page (R6b-32), as outline
+/// destinations do (see [`OutlineChanges::destinations_changed`]): the same page, at the same
+/// view, now at another page number (a page deleted or moved before it), or, where its page was
+/// deleted, going nowhere (no destination, or a page reference that names no page of the file)
+/// or, for a named destination, the name gone. A host may accept these as part of a page delete
+/// or move. Any other change of a destination fails the inspection: another page, another view,
+/// a destination gained, a named destination added, removed (its page still there) or retargeted.
+/// A name tree that viewers could resolve differently (keys out of order or named twice,
+/// `/Limits` that do not bound a node) fails it too.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DestinationChanges {
+    /// Named destinations (the catalog's `/Dests`, the `/Names /Dests` tree) whose destination
+    /// followed its page.
+    pub named: u32,
+    /// Link annotations, on pages present in both files, whose destination (`/Dest`, or a plain
+    /// go-to action) followed its page. Their annotation is otherwise unchanged: such a link is
+    /// not counted in `annotations.changed`.
+    pub links: u32,
 }
 
 /// Why a comparison has no answer. The host refuses the edited file on every one of them.
@@ -499,22 +523,28 @@ fn compare(base: &[u8], edited: &[u8], limits: Limits) -> Result<Inspection, Ins
         return Err(InspectError::Edited(format!("the document's /{key} changed, which this comparison does not report")));
     }
     let mut inspection = Inspection { base_kept, ..Inspection::default() };
-    let pairs =
-        match_pages(&before.structure.pages, &after.structure.pages, &mut inspection.pages, &mut budget).map_err(|fail| fail.of(Role::Edited))?;
+    let edited_fail = |fail: Fail| fail.of(Role::Edited);
+    // Outline entries pair by title, not by page: where their destinations went says, between
+    // changed pages equally alike, which went where.
+    let outline_pairs = outline::pair(&before.structure.outline, &after.structure.outline, &mut budget).map_err(edited_fail)?;
+    let votes = Votes::new(&before.structure, &after.structure, &outline_pairs);
+    let pairs = match_pages(&before.structure.pages, &after.structure.pages, &mut inspection.pages, &votes, &mut budget).map_err(edited_fail)?;
     // Destinations are judged through the pages' pairing: one may follow its page, nothing more.
     let followed: BTreeMap<usize, usize> = pairs.iter().copied().collect();
     if before.structure.outline_root != after.structure.outline_root {
         return Err(InspectError::Edited("the outline's root dictionary changed, which this comparison does not report".into()));
     }
     inspection.outlines =
-        outline::compare(&before.structure.outline, &after.structure.outline, &followed, &mut budget).map_err(|fail| fail.of(Role::Edited))?;
+        outline::compare(&before.structure.outline, &after.structure.outline, outline_pairs, &followed, &mut budget).map_err(edited_fail)?;
+    inspection.destinations.named =
+        outline::named(&before.structure.named_destinations, &after.structure.named_destinations, &followed, &mut budget).map_err(edited_fail)?;
     // The document's layer configuration decides what every page shows.
     let layers_changed = before.structure.layers != after.structure.layers;
     inspection.form_fields_changed = fields_changed(&before.structure, &after.structure);
     let mut rasters = Rasters::default();
     compare_pages(&before, &after, &pairs, base_kept, layers_changed, &mut budget, &mut rasters, &mut inspection)?;
     inspection.redaction_areas.sort_by(|(page_a, a), (page_b, b)| page_a.cmp(page_b).then(b[3].total_cmp(&a[3])).then(a[0].total_cmp(&b[0])));
-    inspection.annotations = compare_annotations(&before, &after, &pairs, base_kept, &mut budget, &mut rasters)?;
+    (inspection.annotations, inspection.destinations.links) = compare_annotations(&before, &after, &pairs, base_kept, &mut budget, &mut rasters)?;
     Ok(inspection)
 }
 
@@ -602,6 +632,14 @@ fn read_side(bytes: &[u8], against: Option<(&[u8], &Structure, bool)>, placement
             return Err(Fail::Read(format!("readers disagree on the annotations of page {number}")));
         }
         page.size = side.hayro.upright_size(index).ok_or_else(|| Fail::Read(format!("page {number} could not be read")))?;
+        // The page's boxes and rotation, inherited through the page tree, are what hayro took:
+        // hayro skips a value it cannot read and inherits another (or a default).
+        let (media, crop, rotation) = side.hayro.page_geometry(index).ok_or_else(|| Fail::Read(format!("page {number} could not be read")))?;
+        // hayro reads each number as a 32-bit float.
+        let same = |ours: &[f64; 4], theirs: &[f64; 4]| ours.iter().zip(theirs).all(|(a, b)| f64::from(*a as f32) == *b);
+        if !same(&page.boxes.0, &media) || !same(page.boxes.1.as_ref().unwrap_or(&page.boxes.0), &crop) || i64::from(rotation) != page.rotation {
+            return Err(Fail::Read(format!("readers disagree on the boxes or rotation page {number} inherits")));
+        }
         budget.content(page.interpreted)?;
         // The page hayro drew is this page, its decoded content this content, and every object
         // it read to draw it the object `pdfcraft_cos` reads.
@@ -643,6 +681,8 @@ fn read_side(bytes: &[u8], against: Option<(&[u8], &Structure, bool)>, placement
         return Err(Fail::Read(format!("readers disagree: hayro cannot read object {num} {generation} R")));
     }
     known.agree(&doc, budget, &resolved)?;
+    // And parses to the same value: every dictionary entry and array item any fact rests on.
+    known.agree_shapes(&doc, budget, &read, &side.hayro.object_shapes(&read))?;
     // Every content stream hayro decoded is one `pdfcraft_cos` decodes alike, and every stream
     // whose /Length is wrong one hayro read as the same data.
     known.agree_decoded(&doc, budget)?;
@@ -710,23 +750,147 @@ fn in_order(a: &[Digest], b: &[Digest]) -> Pairs {
     pairs
 }
 
-/// An edited page could be the base page after a redaction: same size, and every glyph it draws
-/// is a base glyph (same text, same place).
-fn could_be_redacted(base: &PageFacts, edited: &PageFacts, budget: &mut Budget) -> Result<bool, Fail> {
-    let same = |x: f32, y: f32| (x - y).abs() < 0.01;
-    if !(same(base.size.0, edited.size.0) && same(base.size.1, edited.size.1)) || edited.glyphs.len() > base.glyphs.len() {
-        return Ok(false);
+/// A page's content as a multiset of features, for pairing changed pages by similarity: each
+/// glyph by its name and the 4-point cell of its centre, each image by its digest and the 4-point
+/// cell of its placement's origin (where its placements are known, else by its digest alone).
+/// The cells are coarse on purpose: a rewrite that sets kept text a little off still leaves most
+/// glyphs in their cells. Only which pages pair rests on this; the comparison that follows is
+/// exact.
+fn features(page: &PageFacts, budget: &mut Budget) -> Result<HashMap<u64, u32>, Fail> {
+    use std::hash::{Hash, Hasher};
+    let cell = |value: f64| (value / 4.0).floor() as i64;
+    let mut out: HashMap<u64, u32> = HashMap::new();
+    let mut add = |key: u64| {
+        let slot = out.entry(key).or_default();
+        *slot = slot.saturating_add(1);
+    };
+    for index in 0..page.glyphs.len() {
+        budget.tick()?;
+        let Some((name, rect)) = page.glyphs.glyph(index) else { return Err(Fail::Read("a glyph went missing".into())) };
+        let mut hasher = std::hash::DefaultHasher::new();
+        b'g'.hash(&mut hasher);
+        match name {
+            structure::GlyphName::Text(chars) => chars.hash(&mut hasher),
+            structure::GlyphName::Font(font, id) => (font, id).hash(&mut hasher),
+        }
+        cell((f64::from(rect[0]) + f64::from(rect[2])) / 2.0).hash(&mut hasher);
+        cell((f64::from(rect[1]) + f64::from(rect[3])) / 2.0).hash(&mut hasher);
+        add(hasher.finish());
     }
-    Ok(glyphs::pair(&base.glyphs, &edited.glyphs, budget)?.added.is_empty())
+    if page.image_uses.is_empty() {
+        for digest in &page.images {
+            budget.tick()?;
+            let mut hasher = std::hash::DefaultHasher::new();
+            (b'i', digest).hash(&mut hasher);
+            add(hasher.finish());
+        }
+    } else {
+        for used in &page.image_uses {
+            budget.tick()?;
+            let mut hasher = std::hash::DefaultHasher::new();
+            (b'p', &used.digest, used.tiled).hash(&mut hasher);
+            if used.matrix[4].is_finite() && used.matrix[5].is_finite() {
+                (cell(used.matrix[4]), cell(used.matrix[5])).hash(&mut hasher);
+            }
+            add(hasher.finish());
+        }
+    }
+    Ok(out)
+}
+
+/// A feature shared by more of the changed base pages than this tells none of them apart (a
+/// running header): it does not count toward any page's similarity.
+const MAX_SHARED_FEATURE: usize = 64;
+
+/// The similarity of each changed base page to each changed edited page that shares content
+/// with it: (score, base page, edited page). The score is the features the two share, less the
+/// edited page's features the base page lacks (a redaction removes content and adds none).
+fn similarities(
+    before: &[PageFacts],
+    after: &[PageFacts],
+    base_free: &[usize],
+    edited_free: &[usize],
+    budget: &mut Budget,
+) -> Result<Vec<(i64, usize, usize)>, Fail> {
+    let mut index: HashMap<u64, Vec<(usize, u32)>> = HashMap::new();
+    for &page in base_free {
+        let Some(facts) = before.get(page) else { continue };
+        for (key, count) in features(facts, budget)? {
+            index.entry(key).or_default().push((page, count));
+        }
+    }
+    let mut out = Vec::new();
+    for &other in edited_free {
+        let Some(facts) = after.get(other) else { continue };
+        let found = features(facts, budget)?;
+        let total: i64 = found.values().map(|count| i64::from(*count)).sum();
+        let mut shared: BTreeMap<usize, i64> = BTreeMap::new();
+        for (key, count) in &found {
+            let Some(list) = index.get(key) else { continue };
+            if list.len() > MAX_SHARED_FEATURE {
+                continue;
+            }
+            for (page, base_count) in list {
+                budget.tick()?;
+                *shared.entry(*page).or_default() += i64::from((*count).min(*base_count));
+            }
+        }
+        for (page, common) in shared {
+            out.push((common.saturating_sub(total.saturating_sub(common)), page, other));
+        }
+    }
+    Ok(out)
+}
+
+/// What the documents' destinations say about where pages went: an outline entry (paired by its
+/// title) or a named destination (by its name) going to base page `b` and now to edited page `e`
+/// votes for that pair; one that went to `b` and now goes nowhere says `b` was deleted. Used
+/// only to choose between changed pages equally alike (see [`match_pages`]): the pages are then
+/// compared as paired, and every destination must have followed that pairing.
+#[derive(Default)]
+struct Votes {
+    pairs: HashMap<(usize, usize), u32>,
+    deleted: HashMap<usize, u32>,
+}
+
+impl Votes {
+    fn new(before: &Structure, after: &Structure, outline_pairs: &[(usize, usize)]) -> Self {
+        let mut votes = Self::default();
+        for &(old, new) in outline_pairs {
+            if let (Some(a), Some(b)) = (before.outline.get(old), after.outline.get(new)) {
+                votes.vote(&a.destination, b.destination.clone());
+            }
+        }
+        for (name, destination) in &before.named_destinations {
+            votes.vote(destination, after.named_destinations.get(name).cloned().unwrap_or(structure::Destination::None));
+        }
+        votes
+    }
+
+    fn vote(&mut self, before: &structure::Destination, after: structure::Destination) {
+        use structure::Destination;
+        let Destination::Page(page, _) = before else { return };
+        let slot = match after {
+            Destination::Page(other, _) => self.pairs.entry((*page, other)).or_default(),
+            Destination::None | Destination::Unpaged(_) => self.deleted.entry(*page).or_default(),
+            _ => return,
+        };
+        *slot = slot.saturating_add(1);
+    }
 }
 
 /// Pair the pages: identical pages in order, then identical pages elsewhere (moved), then the
-/// rest — pages that could be a redaction of the base page first, then by position. What is
-/// left was inserted or deleted.
-fn match_pages(before: &[PageFacts], after: &[PageFacts], changes: &mut PageChanges, budget: &mut Budget) -> Result<Pairs, Fail> {
+/// changed pages by content similarity (R6b-31: the glyphs and images they share, at their
+/// places; see [`similarities`]), the most similar first; position decides only between equally
+/// similar pages (and pairs pages that share nothing): a page between the same two pages paired
+/// in order first, then the nearest. Before position, between equally similar pages and for
+/// pages that share nothing, what the destinations say ([`Votes`]). What is left was inserted
+/// or deleted.
+fn match_pages(before: &[PageFacts], after: &[PageFacts], changes: &mut PageChanges, votes: &Votes, budget: &mut Budget) -> Result<Pairs, Fail> {
     let base_prints: Vec<Digest> = before.iter().map(|page| page.fingerprint).collect();
     let edited_prints: Vec<Digest> = after.iter().map(|page| page.fingerprint).collect();
-    let mut pairs = in_order(&base_prints, &edited_prints);
+    let anchors = in_order(&base_prints, &edited_prints);
+    let mut pairs = anchors.clone();
     let used_base: BTreeSet<usize> = pairs.iter().map(|pair| pair.0).collect();
     let used_edited: BTreeSet<usize> = pairs.iter().map(|pair| pair.1).collect();
     let mut base_free: Vec<usize> = (0..before.len()).filter(|page| !used_base.contains(page)).collect();
@@ -738,39 +902,57 @@ fn match_pages(before: &[PageFacts], after: &[PageFacts], changes: &mut PageChan
         moved = moved.saturating_add(1);
         false
     });
-    // Changed pages, in order: a page that could be a redaction of the base page first.
-    let mut last = None::<usize>;
-    let mut unpaired = Vec::new();
-    for page in base_free {
-        let mut found = None;
-        for (position, &other) in edited_free.iter().enumerate() {
-            if last.is_some_and(|last| other <= last) {
-                continue;
-            }
-            let (Some(b), Some(e)) = (before.get(page), after.get(other)) else { continue };
-            if could_be_redacted(b, e, budget)? {
-                found = Some(position);
-                break;
-            }
+    // Which gap between pages paired in order a page lies in.
+    let slot_of_base = |page: usize| anchors.partition_point(|anchor| anchor.0 < page);
+    let slot_of_edited = |page: usize| anchors.partition_point(|anchor| anchor.1 < page);
+    let said = |page: usize, other: usize| {
+        (std::cmp::Reverse(votes.pairs.get(&(page, other)).copied().unwrap_or(0)), votes.deleted.get(&page).copied().unwrap_or(0))
+    };
+    let apart = |page: usize, other: usize| (said(page, other), slot_of_base(page).abs_diff(slot_of_edited(other)), page.abs_diff(other));
+    let mut candidates = similarities(before, after, &base_free, &edited_free, budget)?;
+    candidates.sort_by(|a, b| b.0.cmp(&a.0).then(apart(a.1, a.2).cmp(&apart(b.1, b.2))).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    let mut base_taken: BTreeSet<usize> = BTreeSet::new();
+    let mut edited_taken: BTreeSet<usize> = BTreeSet::new();
+    for (_, page, other) in candidates {
+        budget.tick()?;
+        if base_taken.contains(&page) || edited_taken.contains(&other) {
+            continue;
         }
-        match found {
-            Some(position) => {
-                let other = edited_free.remove(position);
-                last = Some(other);
-                pairs.push((page, other));
-            }
-            None => unpaired.push(page),
+        base_taken.insert(page);
+        edited_taken.insert(other);
+        pairs.push((page, other));
+    }
+    base_free.retain(|page| !base_taken.contains(page));
+    edited_free.retain(|page| !edited_taken.contains(page));
+    // Pages that share nothing with any other: as the destinations went, then in order within
+    // the same gap (pages a destination says were deleted last), then in order.
+    let mut positional = Vec::new();
+    let mut voted: Vec<(&(usize, usize), &u32)> = votes.pairs.iter().collect();
+    voted.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    for (&(page, other), _) in voted {
+        if base_free.contains(&page) && edited_free.contains(&other) {
+            positional.push((page, other));
+            base_free.retain(|free| *free != page);
+            edited_free.retain(|free| *free != other);
         }
     }
-    let base_free = unpaired;
-    let positional: Vec<(usize, usize)> = base_free.iter().copied().zip(edited_free.iter().copied()).collect();
+    base_free.sort_by_key(|page| (votes.deleted.get(page).copied().unwrap_or(0), *page));
+    for &page in &base_free {
+        if let Some(position) = edited_free.iter().position(|&other| slot_of_edited(other) == slot_of_base(page)) {
+            positional.push((page, edited_free.remove(position)));
+        }
+    }
+    base_free.retain(|page| !positional.iter().any(|pair| pair.0 == *page));
+    base_free.sort_unstable();
+    let rest = base_free.len().min(edited_free.len());
+    positional.extend(base_free.drain(..rest).zip(edited_free.drain(..rest)));
     pairs.extend(positional.iter().copied());
     *changes = PageChanges {
         before: count(before.len()),
         after: count(after.len()),
         rotated: count(pairs.iter().filter(|(old, new)| before.get(*old).map(|p| p.rotation) != after.get(*new).map(|p| p.rotation)).count()),
-        inserted: count(edited_free.len().saturating_sub(positional.len())),
-        deleted: count(base_free.len().saturating_sub(positional.len())),
+        inserted: count(edited_free.len()),
+        deleted: count(base_free.len()),
         moved: count(moved),
     };
     pairs.sort_unstable();
@@ -904,8 +1086,8 @@ fn compare_pages(
                 // Which layers show by default changed: not a redaction, whatever the boxes.
                 || layers_changed
                 // Changed, and drawn with something other viewers may show otherwise than
-                // hayro's pixels.
-                || (drawn_differently && e.render_risk.is_some());
+                // hayro's pixels, on either side (R6b-32).
+                || (drawn_differently && (b.render_risk.is_some() || e.render_risk.is_some()));
             if outside {
                 counts.outside_redactions += 1;
             } else {
@@ -1075,6 +1257,7 @@ impl AnnotationContext<'_> {
     }
 }
 
+/// The annotations compared, and how many links' destinations followed their page.
 fn compare_annotations(
     before: &Side,
     after: &Side,
@@ -1082,10 +1265,18 @@ fn compare_annotations(
     base_kept: bool,
     budget: &mut Budget,
     rasters: &mut Rasters,
-) -> Result<AnnotationChanges, InspectError> {
+) -> Result<(AnnotationChanges, u32), InspectError> {
     let context = AnnotationContext { before, after, base_kept };
     let mut changes = AnnotationChanges::default();
+    let mut links = 0u32;
     let to_edited: HashMap<usize, usize> = pairs.iter().copied().collect();
+    let pages: BTreeMap<usize, usize> = pairs.iter().copied().collect();
+    // A link's destination may change only by following its page (R6b-32).
+    let link_moved = |a: &Annot, b: &Annot| -> Result<bool, InspectError> {
+        let none = structure::Destination::None;
+        outline::followed(a.link.as_ref().unwrap_or(&none), b.link.as_ref().unwrap_or(&none), &pages)
+            .map_err(|_| InspectError::Edited("a link's destination changed other than by following its page".into()))
+    };
     // Appended updates keep object numbers: their annotations are matched by identity.
     let mut edited_by_id: BTreeMap<ObjRef, (usize, &Annot)> = BTreeMap::new();
     // Per edited page, the annotations matched by content instead: all of them in a rewrite
@@ -1111,20 +1302,42 @@ fn compare_annotations(
                 match edited_by_id.get(&id) {
                     Some((index, other)) => {
                         seen.insert(id);
+                        let moved = link_moved(annot, other)?;
                         if other.digest != annot.digest || Some(*index) != new {
                             changes.changed = changes.changed.saturating_add(1);
+                        } else {
+                            links = links.saturating_add(u32::from(moved));
                         }
                     }
                     None => context.gone(annot, pair, budget, rasters, &mut changes)?,
                 }
                 continue;
             }
-            let found = new.and_then(|new| {
-                let list = by_content.get_mut(&new)?;
-                let position = list.iter().position(|other| other.digest == annot.digest)?;
-                Some(list.remove(position))
-            });
+            // The same dictionary, its destination (a link's) followed.
+            let mut found = None;
+            let mut retargeted = false;
+            if let Some(list) = new.and_then(|new| by_content.get_mut(&new)) {
+                for (position, other) in list.iter().enumerate() {
+                    if other.digest != annot.digest {
+                        continue;
+                    }
+                    match link_moved(annot, other) {
+                        Ok(moved) => {
+                            found = Some((position, moved));
+                            break;
+                        }
+                        Err(_) => retargeted = true,
+                    }
+                }
+                if let Some((position, moved)) = found {
+                    list.remove(position);
+                    links = links.saturating_add(u32::from(moved));
+                }
+            }
             if found.is_none() {
+                if retargeted {
+                    return Err(InspectError::Edited("a link's destination changed other than by following its page".into()));
+                }
                 context.gone(annot, pair, budget, rasters, &mut changes)?;
             }
         }
@@ -1137,7 +1350,7 @@ fn compare_annotations(
     for annot in by_content.values().flatten() {
         add_kind(&mut changes, &annot.subtype);
     }
-    Ok(changes)
+    Ok((changes, links))
 }
 
 #[cfg(test)]
@@ -1146,6 +1359,8 @@ mod agreement_tests;
 mod conformance_tests;
 #[cfg(test)]
 mod corpus_tests;
+#[cfg(test)]
+mod destination_tests;
 #[cfg(test)]
 mod limit_tests;
 #[cfg(test)]

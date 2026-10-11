@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use super::structure::{Destination, OutlineEntry};
+use super::structure::{Destination, NamedKey, OutlineEntry};
 use super::{Budget, Fail, OutlineChanges, count};
 
 /// The most cells of the pairing table for the entries between the common start and end: two
@@ -13,17 +13,9 @@ use super::{Budget, Fail, OutlineChanges, count};
 /// deletes and moves) leave no entries between them.
 const MAX_CELLS: usize = 1 << 22;
 
-/// Pair `before` with `after` and count what changed. `pages`: each base page present in the
-/// edited file, and its index there (a base page missing was deleted). Fails on what no fact
-/// reports: paired entries that differ in anything but their title, or whose destination changed
-/// other than by following its page (see [`followed`]); added entries with an action other than
-/// going to a destination, or going outside the file's pages.
-pub(crate) fn compare(
-    before: &[OutlineEntry],
-    after: &[OutlineEntry],
-    pages: &BTreeMap<usize, usize>,
-    budget: &mut Budget,
-) -> Result<OutlineChanges, Fail> {
+/// Pair the entries of `before` with those of `after`, as (index in `before`, index in `after`),
+/// in order (see the module documentation). Only titles and depths decide.
+pub(crate) fn pair(before: &[OutlineEntry], after: &[OutlineEntry], budget: &mut Budget) -> Result<Vec<(usize, usize)>, Fail> {
     let key = |entry: &OutlineEntry| (entry.depth, entry.title.clone());
     let prefix = before.iter().zip(after).take_while(|(a, b)| key(a) == key(b)).count();
     let (rest_before, rest_after) = (before.get(prefix..).unwrap_or_default(), after.get(prefix..).unwrap_or_default());
@@ -54,6 +46,22 @@ pub(crate) fn compare(
     }
     let (start_before, start_after) = (before.len().saturating_sub(suffix), after.len().saturating_sub(suffix));
     pairs.extend((0..suffix).map(|index| (start_before.saturating_add(index), start_after.saturating_add(index))));
+    Ok(pairs)
+}
+
+/// Count what changed between `before` and `after`, their entries paired as [`pair`] pairs
+/// them. `pages`: each base page present in the edited file, and its index there (a base page
+/// missing was deleted). Fails on what no fact reports: paired entries that differ in anything
+/// but their title, or whose destination changed other than by following its page (see
+/// [`followed`]); added entries with an action other than going to a destination, or going
+/// outside the file's pages.
+pub(crate) fn compare(
+    before: &[OutlineEntry],
+    after: &[OutlineEntry],
+    pairs: Vec<(usize, usize)>,
+    pages: &BTreeMap<usize, usize>,
+    budget: &mut Budget,
+) -> Result<OutlineChanges, Fail> {
     let mut changes = OutlineChanges::default();
     let mut paired_before = vec![false; before.len()];
     let mut paired_after = vec![false; after.len()];
@@ -64,7 +72,9 @@ pub(crate) fn compare(
             return Err(Fail::Read("an outline entry changed other than in its title or destination (its style, colour or action)".into()));
         }
         changes.titles_changed = changes.titles_changed.saturating_add(u32::from(a.title != b.title));
-        changes.destinations_changed = changes.destinations_changed.saturating_add(u32::from(followed(&a.destination, &b.destination, pages)?));
+        let moved = followed(&a.destination, &b.destination, pages)
+            .map_err(|_| Fail::Read("an outline entry's destination changed other than by following its page".into()))?;
+        changes.destinations_changed = changes.destinations_changed.saturating_add(u32::from(moved));
         if let Some(slot) = paired_before.get_mut(i) {
             *slot = true;
         }
@@ -77,7 +87,7 @@ pub(crate) fn compare(
         if !paired && entry.acts {
             return Err(Fail::Read("an added outline entry has an action other than going to a destination".into()));
         }
-        if !paired && matches!(entry.destination, Destination::Other(_)) {
+        if !paired && matches!(entry.destination, Destination::Other(_) | Destination::Unpaged(_)) {
             return Err(Fail::Read("an added outline entry goes somewhere other than one of the file's pages".into()));
         }
     }
@@ -85,19 +95,50 @@ pub(crate) fn compare(
     Ok(changes)
 }
 
-/// Whether a paired entry's destination `after` followed its page from `before` (`true`: its
-/// page number changed, or its page was deleted and it has none), stayed as it was (`false`), or
-/// changed otherwise (an error: another page, another view, a destination gained, a named or
-/// external destination changed).
-fn followed(before: &Destination, after: &Destination, pages: &BTreeMap<usize, usize>) -> Result<bool, Fail> {
+/// Whether a destination `after` followed its page from `before` (`true`: its page number
+/// changed, or its page was deleted and it goes nowhere now: it has none, or its page reference
+/// names no page of the file), stayed as it was (`false`), or changed otherwise (an error:
+/// another page, another view, a destination gained, a named or external destination changed).
+/// Outline entries, named destinations and links' destinations all follow this rule.
+pub(crate) fn followed(before: &Destination, after: &Destination, pages: &BTreeMap<usize, usize>) -> Result<bool, Fail> {
     match (before, after) {
         (Destination::Page(page, view), Destination::Page(now, same)) if pages.get(page) == Some(now) && view == same => Ok(page != now),
         (Destination::Page(page, _), Destination::None) if !pages.contains_key(page) => Ok(true),
+        (Destination::Page(page, view), Destination::Unpaged(same)) if !pages.contains_key(page) && view == same => Ok(true),
         (Destination::None, Destination::None) => Ok(false),
+        (Destination::Unpaged(view), Destination::Unpaged(same)) if view == same => Ok(false),
         (Destination::Named(name), Destination::Named(same)) if name == same => Ok(false),
         (Destination::Other(other), Destination::Other(same)) if other == same => Ok(false),
-        _ => Err(Fail::Read("an outline entry's destination changed other than by following its page".into())),
+        _ => Err(Fail::Read("a destination changed other than by following its page".into())),
     }
+}
+
+/// How many named destinations followed their page (see `DestinationChanges::named`); fails on
+/// any other change: a name added, a name gone whose page is still there, a destination changed
+/// other than by following its page.
+pub(crate) fn named(
+    before: &BTreeMap<NamedKey, Destination>,
+    after: &BTreeMap<NamedKey, Destination>,
+    pages: &BTreeMap<usize, usize>,
+    budget: &mut Budget,
+) -> Result<u32, Fail> {
+    let mut changed = 0u32;
+    for (name, destination) in before {
+        budget.tick()?;
+        let moved = match after.get(name) {
+            Some(now) => {
+                followed(destination, now, pages).map_err(|_| Fail::Read("a named destination changed other than by following its page".into()))?
+            }
+            // An editor may drop the name of a page it deleted.
+            None if matches!(destination, Destination::Page(page, _) if !pages.contains_key(page)) => true,
+            None => return Err(Fail::Read("a named destination was removed, though its page is still there".into())),
+        };
+        changed = changed.saturating_add(u32::from(moved));
+    }
+    if after.keys().any(|name| !before.contains_key(name)) {
+        return Err(Fail::Read("a named destination was added".into()));
+    }
+    Ok(changed)
 }
 
 type Key = (usize, Option<Vec<u8>>);
@@ -156,7 +197,9 @@ mod tests {
     }
 
     fn run_with(before: &[OutlineEntry], after: &[OutlineEntry], pages: &[(usize, usize)]) -> Result<OutlineChanges, Fail> {
-        compare(before, after, &pages.iter().copied().collect(), &mut Budget::new(Limits::default()))
+        let mut budget = Budget::new(Limits::default());
+        let pairs = pair(before, after, &mut budget)?;
+        compare(before, after, pairs, &pages.iter().copied().collect(), &mut budget)
     }
 
     #[test]

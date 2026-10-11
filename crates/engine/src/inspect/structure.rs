@@ -39,13 +39,16 @@ const PAGE_OWN_KEYS: [&[u8]; 7] = [b"Parent", b"Annots", b"Rotate", b"Contents",
 
 /// Catalog entries the document-level check leaves out; a change to any other entry (actions,
 /// names, page labels, permissions, …) fails the inspection, since no fact reports it.
-/// - `/Pages`, `/AcroForm`, `/OCProperties`, `/Outlines`: compared on their own (pages, form
-///   fields, the layers, which count every page as changed, and the outline entry by entry);
+/// - `/Pages`, `/AcroForm`, `/OCProperties`, `/Outlines`, `/Dests`: compared on their own (pages,
+///   form fields, the layers, which count every page as changed, the outline entry by entry, and
+///   named destinations name by name; `/Names` is compared whole but for its `/Dests` tree, which
+///   is compared name by name too);
 /// - `/Metadata` (the XMP packet), `/StructTreeRoot` and `/MarkInfo` (tags), `/Version` (the PDF
 ///   version): nothing a viewer draws, and editors update them on ordinary saves (a redaction
 ///   cleans tags; a save may restamp metadata). Left out deliberately, so a changed `/Metadata`
 ///   can carry different document information with no trace in the result.
-const CATALOG_REPORTED: [&[u8]; 8] = [b"Pages", b"AcroForm", b"OCProperties", b"Outlines", b"Metadata", b"StructTreeRoot", b"MarkInfo", b"Version"];
+const CATALOG_REPORTED: [&[u8]; 9] =
+    [b"Pages", b"AcroForm", b"OCProperties", b"Outlines", b"Dests", b"Metadata", b"StructTreeRoot", b"MarkInfo", b"Version"];
 
 /// Stream-dictionary entries that say how the data is encoded, not what it is.
 const CODING_KEYS: [&[u8]; 4] = [b"Filter", b"DecodeParms", b"Length", b"DL"];
@@ -80,12 +83,19 @@ pub(crate) struct Annot {
     pub bare: Digest,
     /// `/Rect`, normalised (`None`: missing or not four finite numbers).
     pub rect: Option<[f64; 4]>,
+    /// For a link going to a destination in this file (its `/Dest`, or a plain go-to `/A`):
+    /// that destination. It is left out of `digest` and `bare`, and compared on its own: it may
+    /// change only by following its page (R6b-32).
+    pub link: Option<Destination>,
 }
 
 /// What one page is, as far as the comparison goes.
 pub(crate) struct PageFacts {
     /// `/Rotate` (inherited), 0, 90, 180 or 270.
     pub rotation: i64,
+    /// `/MediaBox` and `/CropBox` (inherited; the crop box `None` when there is none), each four
+    /// numbers, normalised: hayro must have inherited the same (see `inspect::read_side`).
+    pub boxes: ([f64; 4], Option<[f64; 4]>),
     /// The page dictionary's object.
     pub object: ObjRef,
     /// The decoded content streams, in order.
@@ -199,13 +209,30 @@ pub(crate) enum Destination {
     /// An explicit destination to one of this file's pages: the page's index and the view (the
     /// rest of the array: the fit, position and zoom).
     Page(usize, Digest),
+    /// An explicit destination whose page reference names no page of this file (a page deleted
+    /// and freed, or an object outside the page tree): it goes nowhere. The view, as for `Page`.
+    Unpaged(Digest),
     /// A named destination (a name or a string), by its digest: what it names is the catalog's
-    /// `/Dests` or `/Names`, compared whole.
+    /// `/Dests` or the `/Names /Dests` tree, compared name by name (see
+    /// [`Structure::named_destinations`]).
     Named(Digest),
     /// Anything else (an array whose first entry is not one of this file's pages, a page given
     /// by number, …), by its digest.
     Other(Digest),
 }
+
+/// A named destination's name: where it is defined (the catalog's `/Dests` dictionary, or the
+/// `/Names /Dests` tree) and the name's bytes.
+pub(crate) type NamedKey = (NameSource, Vec<u8>);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum NameSource {
+    Dests,
+    Names,
+}
+
+/// The most nodes and entries a name tree may have.
+const MAX_NAME_TREE_ENTRIES: usize = 100_000;
 
 /// One use of an image on a page, as hayro's interpreter drew it.
 #[derive(Clone, Debug)]
@@ -278,6 +305,10 @@ pub(crate) struct Structure {
     /// The outline's root dictionary but for `/Type`, its links to the entries and `/Count` (an
     /// empty dictionary's digest when there is no outline).
     pub outline_root: Digest,
+    /// Named destinations: the catalog's `/Dests` dictionary (by name) and the `/Names /Dests`
+    /// name tree (by string), each name's destination (a dictionary value's `/D`; one with other
+    /// entries as a whole, as `Other`).
+    pub named_destinations: BTreeMap<NamedKey, Destination>,
     /// Cross-reference sections, oldest first.
     pub sections: Vec<Section>,
 }
@@ -1468,7 +1499,13 @@ impl<'d, 'b> Reader<'d, 'b> {
 
     // ── pages ───────────────────────────────────────────────────────────────────────────────
 
-    fn page(&mut self, node: &PageNode, widgets: &BTreeSet<ObjRef>, annotation_ids: &mut BTreeSet<ObjRef>) -> Result<PageFacts, Fail> {
+    fn page(
+        &mut self,
+        node: &PageNode,
+        widgets: &BTreeSet<ObjRef>,
+        annotation_ids: &mut BTreeSet<ObjRef>,
+        pages: &HashMap<ObjRef, usize>,
+    ) -> Result<PageFacts, Fail> {
         let rotation = match self.int_of(node.rotate.as_ref())? {
             None if node.rotate.is_some() => return Err(read_error(format!("page {} has a /Rotate that is not a whole number", node.obj))),
             value => value.unwrap_or(0).rem_euclid(360),
@@ -1476,6 +1513,12 @@ impl<'d, 'b> Reader<'d, 'b> {
         if rotation % 90 != 0 {
             return Err(read_error(format!("page {} is rotated by {rotation}°, not a multiple of 90°", node.obj)));
         }
+        let what = node.obj;
+        let media = self.page_box(node.media.as_ref())?.ok_or_else(|| read_error(format!("page {what} has no /MediaBox of four numbers")))?;
+        let crop = match &node.crop {
+            Some(crop) => Some(self.page_box(Some(crop))?.ok_or_else(|| read_error(format!("page {what} has a /CropBox that is not four numbers")))?),
+            None => None,
+        };
         // Every other entry, and the boxes as inherited.
         let mut other: Dict =
             node.dict.iter().filter(|(key, _)| !PAGE_OWN_KEYS.contains(&key.as_slice())).map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -1504,9 +1547,10 @@ impl<'d, 'b> Reader<'d, 'b> {
         self.type3_fonts(&chain, &resources, &mut drawn)?;
         self.draw(&scan.items, &chain, Context { depth: 0, patterned: false, masked: false, chain: resources }, &mut drawn)?;
         drawn.images.sort_unstable();
-        let (annots, annots_in_array) = self.annotations(node, widgets, annotation_ids)?;
+        let (annots, annots_in_array) = self.annotations(node, widgets, annotation_ids, pages)?;
         Ok(PageFacts {
             rotation,
+            boxes: (media, crop),
             object: node.obj,
             content: scan.digest,
             resources,
@@ -1528,7 +1572,27 @@ impl<'d, 'b> Reader<'d, 'b> {
         })
     }
 
-    fn annotations(&mut self, node: &PageNode, widgets: &BTreeSet<ObjRef>, ids: &mut BTreeSet<ObjRef>) -> Result<(Vec<Annot>, usize), Fail> {
+    /// A page box: four numbers written in the array (not references, which a reader may or may
+    /// not follow), normalised. `None` when absent or null, or when it is anything else: hayro
+    /// skips such a value and takes the inherited one, so it is refused.
+    fn page_box(&mut self, o: Option<&Object>) -> Result<Option<[f64; 4]>, Fail> {
+        let Some(o) = o else { return Ok(None) };
+        let Object::Array(items) = &*self.resolve(o)? else { return Ok(None) };
+        let numbers: Option<Vec<f64>> =
+            items.iter().map(|item| matches!(item, Object::Int(_) | Object::Real(_)).then(|| item.as_f64()).flatten()).collect();
+        Ok(match numbers.as_deref() {
+            Some(&[x0, y0, x1, y1]) if [x0, y0, x1, y1].iter().all(|v| v.is_finite()) => Some([x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)]),
+            _ => None,
+        })
+    }
+
+    fn annotations(
+        &mut self,
+        node: &PageNode,
+        widgets: &BTreeSet<ObjRef>,
+        ids: &mut BTreeSet<ObjRef>,
+        pages: &HashMap<ObjRef, usize>,
+    ) -> Result<(Vec<Annot>, usize), Fail> {
         let entries = self.array_of(node.dict.get(b"Annots"), "/Annots")?;
         let mut annots = Vec::new();
         let mut in_array = 0usize;
@@ -1547,23 +1611,59 @@ impl<'d, 'b> Reader<'d, 'b> {
             {
                 return Err(read_error(format!("annotation {id} is listed more than once")));
             }
-            let digest = match id {
-                Some(r) => self.digest_ref(r)?.0,
-                None => self.digest(&Object::Dict(dict.clone()))?,
+            let subtype = dict.name(b"Subtype").unwrap_or_default().to_vec();
+            // A link's destination in this file names a page object, whose digest would change
+            // with the page (rotated, annotated, renumbered): it is compared on its own.
+            let found = if subtype == b"Link" { self.link_destination(&dict, pages)? } else { None };
+            let (link, dest_key) = match found {
+                Some((destination, key)) => (Some(destination), Some(key)),
+                None => (None, None),
             };
-            let bare = self.digest_without(&dict, &[b"AP"])?;
+            let digest = match (id, dest_key) {
+                // A link, with or without a destination, alike (an editor drops the destination
+                // of a link whose page it deleted).
+                _ if subtype == b"Link" => sha256(&[b"link", &self.digest_without(&dict, dest_key.as_slice())?]),
+                (Some(r), _) => self.digest_ref(r)?.0,
+                (None, _) => self.digest(&Object::Dict(dict.clone()))?,
+            };
+            let bare = match dest_key {
+                Some(key) => self.digest_without(&dict, &[b"AP", key])?,
+                None => self.digest_without(&dict, &[b"AP"])?,
+            };
             let rect = self.array_of(dict.get(b"Rect"), "/Rect")?;
             let rect = match rect.iter().map(Object::as_f64).collect::<Option<Vec<f64>>>().as_deref() {
                 Some(&[x0, y0, x1, y1]) if [x0, y0, x1, y1].iter().all(|v| v.is_finite()) => Some([x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)]),
                 _ => None,
             };
-            let subtype = dict.name(b"Subtype").unwrap_or_default().to_vec();
             let widget = subtype == b"Widget" && id.is_some_and(|id| widgets.contains(&id));
             let silent_popup = subtype == b"Popup" && !dict.contains(b"AP");
             let areas = if subtype == b"Redact" { self.marked_areas(&dict)? } else { Vec::new() };
-            annots.push(Annot { id, subtype, digest, tracked: !widget && !silent_popup, areas, bare, rect });
+            annots.push(Annot { id, subtype, digest, tracked: !widget && !silent_popup, areas, bare, rect, link });
         }
         Ok((annots, in_array))
+    }
+
+    /// An annotation's destination in this file and the entry that gives it: `/Dest`, or `/A`
+    /// when it is a plain go-to action (only `/Type`, `/S /GoTo` and `/D`), as for an outline
+    /// entry. `None` when it has neither (any other action stays part of its digest).
+    fn link_destination(&mut self, dict: &Dict, pages: &HashMap<ObjRef, usize>) -> Result<Option<(Destination, &'static [u8])>, Fail> {
+        if let Some(dest) = dict.get(b"Dest") {
+            if dict.contains(b"A") {
+                return Ok(None);
+            }
+            return Ok(Some((self.destination(dest, pages)?, b"Dest")));
+        }
+        let Some(action) = dict.get(b"A") else { return Ok(None) };
+        let goto = match &*self.resolve(action)? {
+            Object::Dict(a) if a.name(b"S") == Some(b"GoTo") && a.iter().all(|(key, _)| matches!(key.as_slice(), b"Type" | b"S" | b"D")) => {
+                a.get(b"D").cloned()
+            }
+            _ => None,
+        };
+        match goto {
+            Some(dest) => Ok(Some((self.destination(&dest, pages)?, b"A"))),
+            None => Ok(None),
+        }
     }
 
     /// A redaction mark's areas: each quadrilateral's box, or the rectangle.
@@ -1735,15 +1835,122 @@ impl Reader<'_, '_> {
         Ok(OutlineEntry { depth, title, destination, rest, acts })
     }
 
+    /// The named destinations (see [`Structure::named_destinations`]). A name tree is read as
+    /// ISO 32000-2 §7.9.6 has it: hayro never reads it, and viewers search it each their own way
+    /// (by `/Limits`, in order, or all of it), so a tree they could resolve differently is
+    /// refused: keys out of order or named twice, `/Limits` that do not bound what a node holds,
+    /// a node with both `/Kids` and `/Names` or with neither, a key that is not a string.
+    fn named_destinations(&mut self, catalog: &Dict, pages: &HashMap<ObjRef, usize>) -> Result<BTreeMap<NamedKey, Destination>, Fail> {
+        let mut out = BTreeMap::new();
+        if let Some(dests) = self.dict_of(catalog.get(b"Dests"), "/Dests")? {
+            for (name, value) in dests.iter() {
+                self.budget.tick()?;
+                let destination = self.named_value(value, pages)?;
+                out.insert((NameSource::Dests, name.clone()), destination);
+            }
+        }
+        let names = self.dict_of(catalog.get(b"Names"), "/Names")?.unwrap_or_default();
+        if let Some(tree) = names.get(b"Dests") {
+            let mut entries = Vec::new();
+            self.name_node(tree, 0, true, &mut BTreeSet::new(), &mut entries)?;
+            if entries.windows(2).any(|pair| pair.first().map(|entry| &entry.0) >= pair.get(1).map(|entry| &entry.0)) {
+                return Err(read_error("the named destinations' tree has keys out of order or named twice"));
+            }
+            for (name, value) in entries {
+                self.budget.tick()?;
+                let destination = self.named_value(&value, pages)?;
+                out.insert((NameSource::Names, name), destination);
+            }
+        }
+        Ok(out)
+    }
+
+    /// One node of a name tree and everything under it, its entries appended to `out` in order.
+    fn name_node(
+        &mut self,
+        node: &Object,
+        depth: usize,
+        root: bool,
+        seen: &mut BTreeSet<ObjRef>,
+        out: &mut Vec<(Vec<u8>, Object)>,
+    ) -> Result<(), Fail> {
+        self.budget.tick()?;
+        if depth > MAX_TREE_DEPTH {
+            return Err(read_error("a name tree is too deep"));
+        }
+        if let Object::Ref(r) = node
+            && !seen.insert(*r)
+        {
+            return Err(read_error("a name tree loops"));
+        }
+        let Object::Dict(dict) = &*self.resolve(node)? else { return Err(read_error("a name tree node is not a dictionary")) };
+        let start = out.len();
+        match (dict.get(b"Kids"), dict.get(b"Names")) {
+            (Some(_), Some(_)) => return Err(read_error("a name tree node has both /Kids and /Names")),
+            (Some(kids), None) => {
+                for kid in self.array_of(Some(kids), "a name tree's /Kids")? {
+                    self.name_node(&kid, depth.saturating_add(1), false, seen, out)?;
+                }
+            }
+            (None, Some(names)) => {
+                let items = self.array_of(Some(names), "a name tree's /Names")?;
+                if items.len() % 2 != 0 {
+                    return Err(read_error("a name tree's /Names has a key without a value"));
+                }
+                for pair in items.chunks(2) {
+                    let (Some(key), Some(value)) = (pair.first(), pair.get(1)) else { continue };
+                    let Object::String(key) = &*self.resolve(key)? else { return Err(read_error("a name tree's key is not a string")) };
+                    if out.len() >= MAX_NAME_TREE_ENTRIES {
+                        return Err(Fail::TooComplex);
+                    }
+                    out.push((key.bytes.clone(), value.clone()));
+                }
+            }
+            (None, None) if root => {}
+            (None, None) => return Err(read_error("a name tree node has neither /Kids nor /Names")),
+        }
+        if let Some(limits) = dict.get(b"Limits") {
+            let limits = self.array_of(Some(limits), "a name tree's /Limits")?;
+            let mut bounds = Vec::with_capacity(2);
+            for limit in &limits {
+                match &*self.resolve(limit)? {
+                    Object::String(limit) => bounds.push(limit.bytes.clone()),
+                    _ => return Err(read_error("a name tree's /Limits are not strings")),
+                }
+            }
+            let held = out.get(start..).unwrap_or_default();
+            let (Some(first), Some(last)) = (held.first(), held.last()) else { return Err(read_error("a name tree's /Limits bound an empty node")) };
+            if bounds.as_slice() != [first.0.clone(), last.0.clone()] {
+                return Err(read_error("a name tree's /Limits do not bound what the node holds"));
+            }
+        }
+        Ok(())
+    }
+
+    /// A named destination's value: an explicit destination, or a dictionary whose `/D` is one
+    /// (a dictionary with other entries is compared whole).
+    fn named_value(&mut self, value: &Object, pages: &HashMap<ObjRef, usize>) -> Result<Destination, Fail> {
+        match &*self.resolve(value)? {
+            Object::Dict(dict) if dict.iter().all(|(key, _)| key.as_slice() == b"D") => match dict.get(b"D") {
+                Some(dest) => self.destination(dest, pages),
+                None => Ok(Destination::Other(self.digest(value)?)),
+            },
+            Object::Array(_) => self.destination(value, pages),
+            _ => Ok(Destination::Other(self.digest(value)?)),
+        }
+    }
+
     /// An explicit destination by its page's index and its view; anything else by its digest.
     fn destination(&mut self, dest: &Object, pages: &HashMap<ObjRef, usize>) -> Result<Destination, Fail> {
         let resolved = self.resolve(dest)?;
         if let Object::Array(items) = &*resolved
             && let Some(Object::Ref(page)) = items.first()
-            && let Some(index) = pages.get(page)
         {
             let view = self.digest(&Object::Array(items.iter().skip(1).cloned().collect()))?;
-            return Ok(Destination::Page(*index, view));
+            return Ok(match pages.get(page) {
+                Some(index) => Destination::Page(*index, view),
+                None => Destination::Unpaged(view),
+            });
         }
         Ok(match &*resolved {
             Object::Null => Destination::None,
@@ -1895,7 +2102,74 @@ impl Known {
     }
 }
 
+/// An object's canonical form as `pdfcraft_cos` parsed it, written as hayro's parse is written
+/// (`pdfcraft_render::content::object_shape`), so that the two can be compared.
+fn shape(object: &Object, depth: usize, out: &mut Vec<u8>) {
+    use pdfcraft_render::content::{SHAPE_DEPTH, SHAPE_LEFT_OUT, ShapeItem, object_shape};
+    if depth > SHAPE_DEPTH {
+        out.push(b'!');
+        return;
+    }
+    let dict = |dict: &Dict, left_out: &[&[u8]], out: &mut Vec<u8>| {
+        let mut entries: Vec<(&Vec<u8>, &Object)> = dict.iter().filter(|(key, _)| !left_out.contains(&key.as_slice())).collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        out.push(b'<');
+        out.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        for (key, value) in entries {
+            out.extend_from_slice(&(key.len() as u64).to_le_bytes());
+            out.extend_from_slice(key);
+            shape(value, depth.saturating_add(1), out);
+        }
+    };
+    match object {
+        Object::Null => object_shape(ShapeItem::Null, out),
+        Object::Bool(value) => object_shape(ShapeItem::Bool(*value), out),
+        Object::Int(value) => object_shape(ShapeItem::Number(*value as f64), out),
+        Object::Real(value) => object_shape(ShapeItem::Number(*value), out),
+        Object::String(string) => object_shape(ShapeItem::String(&string.bytes), out),
+        Object::Name(name) => object_shape(ShapeItem::Name(name), out),
+        Object::Ref(r) => object_shape(ShapeItem::Reference(r.num, r.generation), out),
+        Object::Array(items) => {
+            out.push(b'[');
+            out.extend_from_slice(&(items.len() as u64).to_le_bytes());
+            for item in items {
+                shape(item, depth.saturating_add(1), out);
+            }
+        }
+        Object::Dict(found) => dict(found, &[], out),
+        Object::Stream(stream) => {
+            out.push(b'S');
+            dict(&stream.dict, &SHAPE_LEFT_OUT, out);
+        }
+    }
+}
+
 impl Known {
+    /// Check that each object read here parses to the same value in hayro: `shapes` are hayro's
+    /// (`ContentDocument::object_shapes`) of `read`, in order. Where each object is and its
+    /// stream data are checked by [`Known::agree`]; this checks what is in it, so that no entry
+    /// read from a dictionary or array (a page tree's `/Kids` or inherited attributes, an
+    /// outline's `/First` and `/Next`, a name tree's `/Names`, an annotation's `/Dest` or `/A`,
+    /// a catalog entry) is one the readers parse differently. An object hayro does not read is
+    /// checked by the caller.
+    pub fn agree_shapes(&self, doc: &Document, budget: &mut Budget, read: &[(u32, u16)], shapes: &[Option<Vec<u8>>]) -> Result<(), Fail> {
+        if read.len() != shapes.len() {
+            return Err(read_error("readers disagree: hayro parsed another set of objects"));
+        }
+        for ((num, generation), theirs) in read.iter().zip(shapes) {
+            budget.tick()?;
+            let Some(theirs) = theirs else { continue };
+            let object = doc.try_get(*num).map_err(|error| read_error(format!("object {num} {generation} R cannot be read: {error}")))?;
+            let mut ours = Vec::with_capacity(theirs.len());
+            shape(&object, 0, &mut ours);
+            budget.hashed(ours.len().saturating_add(theirs.len()))?;
+            if ours != *theirs {
+                return Err(read_error(format!("readers disagree: hayro parses object {num} {generation} R otherwise")));
+            }
+        }
+        Ok(())
+    }
+
     /// Check that `pdfcraft_cos` reads what hayro read (see [`Resolved`]): every object at the
     /// same place (the same file offset with the same generation, or the same object stream and
     /// index), read here too with every check [`read`] makes, and every stream's data the same
@@ -2169,17 +2443,24 @@ pub(crate) fn read(
     let outline = reader.outline(&catalog, &page_index)?;
     let root = reader.dict_of(catalog.get(b"Outlines"), "/Outlines")?.unwrap_or_default();
     let outline_root = reader.digest_without(&root, &[b"Type", b"First", b"Last", b"Count"])?;
+    let named_destinations = reader.named_destinations(&catalog, &page_index)?;
     let mut entries = BTreeMap::new();
     for (key, value) in catalog.iter() {
-        if !CATALOG_REPORTED.contains(&key.as_slice()) {
-            entries.insert(key.clone(), reader.digest(value)?);
+        if CATALOG_REPORTED.contains(&key.as_slice()) {
+            continue;
         }
+        // `/Names` but for its `/Dests` tree, compared name by name.
+        let digest = match (key.as_slice(), &*reader.resolve(value)?) {
+            (b"Names", Object::Dict(names)) => reader.digest_without(names, &[b"Dests"])?,
+            _ => reader.digest(value)?,
+        };
+        entries.insert(key.clone(), digest);
     }
     let mut pages = Vec::with_capacity(nodes.len());
     let mut annotation_ids = BTreeSet::new();
     for node in &nodes {
         reader.budget.time()?;
-        pages.push(reader.page(node, &widgets, &mut annotation_ids)?);
+        pages.push(reader.page(node, &widgets, &mut annotation_ids, &page_index)?);
     }
     let known = Known {
         checked: reader.checked,
@@ -2192,5 +2473,5 @@ pub(crate) fn read(
         kept_until,
         agreed: BTreeSet::new(),
     };
-    Ok((Structure { pages, fields, form, catalog: entries, layers, outline, outline_root, sections }, known))
+    Ok((Structure { pages, fields, form, catalog: entries, layers, outline, outline_root, named_destinations, sections }, known))
 }

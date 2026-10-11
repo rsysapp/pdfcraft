@@ -411,6 +411,103 @@ impl<'a> Device<'a> for PageDevice<'a> {
     }
 }
 
+/// The deepest nesting of arrays and dictionaries [`object_shape`] writes out; deeper, a marker.
+pub const SHAPE_DEPTH: usize = 256;
+
+/// Stream-dictionary entries a shape leaves out: how the data is delimited and coded, which a
+/// caller compares on its own (the data's extent, the coding as each reader applies it).
+pub const SHAPE_LEFT_OUT: [&[u8]; 3] = [b"Length", b"Filter", b"DecodeParms"];
+
+/// The canonical form of an object, written the same way for any reader's parse of it:
+/// `n` null; `b` and a byte for a boolean; `#` and the 8 bytes of the number as a 64-bit float
+/// (an integer as its value; -0 as 0); `s` or `/`, the length (8 bytes) and the bytes of a
+/// string or a name (escapes resolved); `[` and the count, then the items; `<` and the count,
+/// then each entry (key length, key, value) in key order; `R`, the number and the generation
+/// (4 and 2 bytes) of a reference; `S` and its dictionary, less [`SHAPE_LEFT_OUT`], for a
+/// stream; `!` past [`SHAPE_DEPTH`].
+pub fn object_shape(kind: ShapeItem<'_>, out: &mut Vec<u8>) {
+    match kind {
+        ShapeItem::Null => out.push(b'n'),
+        ShapeItem::Bool(value) => out.extend_from_slice(&[b'b', u8::from(value)]),
+        ShapeItem::Number(value) => {
+            out.push(b'#');
+            let value = if value == 0.0 { 0.0 } else { value };
+            out.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+        ShapeItem::String(bytes) | ShapeItem::Name(bytes) => {
+            out.push(if matches!(kind, ShapeItem::String(_)) { b's' } else { b'/' });
+            out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            out.extend_from_slice(bytes);
+        }
+        ShapeItem::Reference(num, generation) => {
+            out.push(b'R');
+            out.extend_from_slice(&num.to_le_bytes());
+            out.extend_from_slice(&generation.to_le_bytes());
+        }
+    }
+}
+
+/// One scalar item of a shape (see [`object_shape`]).
+#[derive(Clone, Copy, Debug)]
+pub enum ShapeItem<'a> {
+    Null,
+    Bool(bool),
+    Number(f64),
+    String(&'a [u8]),
+    Name(&'a [u8]),
+    Reference(u32, u16),
+}
+
+/// The shape of a reference as hayro holds it: number and generation, or an impossible pair.
+fn shape_reference(reference: hayro::hayro_syntax::object::ObjRef, out: &mut Vec<u8>) {
+    match (u32::try_from(reference.obj_number), u16::try_from(reference.gen_number)) {
+        (Ok(num), Ok(generation)) => object_shape(ShapeItem::Reference(num, generation), out),
+        _ => out.push(b'?'),
+    }
+}
+
+fn shape_of(object: &Object<'_>, depth: usize, out: &mut Vec<u8>) {
+    use hayro::hayro_syntax::object::MaybeRef;
+    if depth > SHAPE_DEPTH {
+        out.push(b'!');
+        return;
+    }
+    let item = |value: &MaybeRef<Object<'_>>, out: &mut Vec<u8>| match value {
+        MaybeRef::Ref(reference) => shape_reference(*reference, out),
+        MaybeRef::NotRef(object) => shape_of(object, depth + 1, out),
+    };
+    let dict = |dict: &Dict<'_>, left_out: &[&[u8]], out: &mut Vec<u8>| {
+        let entries: Vec<_> = dict.entries().filter(|(key, _)| !left_out.contains(&key.as_ref())).collect();
+        out.push(b'<');
+        out.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        for (key, value) in &entries {
+            out.extend_from_slice(&(key.as_ref().len() as u64).to_le_bytes());
+            out.extend_from_slice(key.as_ref());
+            item(value, out);
+        }
+    };
+    match object {
+        Object::Null(_) => object_shape(ShapeItem::Null, out),
+        Object::Boolean(value) => object_shape(ShapeItem::Bool(*value), out),
+        Object::Number(number) => object_shape(ShapeItem::Number(number.as_f64()), out),
+        Object::String(string) => object_shape(ShapeItem::String(string.as_bytes()), out),
+        Object::Name(name) => object_shape(ShapeItem::Name(name.as_ref()), out),
+        Object::Array(array) => {
+            let items: Vec<_> = array.raw_iter().collect();
+            out.push(b'[');
+            out.extend_from_slice(&(items.len() as u64).to_le_bytes());
+            for value in &items {
+                item(value, out);
+            }
+        }
+        Object::Dict(found) => dict(found, &[], out),
+        Object::Stream(stream) => {
+            out.push(b'S');
+            dict(stream.dict(), &SHAPE_LEFT_OUT, out);
+        }
+    }
+}
+
 /// A page's content rendered upright: `rgba` is premultiplied RGBA8, `width` × `height` pixels.
 /// User space maps to pixels as `px = (x − crop[0]) · scale`, `py = (height_pt − (y − crop[1])) · scale`.
 #[derive(Clone, Debug)]
@@ -507,6 +604,29 @@ impl ContentDocument {
             // A panic reads nothing for certain.
             Err(_) => (Resolved { conflicts: 1, ..read }, objects.to_vec()),
         }
+    }
+
+    /// Each of `objects` (number, generation) as hayro parses it, in a canonical form another
+    /// reader can compare with its own parse (see [`object_shape`]); `None` where hayro reads
+    /// nothing. With [`ContentDocument::read_objects`] (where each object is, and its stream
+    /// data), a caller checks that no value it reads from a dictionary or array is one the two
+    /// readers parse differently.
+    pub fn object_shapes(&self, objects: &[(u32, u16)]) -> Vec<Option<Vec<u8>>> {
+        let shapes = catch_unwind(AssertUnwindSafe(|| {
+            let xref = self.pdf.xref();
+            objects
+                .iter()
+                .map(|(num, generation)| {
+                    let num = i32::try_from(*num).ok()?;
+                    let object = xref.get::<Object<'_>>(ObjectIdentifier::new(num, i32::from(*generation)))?;
+                    let mut out = Vec::new();
+                    shape_of(&object, 0, &mut out);
+                    Some(out)
+                })
+                .collect::<Vec<_>>()
+        }));
+        // A panic reads nothing for certain.
+        shapes.unwrap_or_else(|_| vec![None; objects.len()])
     }
 
     pub fn page_count(&self) -> usize {
@@ -616,6 +736,23 @@ impl ContentDocument {
             return Err(ContentError::Unreadable("the file's cross-reference data is damaged".into()));
         }
         Ok(content)
+    }
+
+    /// The page's media box and crop box (`[x0, y0, x1, y1]`, normalised) and its rotation in
+    /// degrees (0, 90, 180 or 270), as hayro took them, inherited through the page tree: for a
+    /// caller that checks another reader inherits the same (hayro skips a value it cannot read
+    /// and takes the inherited one, or a default).
+    pub fn page_geometry(&self, page: usize) -> Option<([f64; 4], [f64; 4], u16)> {
+        let pages = self.pdf.pages();
+        let page = pages.get(page)?;
+        let (media, crop) = (page.media_box(), page.crop_box());
+        let rotation = match page.rotation() {
+            hayro::hayro_syntax::page::Rotation::None => 0,
+            hayro::hayro_syntax::page::Rotation::Horizontal => 90,
+            hayro::hayro_syntax::page::Rotation::Flipped => 180,
+            hayro::hayro_syntax::page::Rotation::FlippedHorizontal => 270,
+        };
+        Some(([media.x0, media.y0, media.x1, media.y1], [crop.x0, crop.y0, crop.x1, crop.y1], rotation))
     }
 
     /// The page box hayro renders upright (intersected crop box), in points: width, height.
