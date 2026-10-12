@@ -195,24 +195,17 @@ pub(crate) fn check(data: &[u8], base: &ContentBase, budget: &mut Budget) -> Res
         return Ok(Brought::default());
     }
     let mut brought = Brought::default();
-    // Where in the redactor's clip (see [`CLIP`]) or box (`re`, then `f`) the operators are.
-    let mut clip: Option<usize> = None;
-    let mut boxed = false;
+    // Follow-up 9 (R6b-54, N1): a path is begun (`m`, `re`), built, and painted or ended (`n`)
+    // before anything else: path points never painted draw nothing, yet carry what they hold.
+    let mut in_path = false;
     walk(data, budget, true, &mut |operator, operands| {
-        // Inside the redactor's clip, or after its box's `re`: exactly what comes next there.
-        if let Some(at) = clip {
-            if CLIP.get(at) != Some(&operator) || !shape(operator).is_some_and(|shape| fits(shape, operands)) || !plain_numbers(operands) {
-                return Err(refused("path operators the redactor does not write"));
-            }
-            clip = (at + 1 < CLIP.len()).then_some(at + 1);
-            return Ok(());
-        }
-        if boxed {
-            boxed = false;
-            if operator != b"f" || !operands.is_empty() {
-                return Err(refused("a box the redactor does not write"));
-            }
-            return Ok(());
+        match operator {
+            b"m" | b"re" => in_path = true,
+            b"l" | b"c" | b"v" | b"y" | b"h" | b"W" | b"W*" if !in_path => return Err(refused("path operators no path begins")),
+            b"l" | b"c" | b"v" | b"y" | b"h" | b"W" | b"W*" => {}
+            b"S" | b"s" | b"f" | b"F" | b"f*" | b"B" | b"B*" | b"b" | b"b*" | b"n" => in_path = false,
+            _ if in_path => return Err(refused("a path the redactor does not finish")),
+            _ => {}
         }
         if operator == b"BI" {
             // An inline image: one of the base's, its dictionary holding nothing but how to
@@ -258,20 +251,10 @@ pub(crate) fn check(data: &[u8], base: &ContentBase, budget: &mut Budget) -> Res
             return Err(refused(format!("operands `{}` does not take", String::from_utf8_lossy(operator))));
         }
         let numbers_plain = plain_numbers(operands);
-        // A path the redactor writes: its clip (a quadrilateral around, one inside, even-odd,
-        // per mark), or a box; never a path point of its own elsewhere.
-        match operator {
-            b"m" => {
-                if !numbers_plain || !shape(operator).is_some_and(|shape| fits(shape, operands)) {
-                    return Err(refused("path operators the redactor does not write"));
-                }
-                clip = Some(1);
-                return Ok(());
-            }
-            b"l" | b"h" | b"W*" => return Err(refused("path operators the redactor does not write")),
-            b"re" => boxed = true,
-            _ => {}
-        }
+        // Follow-up 9 (R6b-54, N1): the paths the redactor writes are the pieces of paths it
+        // cut along the marks (`m`, `l`, `h`, `re`, painted, or clipping with `W`/`W*` and `n`),
+        // and its boxes; their numbers are written to four places. Where their points lie is
+        // the self-check's to judge (`apply_marks` reads no point under a mark).
         let displacements_apart = match operands.first() {
             Some(Object::Array(items)) if operator == b"TJ" => !items.windows(2).any(|pair| number(&pair[0]) && number(&pair[1])),
             _ => true,
@@ -286,7 +269,7 @@ pub(crate) fn check(data: &[u8], base: &ContentBase, budget: &mut Budget) -> Res
         }
         Ok(())
     })?;
-    if clip.is_some() || boxed {
+    if in_path {
         return Err(refused("a path the redactor does not finish"));
     }
     Ok(brought)
@@ -355,9 +338,6 @@ fn write_canonical(operator: &[u8], operands: &[Object], out: &mut Vec<u8>) {
     out.push(b'\n');
 }
 
-/// The clip the redactor writes around each mark (`pdfcraft_redact`'s `clip_out`).
-const CLIP: [&[u8]; 12] = [b"m", b"l", b"l", b"l", b"h", b"m", b"l", b"l", b"l", b"h", b"W*", b"n"];
-
 /// Whether every number among `operands` (and in their arrays) is written as the redactor
 /// writes numbers: to four places.
 fn plain_numbers(operands: &[Object]) -> bool {
@@ -374,12 +354,14 @@ fn plain_numbers(operands: &[Object]) -> bool {
     })
 }
 
-/// The operators the redactor writes of its own (`pdfcraft_redact`): the state around what it
-/// clips (`q`, `Q`), the clip that leaves the marks out (`m`, `l`, `h`, `W*`, `n`), the boxes
+/// The operators the redactor writes of its own (`pdfcraft_redact`): the saves around its boxes
+/// and those closing what the content left open (`q`, `Q`), the pieces of paths it cut (`m`,
+/// `l`, `h`, `re`, painted by `f`, `f*` or `S`, or clipping by `W` or `W*` and `n`), the boxes
 /// (`g`, `rg`, `re`, `f`), what it keeps of a line of text (`TJ`, and `Tw`, `Tc`, `T*` for `'`
 /// and `"`, `Tf` naming a font the content still shows text with in place of one that shows
 /// nothing any more), and its copies of forms and images (`Do`).
-const REDACTOR_WRITES: [&[u8]; 17] = [b"q", b"Q", b"m", b"l", b"h", b"W*", b"n", b"g", b"rg", b"re", b"f", b"TJ", b"Tw", b"Tc", b"T*", b"Tf", b"Do"];
+const REDACTOR_WRITES: [&[u8]; 21] =
+    [b"q", b"Q", b"m", b"l", b"h", b"W", b"W*", b"n", b"g", b"rg", b"re", b"f", b"f*", b"S", b"TJ", b"Tw", b"Tc", b"T*", b"Tf", b"Do", b"F"];
 
 /// What [`walk`] calls with each operator and its operands.
 type Each<'a> = dyn FnMut(&[u8], &[Object]) -> Result<(), Fail> + 'a;

@@ -93,6 +93,12 @@ struct Gs {
     /// Embed build (R6b-50): the tiling pattern painting fills and strokes (`scn`/`SCN` with a
     /// name), whose cell is redacted where it shows under a region.
     patterns: [Option<Vec<u8>>; 2],
+    /// Embed build (R6b-54, N1): whether strokes are dashed (`d` with a non-empty array): a
+    /// dashed stroke cut along a region would restart its dashes.
+    dashed: bool,
+    /// Embed build (R6b-54, N2): the box (user space) the clipping paths set so far bound
+    /// (`None`: not bounded).
+    clip: Option<[f64; 4]>,
 }
 
 /// What processing a scope produced.
@@ -355,6 +361,13 @@ impl<'a> Scope<'a> {
         self.rects.iter().any(|r| overlaps(*r, b, 0.0))
     }
 
+    /// Embed build (R6b-54, N1): whether a path's box meets a region: a positive overlap once
+    /// the box is given a hair of extent, so a straight line (a box of no height or width) under
+    /// a region meets it too.
+    fn path_hits(&self, b: [f64; 4]) -> bool {
+        self.rects.iter().any(|r| crate::geometry::meets(*r, b))
+    }
+
     fn covered(&self, b: [f64; 4]) -> bool {
         self.rects.iter().any(|r| contains(*r, b, 0.01))
     }
@@ -457,27 +470,152 @@ fn fresh_name(scope: &mut Scope<'_>, xobjects: &Dict) -> Vec<u8> {
     }
 }
 
-/// The clip that hides everything inside each region: one even-odd clip per region (a big
-/// rectangle with the region cut out), in the current user space. Returns `None` when the CTM
-/// can't be inverted (nothing is painted then anyway).
-fn clip_out(rects: &[[f64; 4]], ctm: &Matrix, around: [f64; 4]) -> Option<Vec<Op>> {
-    let inv = ctm.invert()?;
-    let mut ops = Vec::new();
-    let big = [around[0] - 10.0, around[1] - 10.0, around[2] + 10.0, around[3] + 10.0];
-    for r in rects.iter().filter(|r| overlaps(**r, around, 0.0)) {
-        let outer = [(big[0], big[1]), (big[2], big[1]), (big[2], big[3]), (big[0], big[3])];
-        let inner = [(r[0], r[1]), (r[0], r[3]), (r[2], r[3]), (r[2], r[1])];
-        for poly in [outer, inner] {
-            for (k, (x, y)) in poly.iter().enumerate() {
-                let (u, v) = inv.apply(*x, *y);
-                ops.push(Op::new(if k == 0 { "m" } else { "l" }, vec![num(u), num(v)]));
-            }
-            ops.push(Op::new("h", vec![]));
+/// Embed build (R6b-54, N1): how far inside a region a path's point must lie to count as under
+/// it once applied (the pieces end on its edges, written to four places in their own space).
+const VERTEX_SLACK: f64 = 0.01;
+
+/// Embed build (R6b-54, N2): whether a shading (a resource entry) is a plain gradient: axial or
+/// radial (types 2 and 3), its function exponential (type 2) or stitching such ones (type 3),
+/// or an array of them. A sampled or calculator function, or a mesh or function-based shading,
+/// can draw a picture.
+pub(crate) fn plain_shading(doc: &Document, entry: &Object) -> bool {
+    fn plain_function(doc: &Document, function: &Object, depth: usize) -> bool {
+        if depth > 8 {
+            return false;
         }
-        ops.push(Op::new("W*", vec![]));
-        ops.push(Op::new("n", vec![]));
+        match &*doc.resolve(function) {
+            Object::Array(items) => !items.is_empty() && items.iter().all(|item| plain_function(doc, item, depth + 1)),
+            Object::Dict(d) => match d.int(b"FunctionType") {
+                Some(2) => true,
+                Some(3) => d
+                    .get(b"Functions")
+                    .and_then(|f| doc.resolve(f).as_array().cloned())
+                    .is_some_and(|items| !items.is_empty() && items.iter().all(|item| plain_function(doc, item, depth + 1))),
+                _ => false,
+            },
+            _ => false,
+        }
     }
-    Some(ops)
+    let resolved = doc.resolve(entry);
+    let dict = match &*resolved {
+        Object::Dict(d) => d.clone(),
+        _ => return false,
+    };
+    matches!(dict.int(b"ShadingType"), Some(2 | 3)) && dict.get(b"Function").is_some_and(|function| plain_function(doc, function, 0))
+}
+
+/// Embed build (R6b-54, N1): a path (construction operators `body`, painted by `paint`, setting
+/// the clip when `clips`) that meets a region, rebuilt: every subpath meeting a region is
+/// replaced by its pieces outside the regions (see `geometry`), the others kept as written.
+/// Filling and clipping use the polygon pieces (with the path's own rule), stroking the stroke
+/// pieces; a fill-and-stroke is written as the fill, then the stroke. A shading pattern painting
+/// what is left must be a plain gradient. A refusal where the cut cannot be exact.
+fn cut_path(doc: &Document, scope: &mut Scope<'_>, gs: &Gs, body: &[Op], paint: &[u8], clips: bool, resources: &Dict) -> Result<Vec<Op>, Refusal> {
+    use crate::geometry;
+    let subpaths = geometry::subpaths(body, &gs.ctm).ok_or(Refusal::ContentNotFollowable)?;
+    let back = gs.ctm.invert().ok_or(Refusal::PathNotClippable)?;
+    let even_odd = body.iter().any(|op| op.is("W*")) || matches!(paint, b"f*" | b"B*" | b"b*");
+    let fills = matches!(paint, b"f" | b"F" | b"f*" | b"B" | b"B*" | b"b" | b"b*");
+    let strokes = matches!(paint, b"S" | b"s" | b"B" | b"B*" | b"b" | b"b*");
+    let close_strokes = matches!(paint, b"s" | b"b" | b"b*");
+    let mut kept: Vec<Op> = Vec::new();
+    let mut kept_closed: Vec<Op> = Vec::new();
+    let mut fill_pieces: Vec<Op> = Vec::new();
+    let mut stroke_pieces: Vec<Op> = Vec::new();
+    let mut budget = geometry::MAX_POINTS;
+    let mut cut_any = false;
+    for sub in &subpaths {
+        scope.charge(sub.ops.len().saturating_mul(scope.rects.len().max(1)));
+        let meeting: Vec<[f64; 4]> = scope.rects.iter().filter(|r| geometry::meets(**r, sub.bounds)).copied().collect();
+        if meeting.is_empty() {
+            let alone = sub.ops_standing_alone(&back);
+            kept.extend(alone.iter().cloned());
+            kept_closed.extend(alone);
+            if !sub.closed && !sub.ops.iter().any(|op| op.is("re")) {
+                kept_closed.push(Op::new("h", vec![]));
+            }
+            continue;
+        }
+        cut_any = true;
+        if scope.rects.iter().any(|r| pdfcraft_content::contains(*r, sub.bounds, 0.0)) {
+            scope.report.paths_removed += 1;
+            continue;
+        }
+        scope.report.paths_clipped += 1;
+        let outline = geometry::outline(sub, &mut budget).ok_or(Refusal::PathNotClippable)?;
+        scope.charge(outline.len().saturating_mul(meeting.len()));
+        if fills || clips {
+            for piece in geometry::clip_fill(outline.clone(), &meeting).ok_or(Refusal::PathNotClippable)? {
+                geometry::write(&piece, &back, true, &mut fill_pieces);
+            }
+        }
+        if strokes {
+            let closed = sub.closed || close_strokes;
+            let mut pieces = geometry::clip_stroke(&outline, closed, &meeting).ok_or(Refusal::PathNotClippable)?;
+            geometry::join_ends(&mut pieces, closed);
+            for piece in pieces {
+                geometry::write(&piece, &back, false, &mut stroke_pieces);
+            }
+        }
+    }
+    if scope.exhausted() {
+        return Err(Refusal::TooComplex);
+    }
+    // A dashed stroke cut restarts its dashes on every piece: not exact.
+    if strokes && cut_any && gs.dashed && !stroke_pieces.is_empty() {
+        return Err(Refusal::PathNotClippable);
+    }
+    // A shading pattern painting what is left: only a plain gradient (R6b-54, N2).
+    for (paints, slot) in
+        [(fills && !(kept.is_empty() && fill_pieces.is_empty()), 0usize), (strokes && !(kept.is_empty() && stroke_pieces.is_empty()), 1)]
+    {
+        if !paints {
+            continue;
+        }
+        let Some(name) = gs.patterns[slot].as_deref() else { continue };
+        let Some(pattern) = scope.resource(doc, &res_dict(doc, resources, b"Pattern"), b"Pattern", name) else { continue };
+        let resolved = doc.resolve(&pattern);
+        let dict = match &*resolved {
+            Object::Dict(d) => d.clone(),
+            Object::Stream(s) => s.dict.clone(),
+            _ => continue,
+        };
+        if dict.int(b"PatternType") == Some(2) && !dict.get(b"Shading").is_some_and(|shading| plain_shading(doc, shading)) {
+            return Err(Refusal::ShadingUnderMark);
+        }
+    }
+    let fill_op = if even_odd { "f*" } else { "f" };
+    let mut out: Vec<Op> = Vec::new();
+    if fills {
+        let mut fill: Vec<Op> = kept.clone();
+        fill.extend(fill_pieces.iter().cloned());
+        if !fill.is_empty() {
+            out.extend(fill);
+            out.push(Op::new(if strokes { fill_op } else { std::str::from_utf8(paint).unwrap_or(fill_op) }, vec![]));
+        }
+    }
+    if strokes {
+        let mut stroke: Vec<Op> = if close_strokes { kept_closed.clone() } else { kept.clone() };
+        stroke.extend(stroke_pieces);
+        if !stroke.is_empty() {
+            out.extend(stroke);
+            out.push(Op::new("S", vec![]));
+        }
+    }
+    if clips {
+        // The clip is the path's region outside the regions (inside them nothing is drawn any
+        // more): set with no painting, after the painting as `W` sets it.
+        let mut clip = kept;
+        clip.extend(fill_pieces);
+        if clip.is_empty() {
+            // Nothing outside the regions: a clip of nothing.
+            clip.push(Op::new("re", vec![Object::Int(0), Object::Int(0), Object::Int(0), Object::Int(0)]));
+        }
+        out.extend(clip);
+        out.push(Op::new(if even_odd { "W*" } else { "W" }, vec![]));
+        out.push(Op::new("n", vec![]));
+    }
+    Ok(out)
 }
 
 /// One glyph of a shown string.
@@ -506,6 +644,8 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
         rise: 0.0,
         unplaceable: false,
         patterns: [None, None],
+        dashed: false,
+        clip: None,
     };
     let mut stack: Vec<Gs> = Vec::new();
     let (mut tm, mut tlm) = (Matrix::IDENTITY, Matrix::IDENTITY);
@@ -583,6 +723,11 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
                         None => [u, v, u, v],
                         Some(b) => [b[0].min(u), b[1].min(v), b[2].max(u), b[3].max(v)],
                     });
+                    // Embed build (R6b-54, N1): no point or control point of a path may lie under
+                    // a region once applied (the redactor's pieces end on its edges).
+                    if scope.mode == Mode::Verify && scope.rects.iter().any(|r| crate::geometry::strictly_inside((u, v), r, VERTEX_SLACK)) {
+                        out.residue += 1;
+                    }
                 }
                 clip |= matches!(o, b"W" | b"W*");
                 path.push(op);
@@ -592,10 +737,20 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
                 let body = std::mem::take(&mut path);
                 let bbox = path_box.take();
                 let clips = std::mem::replace(&mut clip, false);
-                let hit = scope.mode == Mode::Apply && o != b"n" && bbox.is_some_and(|b| scope.hits(b));
+                // Embed build (R6b-54, N2): what the clip bounds from here on.
+                if clips && let Some(b) = bbox {
+                    gs.clip = Some(match gs.clip {
+                        Some(c) => [c[0].max(b[0]), c[1].max(b[1]), c[2].min(b[2]), c[3].min(b[3])],
+                        None => b,
+                    });
+                }
+                let hit = scope.mode == Mode::Apply && bbox.is_some_and(|b| scope.path_hits(b));
                 // Embed build (R6b-50): a tiling pattern painted over a region shows its cell
                 // there: the cell is redacted too (its data would keep what lies under the box).
-                if hit && let Some(b) = bbox {
+                if hit
+                    && o != b"n"
+                    && let Some(b) = bbox
+                {
                     let fills = matches!(o, b"f" | b"F" | b"f*" | b"B" | b"B*" | b"b" | b"b*");
                     let strokes = matches!(o, b"S" | b"s" | b"B" | b"B*" | b"b" | b"b*");
                     for (paints, slot) in [(fills, 0usize), (strokes, 1)] {
@@ -609,37 +764,15 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
                     ops.push(op);
                     continue;
                 }
-                let b = bbox.unwrap_or_default();
                 changed = true;
-                if scope.covered(b) {
-                    scope.report.paths_removed += 1;
-                    if clips {
-                        // Keep the clipping, drop the painting.
-                        ops.extend(body);
-                        ops.push(Op::new("n", vec![]));
-                    }
-                } else if clips {
-                    // A clip-and-paint path can't be wrapped in q/Q without losing its clip:
-                    // paint it clipped, then set its clip with a no-op path.
-                    scope.report.paths_clipped += 1;
-                    if let Some(c) = clip_out(scope.rects, &gs.ctm, b) {
-                        let plain: Vec<Op> = body.iter().filter(|p| !p.is("W") && !p.is("W*")).cloned().collect();
-                        ops.push(Op::new("q", vec![]));
-                        ops.extend(c);
-                        ops.extend(plain);
-                        ops.push(op);
-                        ops.push(Op::new("Q", vec![]));
-                    }
-                    ops.extend(body);
-                    ops.push(Op::new("n", vec![]));
-                } else {
-                    scope.report.paths_clipped += 1;
-                    if let Some(c) = clip_out(scope.rects, &gs.ctm, b) {
-                        ops.push(Op::new("q", vec![]));
-                        ops.extend(c);
+                // Embed build (R6b-54, N1): every subpath meeting a region goes; what it has
+                // outside the regions is rebuilt, cut exactly along them.
+                match cut_path(doc, scope, &gs, &body, o, clips, resources) {
+                    Ok(rebuilt) => ops.extend(rebuilt),
+                    Err(refusal) => {
+                        out.refuse(refusal);
                         ops.extend(body);
                         ops.push(op);
-                        ops.push(Op::new("Q", vec![]));
                     }
                 }
                 continue;
@@ -664,6 +797,7 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
                     }
                 }
                 b"ET" => in_text = false,
+                b"d" => gs.dashed = op.operands.first().and_then(Object::as_array).is_some_and(|dashes| !dashes.is_empty()),
                 b"cm" => {
                     if let Some(m) = op.nums::<6>() {
                         gs.ctm = Matrix(m).then(&gs.ctm);
@@ -808,14 +942,36 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
                     }
                 }
                 b"sh" if scope.mode == Mode::Apply => {
-                    // A shading fills the current clip: clip the regions out.
-                    if let Some(c) = clip_out(scope.rects, &gs.ctm, [-1e6, -1e6, 1e6, 1e6]) {
-                        changed = true;
-                        ops.push(Op::new("q", vec![]));
-                        ops.extend(c);
-                        ops.push(op);
-                        ops.push(Op::new("Q", vec![]));
-                        continue;
+                    // Embed build (R6b-54, N2): a shading fills what the clip leaves (within its
+                    // own box): wholly under the regions it goes; reaching one otherwise it is
+                    // kept only when its data is a plain gradient (axial or radial, exponential
+                    // or stitched functions), which draws no picture; else refused.
+                    let shading = op.name(0).and_then(|name| scope.resource(doc, &res_dict(doc, resources, b"Shading"), b"Shading", name));
+                    let shading_box = shading.as_ref().and_then(|entry| {
+                        let resolved = doc.resolve(entry);
+                        let dict = match &*resolved {
+                            Object::Dict(d) => d.clone(),
+                            Object::Stream(s) => s.dict.clone(),
+                            _ => return None,
+                        };
+                        let v: Vec<f64> =
+                            dict.get(b"BBox").and_then(|b| doc.resolve(b).as_array().map(|a| a.iter().filter_map(Object::as_f64).collect()))?;
+                        (v.len() == 4).then(|| gs.ctm.bbox([v[0].min(v[2]), v[1].min(v[3]), v[0].max(v[2]), v[1].max(v[3])]))
+                    });
+                    let region = match (gs.clip, shading_box) {
+                        (Some(c), Some(b)) => Some([c[0].max(b[0]), c[1].max(b[1]), c[2].min(b[2]), c[3].min(b[3])]),
+                        (one, other) => one.or(other),
+                    };
+                    let reaches = region.is_none_or(|r| scope.hits(r));
+                    if reaches && !scope.rects.is_empty() {
+                        if region.is_some_and(|r| scope.covered(r)) {
+                            changed = true;
+                            scope.report.paths_removed += 1;
+                            continue;
+                        }
+                        if !shading.as_ref().is_some_and(|entry| plain_shading(doc, entry)) {
+                            out.refuse(Refusal::ShadingUnderMark);
+                        }
                     }
                 }
                 b"Do" => {

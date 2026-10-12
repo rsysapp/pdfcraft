@@ -907,3 +907,137 @@ fn an_inline_image_holding_ei_in_its_data_is_redacted_beside_or_refused() {
         assert!(found(&applied.bytes, SECRET).is_empty());
     }
 }
+
+// ── R6b-54 N1, N2, N10: paths cut exactly, shadings, vector-only redactions ───────────────────
+
+/// Every number the output's content streams (pages' and forms') hold as an operand of a path
+/// operator, as written.
+fn path_operands(bytes: &[u8]) -> String {
+    let doc = pdfcraft_cos::Document::open(Arc::new(bytes.to_vec())).unwrap();
+    let mut all = String::new();
+    for num in doc.object_numbers() {
+        if let Ok(object) = doc.try_get(num)
+            && let pdfcraft_cos::Object::Stream(s) = &*object
+            && s.dict.name(b"Subtype") != Some(b"Image")
+            && let Ok(data) = s.decoded()
+        {
+            let Ok(canonical) = operators::canonical(&data, &mut Budget::new(Limits::default())) else { continue };
+            for line in String::from_utf8_lossy(&canonical).lines() {
+                let mut words: Vec<&str> = line.split_whitespace().collect();
+                if words.last().is_some_and(|op| matches!(*op, "m" | "l" | "c" | "v" | "y" | "re")) {
+                    words.pop();
+                    for word in words {
+                        if let Ok(value) = word.parse::<f64>() {
+                            all.push_str(&format!("{value} "));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    all
+}
+
+#[test]
+fn a_path_partly_under_a_mark_loses_what_lies_under_it() {
+    // R6b-54 N1 (redaction re-review N1, CRITICAL): a subpath meeting a mark goes, and what it
+    // has outside is cut exactly along the mark; no point of it is left under the mark.
+    // `path-two-subpaths`: one triangle wholly under the box, one outside.
+    let base = Spec::new(&format!(
+        "BT /F1 12 Tf 20 150 Td (Alpha) Tj ET\n0 0 1 rg 23.456 150 m 33.456 160 l 43.456 150 l h 150 150 m 160 160 l 170 150 l h f\n{KEEP}"
+    ))
+    .build();
+    let applied = apply(&base, &marked(&base, &[BOX])).unwrap();
+    let operands = path_operands(&applied.bytes);
+    assert!(!operands.contains("23.456") && !operands.contains("33.456") && operands.contains("150 150"), "{operands}");
+    assert!(found(&applied.bytes, "23.456").is_empty());
+    // `signature-path-1pt-past`: a stroke reaching 1.5 pt past the mark keeps only that.
+    let base = Spec::new(&format!("0 0 0 RG 1 w 20.123 150 m 40.123 162 l 60.123 146 l 80.123 160 l 100.123 150 l 113.5 155 l S\n{KEEP}")).build();
+    let applied = apply(&base, &marked(&base, &[BOX])).unwrap();
+    let operands = path_operands(&applied.bytes);
+    assert!(!operands.contains("40.123") && !operands.contains("60.123") && operands.contains("113.5"), "{operands}");
+    // `filled-rect-crossing`: a filled shape crossing the mark: its corners outside stay, the
+    // part under the mark goes, and no point is left under it (the self-check reads them).
+    let base = Spec::new(&format!("{LINE}\n0 0 1 rg 30 140 m 30.5 170 l 130 170 l 130 140 l h f\n{KEEP}")).build();
+    let applied = apply(&base, &marked(&base, &[BOX])).unwrap();
+    assert!(applied.facts.paths_clipped >= 1, "{:?}", applied.facts);
+}
+
+#[test]
+fn a_vector_only_redaction_counts_its_content_removed() {
+    // R6b-54 N10 (`signature-path-inside`): a signature drawn as vectors, wholly under a mark,
+    // is removed and counted as content removed; its area is applied.
+    let base = Spec::new(&format!("0 0 0 RG 1 w 20.123 150 m 40.123 162 l 60.123 146 l 80.123 160 l 100.123 150 l S\n{KEEP}")).build();
+    let applied = apply(&base, &marked(&base, &[BOX])).unwrap();
+    assert_eq!(applied.facts.paths_removed, 1, "{:?}", applied.facts);
+    assert_eq!(applied.inspection.content.pages_with_content_removed, 1, "{:?}", applied.inspection);
+    assert_eq!(applied.inspection.applied_areas.len(), 1);
+    assert!(!path_operands(&applied.bytes).contains("40.123"));
+}
+
+#[test]
+fn a_dashed_stroke_cut_by_a_mark_is_refused_by_its_reason() {
+    // R6b-54 N1: cutting a dashed stroke restarts its dashes: not exact, refused as such.
+    let base = Spec::new(&format!("0 0 0 RG [3 2] 0 d 1 w 0 150 m 200 150 l S\n{KEEP}")).build();
+    assert_eq!(apply(&base, &marked(&base, &[BOX])).map(|_| ()), Err(ApplyError::Refused(Refusal::PathNotClippable)));
+}
+
+fn mesh() -> Vec<u8> {
+    let mut data: Vec<u8> = vec![0, 20, 145, 0, 0, 100, 145, 128, 0, 60, 165, 255];
+    data.extend_from_slice(SECRET.as_bytes());
+    stream("/ShadingType 4 /ColorSpace /DeviceGray /BitsPerCoordinate 8 /BitsPerComponent 8 /BitsPerFlag 8 /Decode [0 255 0 255 0 1]", &data)
+}
+
+#[test]
+fn shadings_under_a_mark_go_or_are_refused_by_their_reason() {
+    // R6b-54 N2 (`mesh-shading-under-box`): a shading painted only under the mark goes with its
+    // data; a mesh reaching a mark otherwise is refused; a plain gradient reaching one stays.
+    let under = Spec {
+        res: "/Shading << /Sh1 6 0 R >>".into(),
+        extras: vec![mesh()],
+        ..Spec::new(&format!("BT /F1 12 Tf 20 150 Td (Alpha) Tj ET\nq 16 144 96 22 re W n /Sh1 sh Q\n{KEEP}"))
+    }
+    .build();
+    let applied = apply(&under, &marked(&under, &[BOX])).unwrap();
+    assert!(found(&applied.bytes, SECRET).is_empty(), "{:?}", found(&applied.bytes, SECRET));
+    let partly = Spec {
+        res: "/Shading << /Sh1 6 0 R >>".into(),
+        extras: vec![mesh()],
+        ..Spec::new(&format!("BT /F1 12 Tf 20 150 Td (Alpha) Tj ET\nq 0 140 200 30 re W n /Sh1 sh Q\n{KEEP}"))
+    }
+    .build();
+    assert_eq!(apply(&partly, &marked(&partly, &[BOX])).map(|_| ()), Err(ApplyError::Refused(Refusal::ShadingUnderMark)));
+    let axial =
+        b"<< /ShadingType 2 /ColorSpace /DeviceGray /Coords [0 0 200 0] /Function << /FunctionType 2 /Domain [0 1] /C0 [0.8] /C1 [1] /N 1 >> >>"
+            .to_vec();
+    let gradient = Spec {
+        res: "/Shading << /Sh1 6 0 R >>".into(),
+        extras: vec![axial],
+        ..Spec::new(&format!("q 0 140 200 30 re W n /Sh1 sh Q\n{LINE}\n{KEEP}"))
+    }
+    .build();
+    let applied = apply(&gradient, &marked(&gradient, &[BOX])).unwrap();
+    assert!(found(&applied.bytes, SECRET).is_empty());
+}
+
+#[test]
+fn the_self_check_reads_no_path_point_under_a_mark() {
+    // R6b-54 N1: the output read again: a point of a path under an applied area (one the
+    // redactor's cut would never leave) fails the self-check.
+    let base = Spec::new(&format!("{LINE}\n{KEEP}")).build();
+    let applied = apply(&base, &marked(&base, &[BOX])).unwrap();
+    assert_eq!(apply::left_under_marks(&applied.bytes, &applied.facts.areas), Ok(()));
+    let mut doc = pdfcraft_cos::Document::open(Arc::new(applied.bytes.clone())).unwrap();
+    let page = pdfcraft_model::pages(&doc).swap_remove(0);
+    let mut list = match page.dict.get(b"Contents").map(|c| (*doc.resolve(c)).clone()) {
+        Some(pdfcraft_cos::Object::Array(items)) => items,
+        Some(other) => vec![other],
+        None => Vec::new(),
+    };
+    let added =
+        doc.add(pdfcraft_cos::Object::Stream(pdfcraft_cos::Stream::from_raw(pdfcraft_cos::Dict::new(), b"0 g 50 150 m 51 151 l S\n".to_vec())));
+    list.insert(0, pdfcraft_cos::Object::Ref(added));
+    doc.update_dict(page.obj, |d| d.set(b"Contents".to_vec(), pdfcraft_cos::Object::Array(list))).unwrap();
+    let forged = pdfcraft_cos::write_full(&doc, &pdfcraft_cos::SaveOptions { mod_date: None, ..Default::default() }).unwrap();
+    assert!(matches!(apply::left_under_marks(&forged, &applied.facts.areas), Err(ApplyError::SelfCheck(_))));
+}

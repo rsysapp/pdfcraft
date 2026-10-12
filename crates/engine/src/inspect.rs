@@ -2319,6 +2319,21 @@ fn compare_pages(
                 || (drawn_differently && (b.render_risk.is_some() || e.render_risk.is_some()))
                 // Follow-up 7 audit (item 10): what a box covers is gone, not kept under it.
                 || (drawn_differently && kept_under_boxes(b, e, &pairing, &boxes, budget).map_err(|fail| fail.of(Role::Edited))?);
+            // Follow-up 9 (R6b-54, N10): a box over drawn content no glyph or image removal
+            // explains removed drawn content (a path, a shading): the redactor removes all of
+            // it under a mark, and a box keeping it under is counted outside above.
+            let mut lost_drawing = false;
+            if !outside && drawn_differently {
+                let (base_raster, _) = rasters.get(before, after, (old, new), budget)?;
+                for (area, used) in boxes.iter().zip(areas.used.iter_mut()) {
+                    budget.tick().map_err(|fail| fail.of(Role::Edited))?;
+                    if !*used && visual::drawn_under(&base_raster, area.map(f64::from)) {
+                        *used = true;
+                        lost_drawing = true;
+                    }
+                }
+            }
+            counts.content_removed += usize::from(lost_drawing && !(lost_text || lost_image));
             if outside {
                 counts.outside_redactions += 1;
                 outside_pages.insert(new);

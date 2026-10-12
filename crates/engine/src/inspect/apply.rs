@@ -277,6 +277,8 @@ fn run(base: &[u8], edited: &[u8], limits: InspectLimits) -> Result<Applied, App
     };
     let mut budget = clock.budget(limits)?;
     self_check(&inspection, &facts, &before, &detail, (removed, fields), &mut budget)?;
+    left_under_marks(&bytes, &facts.areas)?;
+    clock.left(limits)?;
     canonical_streams(edited, &bytes, &mut budget)?;
     inspection.annotations.removed_by_redaction = removed;
     inspection.form_fields_removed_by_redaction = fields;
@@ -330,6 +332,27 @@ fn normalise(doc: &mut Document, newest: u32, contents: &std::collections::HashS
                 dict.remove(key);
             }
             doc.set(ObjRef::new(num, 0), Object::Stream(Stream::flate(dict, &canonical)));
+        }
+    }
+    Ok(())
+}
+
+/// Follow-up 9 (R6b-54, N1): the output read again, page by page: nothing the redactor reads as
+/// drawn under an applied area (a glyph, an inline image, a point or control point of a path)
+/// but its own boxes.
+pub(crate) fn left_under_marks(output: &[u8], areas: &[(u32, [f32; 4])]) -> Result<(), ApplyError> {
+    let mut doc = Document::open(Arc::new(output.to_vec())).map_err(|error| ApplyError::SelfCheck(error.to_string()))?;
+    let mut by_page: std::collections::BTreeMap<u32, Vec<[f64; 4]>> = std::collections::BTreeMap::new();
+    for (page, area) in areas {
+        by_page.entry(*page).or_default().push(area.map(f64::from));
+    }
+    for (page, rects) in by_page {
+        let index = usize::try_from(page.saturating_sub(1)).unwrap_or(usize::MAX);
+        match pdfcraft_redact::residue(&mut doc, index, &rects) {
+            Ok(0) => {}
+            Ok(_) => return Err(ApplyError::SelfCheck(format!("something is left under a mark on page {page}"))),
+            Err(pdfcraft_redact::RedactError::TooComplex) => return Err(ApplyError::TooComplex),
+            Err(error) => return Err(ApplyError::SelfCheck(error.to_string())),
         }
     }
     Ok(())

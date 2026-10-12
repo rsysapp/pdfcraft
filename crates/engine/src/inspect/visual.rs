@@ -299,6 +299,27 @@ pub(crate) fn area_filled(base: &UprightRaster, edited: &UprightRaster, area: [f
     fill.is_some() && covered_something
 }
 
+/// Follow-up 9 (R6b-54, N10): whether the base render shows anything but blank paper inside
+/// `area` (user space, away from its edge): what a box over it covered was drawn content (a
+/// path, a shading), so a redaction there removed some.
+pub(crate) fn drawn_under(base: &UprightRaster, area: [f64; 4]) -> bool {
+    let scale = f64::from(base.scale);
+    let [cx, cy] = [f64::from(base.crop[0]), f64::from(base.crop[1])];
+    let height_pt = f64::from(base.height_pt);
+    let x0 = (area[0] - cx) * scale;
+    let x1 = (area[2] - cx) * scale;
+    let top = (height_pt - (area[3] - cy)) * scale;
+    let bottom = (height_pt - (area[1] - cy)) * scale;
+    if ![x0, x1, top, bottom].iter().all(|v| v.is_finite()) {
+        return false;
+    }
+    let pixel = |v: f64, limit: u32| v.clamp(0.0, f64::from(limit)) as usize;
+    let (px0, px1) = (pixel(x0.ceil() + 1.0, base.width), pixel(x1.floor() - 1.0, base.width));
+    let (py0, py1) = (pixel(top.ceil() + 1.0, base.height), pixel(bottom.floor() - 1.0, base.height));
+    let width = base.width as usize;
+    (py0..py1).any(|y| (px0..px1).any(|x| colour(base, y * width + x).is_some_and(|c| c != u32::MAX)))
+}
+
 /// A comparison render reduced to blocks of [`BLOCK`] × [`BLOCK`] pixels, for pairing changed
 /// pages that share no glyph or image (R6b-38): each block's mean luminance, in quarters of a
 /// level, and whether it holds a pixel of what could be a redaction box: a pixel of the fill

@@ -16,6 +16,8 @@
 
 use pdfcraft_cos::{Dict, Document, ObjRef, Object, Stream};
 
+// Embed build (R6b-54, N1): paths cut exactly along the regions.
+mod geometry;
 mod image;
 mod interp;
 pub mod patterns;
@@ -772,6 +774,20 @@ fn apply_chosen(doc: &mut Document, chosen_by: &dyn Fn(&Mark) -> bool, options: 
     // The previous revision still holds the removed content: the next save must rewrite.
     doc.require_full_save();
     Ok(report)
+}
+
+/// Embed build (R6b-54, N1): what is still under `rects` on page `index` (0-based) of `doc`, but
+/// for the redaction's own boxes: glyphs, inline images, and points or control points of paths
+/// (more than a hundredth of a point inside). A host's self-check reads its output with it.
+pub fn residue(doc: &mut Document, index: usize, rects: &[[f64; 4]]) -> Result<usize, RedactError> {
+    let pages = pdfcraft_model::pages(doc);
+    let Some(page) = pages.get(index) else { return Err(RedactError::Unreadable(index + 1)) };
+    let work = interp::Work::new(interp::MAX_WORK, None);
+    let found = verify_page(doc, page, index, rects, &work)?;
+    if work.spent() {
+        return Err(RedactError::TooComplex);
+    }
+    Ok(found)
 }
 
 /// What is still under `rects` on `page` (index `index`), but for the redaction's own boxes

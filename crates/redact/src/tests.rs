@@ -235,7 +235,10 @@ fn vectors_are_removed_or_clipped_and_inline_images_go() {
     assert_eq!((r.paths_removed, r.paths_clipped, r.images_removed), (1, 1, 1), "{r:?}");
     let c = content(&doc, 0);
     assert!(!c.contains("10 10 20 20 re"), "{c}");
-    assert!(c.contains("W*\nn\n0 0 300 300 re\nf\nQ"), "the page-size rect is clipped: {c}");
+    // Embed build (R6b-54, N1): the page-size rectangle is cut along both marks (no clip): its
+    // pieces' corners are the page's and the marks' edges, none inside a mark.
+    assert!(!c.contains("0 0 300 300 re") && !c.contains("W*"), "the page-size rect is cut: {c}");
+    assert!(c.contains("0 0 m") && c.contains("300 300 l"), "{c}");
     assert!(!c.contains("BI"), "{c}");
     assert!(c.contains("150 150 m"), "the line elsewhere stays");
 }
