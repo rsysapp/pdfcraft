@@ -319,11 +319,50 @@ impl<'a> Scope<'a> {
     }
 }
 
+/// Embed build (follow-up 8 audit): whether operator `o` with `operands` leaves the state where
+/// the redactor cannot follow a viewer exactly: a `Q` with no `q` to restore, text shown or a
+/// text position set outside `BT` … `ET`, or a state operator whose operands are not the
+/// numbers (and name) it takes.
+fn drifts(o: &[u8], operands: &[Object], nothing_saved: bool, in_text: bool) -> bool {
+    let numbers = |count: usize| operands.len() == count && operands.iter().all(|operand| operand.as_f64().is_some());
+    match o {
+        b"Q" => nothing_saved,
+        b"cm" => !numbers(6),
+        b"Td" | b"TD" => !in_text || !numbers(2),
+        b"Tm" => !in_text || !numbers(6),
+        b"T*" => !in_text || !operands.is_empty(),
+        b"Tc" | b"Tw" | b"Tz" | b"TL" | b"Ts" | b"Tr" => !numbers(1),
+        b"Tf" => {
+            !(operands.len() == 2
+                && operands.first().is_some_and(|name| name.as_name().is_some())
+                && operands.get(1).is_some_and(|size| size.as_f64().is_some()))
+        }
+        b"Tj" | b"'" => !in_text || !(operands.len() == 1 && operands.first().is_some_and(|text| text.as_string().is_some())),
+        b"\"" => {
+            !in_text
+                || !(operands.len() == 3
+                    && operands.iter().take(2).all(|n| n.as_f64().is_some())
+                    && operands.get(2).is_some_and(|text| text.as_string().is_some()))
+        }
+        b"TJ" => !in_text || !(operands.len() == 1 && operands.first().is_some_and(|items| items.as_array().is_some())),
+        _ => false,
+    }
+}
+
 /// Embed build: whether the redactor cannot place a font's glyphs: a composite font written
 /// vertically (`/WMode 1`, a `-V` CMap) or with a CMap it does not read (any predefined CMap but
 /// `Identity-H`, whose codes and widths it would split and measure wrongly, or one that uses
 /// another, `/UseCMap`).
 fn unplaceable(doc: &Document, font: &Dict) -> bool {
+    // Embed build (follow-up 8 audit): a Type 3 font whose matrix is not a plain scale (the
+    // metrics take its first number alone).
+    if font.name(b"Subtype") == Some(b"Type3") {
+        let matrix: Vec<f64> = font
+            .get(b"FontMatrix")
+            .and_then(|m| doc.resolve(m).as_array().map(|a| a.iter().filter_map(Object::as_f64).collect()))
+            .unwrap_or_default();
+        return !matches!(matrix.as_slice(), [a, 0.0, 0.0, d, 0.0, 0.0] if a == d && *a > 0.0);
+    }
     if font.name(b"Subtype") != Some(b"Type0") {
         return false;
     }
@@ -418,6 +457,8 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
     let mut path_box: Option<[f64; 4]> = None;
     let mut clip = false;
     let mut forced_change = false;
+    // Embed build (follow-up 8 audit): inside `BT` … `ET`.
+    let mut in_text = false;
 
     // The streams are one content stream in pieces, which may be split between any two tokens
     // (ISO 32000-2 §7.8.2): an operator's operands can end one piece and the operator start the
@@ -548,6 +589,12 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
                 path_box = None;
                 clip = false;
             }
+            // Embed build (follow-up 8 audit): state a viewer may compute otherwise (a `Q` with no
+            // `q`, text shown outside a text object, an operator with operands it does not take)
+            // makes every glyph place after it a guess: the redaction is refused.
+            if scope.mode == Mode::Apply && !scope.rects.is_empty() && drifts(o, &op.operands, stack.is_empty(), in_text) {
+                out.residue += 1;
+            }
             match o {
                 b"q" => stack.push(gs.clone()),
                 b"Q" => {
@@ -555,6 +602,7 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
                         gs = g;
                     }
                 }
+                b"ET" => in_text = false,
                 b"cm" => {
                     if let Some(m) = op.nums::<6>() {
                         gs.ctm = Matrix(m).then(&gs.ctm);
@@ -564,6 +612,7 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
                     tm = Matrix::IDENTITY;
                     tlm = Matrix::IDENTITY;
                     drift = 0.0;
+                    in_text = true;
                 }
                 b"Tf" => {
                     gs.size = op.num(1).unwrap_or(gs.size);

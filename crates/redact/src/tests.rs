@@ -1104,3 +1104,44 @@ fn work_past_the_bound_fails_the_redaction() {
     assert_eq!(apply(&mut doc, None), Err(RedactError::TooComplex));
     assert!(started.elapsed() < std::time::Duration::from_secs(30), "{:?}", started.elapsed());
 }
+
+#[test]
+fn state_the_redactor_cannot_track_exactly_refuses_the_redaction() {
+    // Follow-up 8 audit: where the interpreter's state could drift from a viewer's (a `Q` with
+    // no `q`, text shown outside a text object, an operator with operands it does not take, a
+    // Type 3 font whose matrix is not a plain scale), glyph places are guesses: refused.
+    let type3 = "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] /FontMatrix [0.001 0.0005 0 0.001 0 0] /CharProcs << /a 8 0 R >> /Encoding << /Type /Encoding /Differences [83 /a] >> /FirstChar 83 /LastChar 83 /Widths [1000] /Resources << >> >>";
+    for (case, content, extra_res, extra) in [
+        ("a Q without q", &b"Q BT /F1 10 Tf 10 100 Td (SECRET) Tj ET"[..], "", vec![]),
+        ("text outside a text object", &b"BT /F1 10 Tf 10 100 Td ET (SECRET) Tj"[..], "", vec![]),
+        ("Td with three operands", &b"BT /F1 10 Tf 5 10 100 Td (SECRET) Tj ET"[..], "", vec![]),
+        ("cm with a name", &b"2 0 0 2 0 0 /Junk cm BT /F1 10 Tf 10 100 Td (SECRET) Tj ET"[..], "", vec![]),
+        ("Tz without operand", &b"BT /F1 10 Tf Tz 10 100 Td (SECRET) Tj ET"[..], "", vec![]),
+        (
+            "a skewed Type 3 font",
+            &b"BT /T3 10 Tf 10 100 Td (SSSSSS) Tj ET"[..],
+            "/Font << /F1 5 0 R /T3 7 0 R >>",
+            vec![type3.as_bytes().to_vec(), stream("", b"1000 0 d0 0 0 1000 1000 re f")],
+        ),
+    ] {
+        let mut doc = if extra_res.is_empty() {
+            one_page(content, "", vec![])
+        } else {
+            one_page(content, &extra_res.replace("/Font << /F1 5 0 R", "/XFont << /F1 5 0 R"), extra)
+        };
+        if !extra_res.is_empty() {
+            // The page names its own fonts: written again with both.
+            let page = doc.get(pdfcraft_cos::ObjRef::new(3, 0)).as_dict().cloned().unwrap();
+            let mut resources = Dict::new();
+            let mut fonts = Dict::new();
+            fonts.set(b"F1".to_vec(), Object::Ref(pdfcraft_cos::ObjRef::new(5, 0)));
+            fonts.set(b"T3".to_vec(), Object::Ref(pdfcraft_cos::ObjRef::new(7, 0)));
+            resources.set(b"Font".to_vec(), Object::Dict(fonts));
+            let mut page = page;
+            page.set(b"Resources".to_vec(), Object::Dict(resources));
+            doc.set(pdfcraft_cos::ObjRef::new(3, 0), Object::Dict(page));
+        }
+        mark(&mut doc, 0, &[OVER_SECRET], "");
+        assert!(apply(&mut doc, None).is_err(), "{case}");
+    }
+}
