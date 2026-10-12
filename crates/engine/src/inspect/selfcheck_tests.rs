@@ -277,3 +277,40 @@ fn what_a_redaction_removes_under_a_mark_is_reported_apart() {
     assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{inspection:?}");
     assert_eq!((inspection.form_fields_changed, inspection.form_fields_removed_by_redaction), (0, 1), "{inspection:?}");
 }
+
+#[test]
+fn an_update_carries_no_operator_channel_and_a_rewrite_draws_only_with_the_base_s_resources() {
+    // Follow-up 8 audit (operators): in an appended update a page's content must stay byte for
+    // byte the base's (R6b-3): one written again, even only with a comment, is a change the
+    // host refuses.
+    let base = page(&format!("{LINE}\n{KEEP}"), "", &[]);
+    let at = base.windows(9).rposition(|w| w == b"startxref").unwrap();
+    let prev: usize = std::str::from_utf8(&base[at + 9..]).unwrap().split_whitespace().next().unwrap().parse().unwrap();
+    let mut update = base.clone();
+    let offset = update.len();
+    update.extend_from_slice(b"4 0 obj\n");
+    update.extend_from_slice(&stream("", format!("% SECRETWORD\n{LINE}\n{KEEP}").as_bytes()));
+    update.extend_from_slice(b"\nendobj\n");
+    let xref = update.len();
+    update.extend_from_slice(
+        format!(
+            "xref\n0 1\n0000000000 65535 f \n4 1\n{offset:010} 00000 n \ntrailer\n<< /Size 5 /Root 1 0 R /Prev {prev} >>\nstartxref\n{xref}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+    let inspection = inspect(&base, &update, InspectLimits::default()).unwrap();
+    assert_eq!(inspection.content.pages_with_content_changed, 1, "{inspection:?}");
+    // In a rewrite, an operator naming a graphics state or shading the base page did not draw
+    // with counts the page outside its redactions.
+    for (case, content, resources, extra) in [
+        ("a new graphics state", format!("q /GS9 gs Q\n{BLACK}\n{KEEP}"), "/ExtGState << /GS9 << /Type /ExtGState /CA 1 >> >>", vec![]),
+        (
+            "a new shading",
+            format!("q 0 0 0 0 re W n /Sh9 sh Q\n{BLACK}\n{KEEP}"),
+            "/Shading << /Sh9 << /ShadingType 2 /ColorSpace /DeviceGray /Coords [0 0 1 0] /Function << /FunctionType 2 /Domain [0 1] /N 1 >> >> >>",
+            vec![],
+        ),
+    ] {
+        assert!(!passes(&base, &page(&content, resources, &extra)), "{case}");
+    }
+}

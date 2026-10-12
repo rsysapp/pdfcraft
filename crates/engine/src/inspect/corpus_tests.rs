@@ -214,10 +214,101 @@ fn check(name: &str, bytes: &[u8]) -> String {
     line
 }
 
+/// The embed build's session for a save: marks redactions only (R6b-49).
+fn marking(base: &[u8], edits: Vec<Edit>) -> Vec<u8> {
+    let mut session = embed_session();
+    session.set_redaction_marks_only(true);
+    let id = session.open("sample.pdf", None, Arc::new(base.to_vec()), None).unwrap();
+    for edit in edits {
+        session.apply(id, edit).unwrap();
+    }
+    session.save_bytes(id).unwrap().as_ref().clone()
+}
+
+fn shape(page: usize, shape: Shape) -> Edit {
+    Edit::AddAnnotation(NewAnnotation { page, style: Style::default_for(&shape), shape, contents: String::new(), author: "Reviewer".into() })
+}
+
+/// Follow-up 8 (re-review M3): every tool the embed build's permissions open, as a save sends
+/// it (an appended update), each accepted with the facts it should give; and a line marked and
+/// applied on the server (R6b-49), accepted with only the redaction.
+fn check_tools(name: &str, bytes: &[u8]) -> String {
+    let count = run(bytes, bytes).unwrap_or_else(|error| panic!("{name}: {error:?}")).pages.before;
+    let added = |edits: Vec<Edit>| run(bytes, &marking(bytes, edits)).unwrap_or_else(|error| panic!("{name}: {error:?}"));
+    let only = |case: &str, inspection: &Inspection, annotations: AnnotationChanges, pages: PageChanges| {
+        assert!(inspection.base_kept, "{name}, {case}");
+        assert_eq!(inspection.annotations, annotations, "{name}, {case}: {inspection:?}");
+        assert_eq!(inspection.pages, pages, "{name}, {case}: {inspection:?}");
+        assert_eq!((inspection.content.pages_with_content_changed, inspection.form_fields_changed), (0, 0), "{name}, {case}: {inspection:?}");
+        assert!(inspection.info.changed.is_empty() && inspection.marks_with_overlay == 0, "{name}, {case}: {inspection:?}");
+    };
+    let same = PageChanges { before: count, after: count, ..PageChanges::default() };
+    only(
+        "a stamp",
+        &added(vec![shape(0, Shape::Stamp { rect: [20.0, 20.0, 120.0, 60.0], stamp: pdfcraft_annot::StampKind::Approved, by: None })]),
+        AnnotationChanges { stamps: 1, ..AnnotationChanges::default() },
+        same,
+    );
+    for (case, drawing) in [
+        ("ink", Shape::Ink { strokes: vec![vec![[20.0, 20.0], [60.0, 40.0], [90.0, 25.0]]] }),
+        ("a rectangle", Shape::Rectangle { rect: [20.0, 20.0, 80.0, 60.0] }),
+        ("an oval", Shape::Oval { rect: [20.0, 20.0, 80.0, 60.0] }),
+        ("a line", Shape::Line { from: [20.0, 20.0], to: [90.0, 60.0], arrow: true }),
+        ("a polygon", Shape::Polygon { vertices: vec![[20.0, 20.0], [80.0, 20.0], [50.0, 70.0]], cloud: false }),
+        ("a cloud", Shape::Polygon { vertices: vec![[20.0, 20.0], [80.0, 20.0], [50.0, 70.0]], cloud: true }),
+        ("a polyline", Shape::PolyLine { vertices: vec![[20.0, 20.0], [50.0, 50.0], [80.0, 20.0]] }),
+    ] {
+        only(case, &added(vec![shape(0, drawing)]), AnnotationChanges { drawings: 1, ..AnnotationChanges::default() }, same);
+    }
+    let marked =
+        added(vec![shape(0, Shape::Redact { quads: vec![rect_quad([20.0, 20.0, 80.0, 40.0])], overlay: String::new(), look: Default::default() })]);
+    only("a pending mark", &marked, AnnotationChanges { redaction_marks: 1, ..AnnotationChanges::default() }, same);
+    assert_eq!(marked.marked_areas.len(), 1, "{name}");
+    let inserted = added(vec![Edit::InsertBlankPage { at: count as usize, width: 595.0, height: 842.0 }]);
+    assert_eq!(inserted.pages, PageChanges { before: count, after: count + 1, inserted: 1, ..PageChanges::default() }, "{name}: {inserted:?}");
+    let mut line = format!("{name}: tools accepted (stamp, 7 drawings, a mark, a page inserted");
+    if count >= 2 {
+        let deleted = added(vec![
+            shape(1, Shape::Stamp { rect: [20.0, 20.0, 120.0, 60.0], stamp: pdfcraft_annot::StampKind::Draft, by: None }),
+            Edit::DeletePages { pages: vec![0] },
+        ]);
+        assert_eq!((deleted.annotations.stamps, deleted.pages.deleted), (1, 1), "{name}: {deleted:?}");
+        let moved = added(vec![
+            Edit::MovePages { pages: vec![count as usize - 1], to: 0 },
+            shape(0, Shape::Ink { strokes: vec![vec![[20.0, 20.0], [60.0, 40.0]]] }),
+        ]);
+        assert_eq!(moved.annotations.drawings, 1, "{name}: {moved:?}");
+        assert!(moved.pages.moved >= 1, "{name}: {moved:?}");
+        line.push_str(", a stamp then a delete, a move then ink");
+    }
+    // A text field filled.
+    let doc = pdfcraft_cos::Document::open(Arc::new(bytes.to_vec())).unwrap();
+    if let Some(field) = pdfcraft_forms::fields(&doc).into_iter().find(|field| field.kind == pdfcraft_forms::FieldKind::Text) {
+        let filled = added(vec![Edit::SetFieldValue { name: field.name.clone(), value: pdfcraft_forms::FieldValue::Text("Filled".into()) }]);
+        assert_eq!(filled.form_fields_changed, 1, "{name}: {filled:?}");
+        line.push_str(", a field filled");
+    }
+    line.push(')');
+    // A line marked in the browser and applied on the server.
+    if let Some(mut redaction) = redact_line(bytes, 0) {
+        redaction.retain(|edit| !matches!(edit, Edit::ApplyRedactions { .. }));
+        let edited = marking(bytes, redaction);
+        match apply_marks(bytes, &edited, InspectLimits::default()) {
+            Ok(applied) => {
+                assert_eq!(applied.inspection.annotations.redactions_applied, 1, "{name}: {:?}", applied.inspection);
+                line.push_str(&format!("; a line marked and applied on the server: accepted ({} glyphs)", applied.facts.glyphs));
+            }
+            Err(error) => panic!("{name}, a line marked and applied on the server: {error:?}"),
+        }
+    }
+    line
+}
+
 #[test]
 fn the_repository_samples_inspect_clean_and_after_ordinary_edits() {
     for (name, bytes) in REPOSITORY_SAMPLES {
         check(name, bytes);
+        check_tools(name, bytes);
     }
 }
 
@@ -237,5 +328,6 @@ fn samples_in_a_directory() {
         let bytes = std::fs::read(&path).unwrap();
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         println!("{}", check(&name, &bytes));
+        println!("{}", check_tools(&name, &bytes));
     }
 }
