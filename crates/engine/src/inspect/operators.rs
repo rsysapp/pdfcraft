@@ -314,8 +314,9 @@ fn plain_numbers(operands: &[Object]) -> bool {
 /// The operators the redactor writes of its own (`pdfcraft_redact`): the state around what it
 /// clips (`q`, `Q`), the clip that leaves the marks out (`m`, `l`, `h`, `W*`, `n`), the boxes
 /// (`g`, `rg`, `re`, `f`), what it keeps of a line of text (`TJ`, and `Tw`, `Tc`, `T*` for `'`
-/// and `"`), and its copies of forms and images (`Do`).
-const REDACTOR_WRITES: [&[u8]; 16] = [b"q", b"Q", b"m", b"l", b"h", b"W*", b"n", b"g", b"rg", b"re", b"f", b"TJ", b"Tw", b"Tc", b"T*", b"Do"];
+/// and `"`, `Tf` naming a font the content still shows text with in place of one that shows
+/// nothing any more), and its copies of forms and images (`Do`).
+const REDACTOR_WRITES: [&[u8]; 17] = [b"q", b"Q", b"m", b"l", b"h", b"W*", b"n", b"g", b"rg", b"re", b"f", b"TJ", b"Tw", b"Tc", b"T*", b"Tf", b"Do"];
 
 /// What [`walk`] calls with each operator and its operands.
 type Each<'a> = dyn FnMut(&[u8], &[Object]) -> Result<(), Fail> + 'a;

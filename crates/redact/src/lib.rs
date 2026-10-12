@@ -109,7 +109,37 @@ pub struct Report {
     /// Structure elements that lost alternate/actual text or emptied marked content, and (Embed
     /// build) marked-content spans that lost theirs.
     pub tags: usize,
+    /// Embed build (R6b-50): redacted pages whose thumbnail (`/Thumb`, a picture of the page as
+    /// it was) was removed.
+    pub thumbnails: usize,
+    /// Embed build (R6b-50): resource entries the redacted content no longer uses, removed (a
+    /// font used only by removed text, a pattern or shading only painted under a mark, …).
+    pub resources_removed: usize,
+    /// Embed build (R6b-50): document-level copies of the removed words. Bookmark titles
+    /// holding one, now "[Redacted]"; document information entries holding one, removed; the
+    /// document's XMP packet removed (0 or 1); named destinations whose name holds one,
+    /// renamed (with what goes to them).
+    pub bookmarks_cleared: usize,
+    pub information_cleared: usize,
+    pub metadata_removed: usize,
+    pub destinations_renamed: usize,
 }
+
+/// Embed build (P6-33, R6b-50): how marks are applied.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Options {
+    /// Every marked area filled solid black, whatever the mark asks (its fill colour, overlay
+    /// text, repetition and overlay form are ignored, R6b-11): what a host applying marks for a
+    /// save requires.
+    pub black: bool,
+    /// Clear the copies of the removed words elsewhere in the document (see
+    /// [`Report::bookmarks_cleared`]): bookmark titles, document information, the XMP packet,
+    /// named destinations.
+    pub document_copies: bool,
+}
+
+/// Embed build (R6b-50): what ends a run of removed glyphs in the removed text.
+pub(crate) const RUN_END: char = '\u{1}';
 
 fn rect_of(doc: &Document, o: Option<&Object>) -> Option<[f64; 4]> {
     let v: Vec<f64> = doc.resolve(o?).as_array()?.iter().filter_map(|x| doc.resolve(x).as_f64()).collect();
@@ -205,11 +235,16 @@ fn overlay_content(marks: &[&Mark]) -> Vec<u8> {
     let mut c: Vec<u8> = Vec::new();
     for m in marks {
         let Some(fill) = m.fill else { continue };
-        c.extend(format!("q {} {} {} rg\n", n(fill[0]), n(fill[1]), n(fill[2])).bytes());
+        // Embed build: written as the content serializer writes operators, so the server's
+        // self-check finds it canonical.
+        let mut box_ops =
+            vec![pdfcraft_content::Op::new("q", vec![]), pdfcraft_content::Op::new("rg", fill.iter().map(|v| pdfcraft_content::num(*v)).collect())];
         for r in &m.rects {
-            c.extend(format!("{} {} {} {} re f\n", n(r[0]), n(r[1]), n(r[2] - r[0]), n(r[3] - r[1])).bytes());
+            box_ops.push(pdfcraft_content::Op::new("re", [r[0], r[1], r[2] - r[0], r[3] - r[1]].into_iter().map(pdfcraft_content::num).collect()));
+            box_ops.push(pdfcraft_content::Op::new("f", vec![]));
         }
-        c.extend_from_slice(b"Q\n");
+        box_ops.push(pdfcraft_content::Op::new("Q", vec![]));
+        c.extend_from_slice(&pdfcraft_content::serialize_ops(&box_ops));
         if m.overlay.is_empty() {
             continue;
         }
@@ -268,7 +303,18 @@ fn overlay_content(marks: &[&Mark]) -> Vec<u8> {
 /// Apply every redaction mark (or only those on `pages`, 0-based). Irreversible for the saved
 /// file; callers keep the previous document for undo.
 pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, RedactError> {
-    let all_marks = marks(doc);
+    apply_with(doc, pages, Options::default())
+}
+
+/// Embed build: [`apply`], with `options`.
+pub fn apply_with(doc: &mut Document, pages: Option<&[usize]>, options: Options) -> Result<Report, RedactError> {
+    let mut all_marks = marks(doc);
+    if options.black {
+        for mark in &mut all_marks {
+            mark.fill = Some([0.0, 0.0, 0.0]);
+            mark.overlay.clear();
+        }
+    }
     let chosen: Vec<&Mark> = all_marks.iter().filter(|m| pages.is_none_or(|p| p.contains(&m.page))).collect();
     if chosen.is_empty() {
         return Err(RedactError::NothingToApply);
@@ -281,6 +327,9 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
     let mut doomed_fields: Vec<String> = Vec::new();
     let widget_owner: Vec<(ObjRef, String)> =
         pdfcraft_forms::fields(doc).into_iter().flat_map(|f| f.widgets.iter().map(|w| (w.obj, f.name.clone())).collect::<Vec<_>>()).collect();
+    // Embed build (R6b-50): the removed glyphs' text, and every annotation removed.
+    let mut removed_text = String::new();
+    let mut all_removed: Vec<ObjRef> = Vec::new();
 
     for &pi in &by_page {
         let page = pdfcraft_model::pages(doc).swap_remove(pi);
@@ -292,8 +341,14 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
         let resources = page.dict.get(b"Resources").and_then(|r| doc.resolve(r).as_dict().cloned()).unwrap_or_default();
         let out = {
             let mut scope = Scope::new(&rects, Mode::Apply, &mut report);
-            process(doc, &mut scope, &data, &resources, pdfcraft_content::Matrix::IDENTITY)
+            let out = process(doc, &mut scope, &data, &resources, pdfcraft_content::Matrix::IDENTITY);
+            removed_text.push_str(&scope.removed_text);
+            out
         };
+        // Embed build (R6b-50): a pattern cell or soft mask the redactor could not redact.
+        if out.residue > 0 {
+            return Err(RedactError::Residue(out.residue));
+        }
         // Embed build: named property lists whose spans' content changed lose the text standing
         // for it, where they are (R6b-47).
         let resources = match crate::spans::strip_named(doc, &resources, &out.properties)? {
@@ -317,8 +372,14 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
             new_list[i] = Object::Ref(doc.add(Object::Stream(Stream::flate(dict, &bytes))));
             changed = true;
         }
-        if changed || !out.xobjects.is_empty() {
+        if changed || !out.xobjects.is_empty() || !out.patterns.is_empty() || !out.states.is_empty() {
             let mut res = resources;
+            // Embed build (R6b-50): redacted pattern cells and soft masks under their names.
+            interp::set_entries(
+                doc,
+                &mut res,
+                &interp::Output { patterns: out.patterns.clone(), states: out.states.clone(), ..interp::Output::default() },
+            );
             if !out.xobjects.is_empty() || !out.dropped.is_empty() {
                 let mut xo = res.get(b"XObject").and_then(|x| doc.resolve(x).as_dict().cloned()).unwrap_or_default();
                 for (n, r) in &out.xobjects {
@@ -334,6 +395,24 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
                 interp::forget_dropped(&mut xo, &out.dropped, &drawn);
                 res.set(b"XObject".to_vec(), Object::Dict(xo));
             }
+            // Embed build (R6b-50): what the redacted content no longer uses goes (a font used
+            // only by the removed text: its subset and map would spell it out).
+            let new_streams: Vec<Vec<u8>> = list
+                .iter()
+                .zip(&new_list)
+                .zip(&data)
+                .map(|((old, new), data)| {
+                    if old == new {
+                        data.clone()
+                    } else {
+                        match &*doc.resolve(new) {
+                            Object::Stream(stream) => stream.decoded().unwrap_or_default(),
+                            _ => Vec::new(),
+                        }
+                    }
+                })
+                .collect();
+            report.resources_removed += interp::forget_unused(doc, &mut res, &data.join(&b'\n'), &new_streams.join(&b'\n'));
             doc.update_dict(page.obj, |d| {
                 d.set(b"Contents".to_vec(), Object::Array(new_list));
                 d.set(b"Resources".to_vec(), Object::Dict(res));
@@ -348,6 +427,16 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
             // Embed build: and its references into the forms the redaction rewrote (R6b-47).
             report.tags += tags::clean_forms(doc, page.obj, &out.forms)?;
         }
+
+        // Embed build (R6b-50): the page's thumbnail shows it as it was; its private data and
+        // XMP may hold what was removed.
+        let had_thumbnail = doc.get(page.obj).as_dict().is_some_and(|d| d.contains(b"Thumb"));
+        doc.update_dict(page.obj, |d| {
+            for key in [&b"Thumb"[..], b"PieceInfo", b"LastModified", b"Metadata"] {
+                d.remove(key);
+            }
+        })?;
+        report.thumbnails += usize::from(had_thumbnail);
 
         // 2. Annotations: the marks, and whatever lies under them (with their pop-ups).
         let annots = annots_of(doc, &doc.get(page.obj).as_dict().cloned().unwrap_or_default());
@@ -401,7 +490,14 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
         // Embed build: the tags naming a removed annotation lose its text, and the reference
         // (follow-up 7 audit, item 10).
         report.tags += tags::clean_objects(doc, &removed)?;
+        all_removed.extend(removed);
     }
+
+    // Embed build (R6b-50): replies to a removed annotation (`/IRT`, any page), replies to
+    // them, and their pop-ups go too: each would keep it reachable.
+    let replies = remove_threads(doc, &mut all_removed)?;
+    report.annotations += replies.len();
+    report.tags += tags::clean_objects(doc, &replies)?;
 
     // 3. Form fields with a widget under a mark (all their widgets go).
     for name in &doomed_fields {
@@ -441,6 +537,10 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
     if residue > 0 {
         return Err(RedactError::Residue(residue));
     }
+    // Embed build (R6b-50): copies of the removed words elsewhere in the document.
+    if options.document_copies {
+        clear_copies(doc, &removed_words(&removed_text), &mut report)?;
+    }
     // The previous revision still holds the removed content: the next save must rewrite.
     doc.require_full_save();
     Ok(report)
@@ -469,4 +569,238 @@ pub fn clear_marks(doc: &mut Document, pages: Option<&[usize]>) -> Result<usize,
         }
     }
     Ok(doomed.len())
+}
+
+/// Embed build (R6b-50): remove every annotation whose `/IRT` chain reaches one in `removed`
+/// (on any page), and the pop-ups of those removed; `removed` grows with them. Returns those
+/// removed here.
+fn remove_threads(doc: &mut Document, removed: &mut Vec<ObjRef>) -> Result<Vec<ObjRef>, RedactError> {
+    let mut gone: Vec<ObjRef> = Vec::new();
+    let pages = pdfcraft_model::pages(doc);
+    // Until nothing more goes (each pass removes at least one, or stops).
+    loop {
+        let mut more = false;
+        for page in &pages {
+            let current = doc.get(page.obj).as_dict().cloned().unwrap_or_default();
+            let annots = annots_of(doc, &current);
+            let doomed: Vec<ObjRef> = annots
+                .iter()
+                .filter_map(Object::as_ref)
+                .filter(|r| !removed.contains(r))
+                .filter(|r| {
+                    let obj = doc.get(*r);
+                    let dict = obj.as_dict();
+                    let reply = dict.and_then(|d| d.get(b"IRT")).and_then(Object::as_ref).is_some_and(|to| removed.contains(&to));
+                    let popup = dict.is_some_and(|d| d.name(b"Subtype") == Some(b"Popup"))
+                        && dict.and_then(|d| d.get(b"Parent")).and_then(Object::as_ref).is_some_and(|to| removed.contains(&to));
+                    reply || popup
+                })
+                .collect();
+            if doomed.is_empty() {
+                continue;
+            }
+            more = true;
+            let kept: Vec<Object> = annots.into_iter().filter(|a| !a.as_ref().is_some_and(|r| doomed.contains(&r))).collect();
+            doc.update_dict(page.obj, |d| {
+                if kept.is_empty() {
+                    d.remove(b"Annots");
+                } else {
+                    d.set(b"Annots".to_vec(), Object::Array(kept));
+                }
+            })?;
+            for r in doomed {
+                // A pop-up is part of its markup, not counted on its own.
+                if doc.get(r).as_dict().is_some_and(|d| d.name(b"Subtype") != Some(b"Popup")) {
+                    gone.push(r);
+                }
+                removed.push(r);
+            }
+        }
+        if !more {
+            return Ok(gone);
+        }
+    }
+}
+
+/// Embed build (R6b-50): what a copy of the removed text elsewhere could hold: each run of
+/// removed glyphs whole (three characters or more), and each word of it of five characters or
+/// more (shorter words are in too many unrelated titles: "Page" when "Page 4" is redacted),
+/// compared without case.
+pub(crate) fn removed_words(text: &str) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    let mut add = |word: &str, least: usize| {
+        let word = word.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+        if word.chars().filter(|c| c.is_alphanumeric()).count() >= least && !words.contains(&word) {
+            words.push(word);
+        }
+    };
+    for run in text.split(RUN_END) {
+        add(run, 3);
+        for word in run.split(|c: char| !c.is_alphanumeric() && c != '-' && c != '\'') {
+            add(word, 5);
+        }
+    }
+    words
+}
+
+fn holds_word(text: &str, words: &[String]) -> bool {
+    let text = text.to_lowercase();
+    words.iter().any(|word| text.contains(word.as_str()))
+}
+
+/// Embed build (R6b-50): clear the copies of the removed `words` elsewhere in the document:
+/// bookmark titles holding one read "[Redacted]", document information entries holding one go,
+/// the document's XMP packet goes, and named destinations whose name holds one are renamed
+/// (with every destination naming them).
+fn clear_copies(doc: &mut Document, words: &[String], report: &mut Report) -> Result<(), RedactError> {
+    let Some(root) = doc.root() else { return Ok(()) };
+    let mut catalog = doc.get(root).as_dict().cloned().unwrap_or_default();
+    if catalog.remove(b"Metadata").is_some() {
+        report.metadata_removed = 1;
+        doc.set(root, Object::Dict(catalog.clone()));
+    }
+    if words.is_empty() {
+        return Ok(());
+    }
+    // Bookmarks: depth first, bounded.
+    let mut todo: Vec<Object> =
+        catalog.get(b"Outlines").and_then(|o| doc.resolve(o).as_dict().and_then(|d| d.get(b"First").cloned())).into_iter().collect();
+    let mut seen: Vec<ObjRef> = Vec::new();
+    while let Some(entry) = todo.pop() {
+        let Some(r) = entry.as_ref() else { continue };
+        if seen.contains(&r) || seen.len() > 100_000 {
+            continue;
+        }
+        seen.push(r);
+        let Some(item) = doc.get(r).as_dict().cloned() else { continue };
+        if item.get(b"Title").and_then(|t| doc.resolve(t).as_string().map(|s| s.to_text())).is_some_and(|title| holds_word(&title, words)) {
+            doc.update_dict(r, |d| d.set(b"Title".to_vec(), Object::String(pdfcraft_cos::PdfString::text("[Redacted]"))))?;
+            report.bookmarks_cleared += 1;
+        }
+        todo.extend(item.get(b"Next").cloned());
+        todo.extend(item.get(b"First").cloned());
+    }
+    // The document information.
+    if let Some(info) = doc.trailer().get(b"Info").and_then(Object::as_ref)
+        && let Some(dict) = doc.get(info).as_dict().cloned()
+    {
+        let doomed: Vec<Vec<u8>> = dict
+            .iter()
+            .filter(|(_, value)| doc.resolve(value).as_string().is_some_and(|s| holds_word(&s.to_text(), words)))
+            .map(|(key, _)| key.clone())
+            .collect();
+        if !doomed.is_empty() {
+            doc.update_dict(info, |d| {
+                for key in &doomed {
+                    d.remove(key);
+                }
+            })?;
+            report.information_cleared += doomed.len();
+        }
+    }
+    // Named destinations in the catalog's /Dests (by name) and the /Names /Dests tree (by
+    // string): renamed to opaque names, and what names them follows.
+    let mut renames: Vec<(Object, Object)> = Vec::new();
+    if let Some(dests_ref) = catalog.get(b"Dests").cloned()
+        && let Some(mut dests) = doc.resolve(&dests_ref).as_dict().cloned()
+    {
+        let names: Vec<Vec<u8>> = dests.iter().map(|(key, _)| key.clone()).filter(|key| holds_word(&String::from_utf8_lossy(key), words)).collect();
+        for (index, name) in names.into_iter().enumerate() {
+            let fresh = format!("PCRedactedDest{}", report.destinations_renamed + index + 1).into_bytes();
+            if let Some(value) = dests.remove(&name) {
+                dests.set(fresh.clone(), value);
+                renames.push((Object::Name(name), Object::Name(fresh)));
+            }
+        }
+        report.destinations_renamed += renames.len();
+        match dests_ref {
+            Object::Ref(r) => doc.set(r, Object::Dict(dests)),
+            _ => {
+                catalog.set(b"Dests".to_vec(), Object::Dict(dests));
+                doc.set(root, Object::Dict(catalog.clone()));
+            }
+        }
+    }
+    if let Some(tree) = catalog.get(b"Names").and_then(|n| doc.resolve(n).as_dict().cloned()).and_then(|n| n.get(b"Dests").and_then(Object::as_ref)) {
+        rename_in_tree(doc, tree, words, &mut renames, report, 0)?;
+    }
+    if renames.is_empty() {
+        return Ok(());
+    }
+    // Every destination naming a renamed one: links' and bookmarks' /Dest, go-to actions' /D.
+    let numbers: Vec<u32> = doc.object_numbers();
+    for num in numbers {
+        let r = ObjRef::new(num, 0);
+        let Some(dict) = doc.get(r).as_dict().cloned() else { continue };
+        let mut changed = dict.clone();
+        let mut touched = false;
+        for key in [&b"Dest"[..], b"D"] {
+            if let Some(value) = dict.get(key)
+                && let Some((_, fresh)) = renames.iter().find(|(old, _)| old == value)
+            {
+                changed.set(key.to_vec(), fresh.clone());
+                touched = true;
+            }
+        }
+        if let Some(Object::Dict(action)) = dict.get(b"A")
+            && let Some(value) = action.get(b"D")
+            && let Some((_, fresh)) = renames.iter().find(|(old, _)| old == value)
+        {
+            let mut action = action.clone();
+            action.set(b"D".to_vec(), fresh.clone());
+            changed.set(b"A".to_vec(), Object::Dict(action));
+            touched = true;
+        }
+        if touched {
+            doc.set(r, Object::Dict(changed));
+        }
+    }
+    Ok(())
+}
+
+/// The `/Names /Dests` tree's leaves under `node`: a name holding a removed word renamed.
+fn rename_in_tree(
+    doc: &mut Document,
+    node: ObjRef,
+    words: &[String],
+    renames: &mut Vec<(Object, Object)>,
+    report: &mut Report,
+    depth: usize,
+) -> Result<(), RedactError> {
+    if depth > 32 {
+        return Ok(());
+    }
+    let Some(mut dict) = doc.get(node).as_dict().cloned() else { return Ok(()) };
+    if let Some(Object::Array(mut pairs)) = dict.get(b"Names").map(|n| (*doc.resolve(n)).clone()) {
+        let mut touched = false;
+        for pair in pairs.chunks_mut(2) {
+            if let Some(Object::String(name)) = pair.first()
+                && holds_word(&name.to_text(), words)
+            {
+                report.destinations_renamed += 1;
+                let fresh = Object::String(pdfcraft_cos::PdfString::literal(format!("PCRedactedDest{}", report.destinations_renamed).into_bytes()));
+                renames.push((pair[0].clone(), fresh.clone()));
+                pair[0] = fresh;
+                touched = true;
+            }
+        }
+        if touched {
+            // Keys must stay in order for a viewer's lookup: sorted again, with /Limits.
+            let mut sorted: Vec<(Object, Object)> = pairs.chunks(2).filter_map(|p| Some((p.first()?.clone(), p.get(1)?.clone()))).collect();
+            sorted.sort_by(|a, b| a.0.as_string().map(|s| s.bytes.clone()).cmp(&b.0.as_string().map(|s| s.bytes.clone())));
+            if let (Some(first), Some(last)) = (sorted.first().map(|p| p.0.clone()), sorted.last().map(|p| p.0.clone()))
+                && dict.contains(b"Limits")
+            {
+                dict.set(b"Limits".to_vec(), Object::Array(vec![first, last]));
+            }
+            dict.set(b"Names".to_vec(), Object::Array(sorted.into_iter().flat_map(|(k, v)| [k, v]).collect()));
+            doc.set(node, Object::Dict(dict.clone()));
+        }
+    }
+    let kids: Vec<ObjRef> =
+        dict.get(b"Kids").and_then(|k| doc.resolve(k).as_array().map(|a| a.iter().filter_map(Object::as_ref).collect())).unwrap_or_default();
+    for kid in kids {
+        rename_in_tree(doc, kid, words, renames, report, depth + 1)?;
+    }
+    Ok(())
 }

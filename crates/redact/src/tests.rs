@@ -94,7 +94,7 @@ fn glyphs_under_a_mark_go_and_the_rest_stays_put() {
     assert_eq!(under(&mut doc, 0, &[[20.0, 95.0, 40.0, 110.0]]), 0);
     // The mark became a black box drawn into the page; the annotation is gone.
     assert!(marks(&doc).is_empty());
-    assert!(c.contains("0 0 0 rg") && c.contains("20 95 20 15 re f"), "{c}");
+    assert!(c.contains("0 0 0 rg") && c.contains("20 95 20 15 re"), "{c}");
     let doc = reopen(&doc);
     assert!(!content(&doc, 0).contains("1234"));
 }
@@ -776,4 +776,230 @@ fn an_annotation_removed_under_a_mark_takes_its_tags_text_and_reference() {
     assert!(element(9).get(b"Alt").is_none() && element(9).get(b"K").is_none(), "{:?}", element(9));
     assert!(element(8).get(b"Alt").is_none());
     assert!(!written_text(&doc).contains("secret.example"));
+}
+
+// ── Embed build: follow-up 8 (R6b-50), the redactor made complete ────────────────────────────
+
+/// Every byte the document holds once written whole, with each stream's data decoded, so that
+/// names, keys and strings are all searched.
+fn written_bytes(doc: &Document) -> Vec<u8> {
+    let bytes = write_full(doc, &SaveOptions::default()).unwrap();
+    let reopened = Document::open(Arc::new(bytes.clone())).unwrap();
+    let mut out = bytes;
+    for num in reopened.object_numbers() {
+        if let Ok(object) = reopened.try_get(num)
+            && let Object::Stream(stream) = &*object
+            && let Ok(data) = stream.decoded()
+        {
+            out.extend_from_slice(&data);
+        }
+    }
+    out
+}
+
+fn holds(doc: &Document, word: &[u8]) -> bool {
+    written_bytes(doc).windows(word.len()).any(|window| window == word)
+}
+
+const SECRET_LINE: &[u8] = b"BT /F1 10 Tf 10 100 Td (SECRET) Tj ET BT /F1 10 Tf 10 200 Td (Public) Tj ET";
+const OVER_SECRET: [f64; 4] = [5.0, 95.0, 45.0, 110.0];
+
+#[test]
+fn structure_titles_go_with_the_content_they_name() {
+    // Re-review M1: an element's /T was kept.
+    let content = b"/P <</MCID 0>> BDC BT /F1 10 Tf 10 100 Td (SECRET) Tj ET EMC";
+    let mut doc = pdf(vec![
+        b"<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 7 0 R /MarkInfo << /Marked true >> >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /StructParents 0 /Resources << /Font << /F1 5 0 R >> >> >>".to_vec(),
+        stream("", content),
+        FONT.replace("95 0 R", "6 0 R").into_bytes(),
+        widths(),
+        b"<< /Type /StructTreeRoot /K 8 0 R >>".to_vec(),
+        b"<< /S /P /P 7 0 R /Pg 3 0 R /T (SECRET title) /K 0 >>".to_vec(),
+    ]);
+    mark(&mut doc, 0, &[OVER_SECRET], "");
+    apply(&mut doc, None).unwrap();
+    assert!(!holds(&doc, b"SECRET"));
+}
+
+/// A 4 × 4 grey image with a 4 × 4 soft mask and the entries `extra`, drawn over 10–50 × 90–130.
+fn masked_image(extra: &str) -> Document {
+    let image = format!("/Type /XObject /Subtype /Image /Width 4 /Height 4 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 8 0 R {extra}");
+    one_page(
+        b"q 40 0 0 40 10 90 cm /Im Do Q",
+        "/XObject << /Im 7 0 R >>",
+        vec![
+            stream(&image, &[200u8; 16]),
+            stream("/Type /XObject /Subtype /Image /Width 4 /Height 4 /ColorSpace /DeviceGray /BitsPerComponent 8", b"SECRETSECRETSECR"),
+            stream("/Type /Metadata /Subtype /XML", b"<x:xmpmeta>SECRET</x:xmpmeta>"),
+            b"<< /Private (SECRET) >>".to_vec(),
+            stream("/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", b"S"),
+        ],
+    )
+}
+
+#[test]
+fn redacted_copies_keep_nothing_of_their_originals_but_what_shows() {
+    // Re-review I2: a cleared image kept its soft mask whole, its alternates, its XMP and its
+    // private data; a rewritten form kept its XMP and private data.
+    let mut doc = masked_image("/Metadata 9 0 R /PieceInfo << /App 10 0 R >> /Alternates [<< /Image 11 0 R >>] /OPI << /Version (SECRET) >>");
+    // The left half of the image (x 10–30).
+    mark(&mut doc, 0, &[[8.0, 88.0, 30.0, 132.0]], "");
+    let report = apply(&mut doc, None).unwrap();
+    assert_eq!(report.images_cleared, 1);
+    assert!(!holds(&doc, b"SECRET"), "the copy keeps the original's entries or its mask's covered samples");
+    // A form drawing the word, with its XMP and private data.
+    let mut doc = one_page(
+        b"/Fm Do",
+        "/XObject << /Fm 7 0 R >>",
+        vec![
+            stream(
+                "/Type /XObject /Subtype /Form /BBox [0 0 300 300] /Metadata 8 0 R /PieceInfo << /App << /Private (SECRET) >> >> /LastModified (SECRET)",
+                SECRET_LINE,
+            ),
+            stream("/Type /Metadata /Subtype /XML", b"<x:xmpmeta>SECRET</x:xmpmeta>"),
+        ],
+    );
+    mark(&mut doc, 0, &[OVER_SECRET], "");
+    apply(&mut doc, None).unwrap();
+    assert!(!holds(&doc, b"SECRET"));
+}
+
+#[test]
+fn a_redacted_page_loses_its_thumbnail_and_private_data() {
+    // Re-review I3 and I5: the page's /Thumb (a picture of it as it was), its private data and
+    // XMP were kept.
+    let mut doc = pdf(vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> /Thumb 7 0 R /PieceInfo << /App << /Private (SECRET) >> >> /LastModified (D:2020) /Metadata 8 0 R >>".to_vec(),
+        stream("", SECRET_LINE),
+        FONT.replace("95 0 R", "6 0 R").into_bytes(),
+        widths(),
+        stream("/Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", b"S"),
+        stream("/Type /Metadata /Subtype /XML", b"<x:xmpmeta>SECRET</x:xmpmeta>"),
+    ]);
+    mark(&mut doc, 0, &[OVER_SECRET], "");
+    let report = apply(&mut doc, None).unwrap();
+    let page = doc.get(pdfcraft_cos::ObjRef::new(3, 0)).as_dict().cloned().unwrap();
+    for key in [&b"Thumb"[..], b"PieceInfo", b"LastModified", b"Metadata"] {
+        assert!(!page.contains(key), "{}", String::from_utf8_lossy(key));
+    }
+    assert_eq!(report.thumbnails, 1);
+    assert!(!holds(&doc, b"SECRET"));
+}
+
+#[test]
+fn replies_to_a_comment_under_a_mark_go_with_it() {
+    // Re-review I4: a reply elsewhere kept the removed comment reachable through its /IRT.
+    let mut doc = pdf(vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> /Annots [7 0 R 8 0 R 9 0 R 10 0 R 11 0 R] >>".to_vec(),
+        stream("", SECRET_LINE),
+        FONT.replace("95 0 R", "6 0 R").into_bytes(),
+        widths(),
+        b"<< /Type /Annot /Subtype /FreeText /Rect [10 98 40 108] /Contents (SECRET) /DA (/Helv 10 Tf 0 g) /Popup 8 0 R >>".to_vec(),
+        b"<< /Type /Annot /Subtype /Popup /Rect [200 200 280 260] /Parent 7 0 R >>".to_vec(),
+        b"<< /Type /Annot /Subtype /Text /Rect [250 10 270 30] /IRT 7 0 R /Contents (About SECRET) >>".to_vec(),
+        b"<< /Type /Annot /Subtype /Text /Rect [250 40 270 60] /IRT 9 0 R /Contents (Agreed) >>".to_vec(),
+        b"<< /Type /Annot /Subtype /Text /Rect [250 70 270 90] /Contents (Unrelated) >>".to_vec(),
+    ]);
+    mark(&mut doc, 0, &[OVER_SECRET], "");
+    let report = apply(&mut doc, None).unwrap();
+    assert_eq!(report.annotations, 3, "the comment and its thread");
+    let page = doc.get(pdfcraft_cos::ObjRef::new(3, 0)).as_dict().cloned().unwrap();
+    let kept: Vec<Object> = page.get(b"Annots").and_then(Object::as_array).cloned().unwrap_or_default();
+    assert_eq!(kept, vec![Object::Ref(pdfcraft_cos::ObjRef::new(11, 0))]);
+    assert!(!holds(&doc, b"SECRET"));
+}
+
+#[test]
+fn pattern_cells_and_soft_mask_groups_under_a_mark_are_redacted() {
+    // Re-review I1: the redactor never entered a tiling pattern's cell or a soft mask's group.
+    let pattern = "/PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 300 300] /XStep 300 /YStep 300 /Resources << /Font << /F1 5 0 R >> >>";
+    let mut doc = one_page(
+        b"q /Pattern cs /P1 scn 0 0 300 300 re f Q BT /F1 10 Tf 10 200 Td (Public) Tj ET",
+        "/Pattern << /P1 7 0 R >>",
+        vec![stream(pattern, b"BT /F1 10 Tf 10 100 Td (SECRET) Tj ET BT /F1 10 Tf 10 250 Td (Tiles) Tj ET")],
+    );
+    mark(&mut doc, 0, &[OVER_SECRET], "");
+    apply(&mut doc, None).unwrap();
+    assert!(!holds(&doc, b"SECRET"), "a pattern's cell");
+    assert!(holds(&doc, b"Tiles"), "what the cell shows elsewhere stays");
+    let group = "/Type /XObject /Subtype /Form /BBox [0 0 300 300] /Group << /S /Transparency >> /Resources << /Font << /F1 5 0 R >> >>";
+    let mut doc = one_page(
+        b"q /Mask gs 0 g 0 0 300 300 re f Q BT /F1 10 Tf 10 200 Td (Public) Tj ET",
+        "/ExtGState << /Mask << /Type /ExtGState /SMask << /S /Luminosity /G 7 0 R >> >> >>",
+        vec![stream(group, b"1 g BT /F1 10 Tf 10 100 Td (SECRET) Tj ET")],
+    );
+    mark(&mut doc, 0, &[OVER_SECRET], "");
+    apply(&mut doc, None).unwrap();
+    assert!(!holds(&doc, b"SECRET"), "a soft mask's group");
+}
+
+#[test]
+fn a_resource_the_redacted_content_no_longer_uses_goes() {
+    // Re-review M2: a font used only by the removed word stayed, its subset and map spelling it.
+    let mut doc = one_page(
+        b"BT /F2 10 Tf 10 100 Td (SECRET) Tj ET BT /F1 10 Tf 10 200 Td (Public) Tj ET",
+        "/Font << /F1 5 0 R /F2 7 0 R >>",
+        vec![FONT.replace("95 0 R", "6 0 R").replace("/Arial", "/SECRET-Bold").into_bytes()],
+    );
+    mark(&mut doc, 0, &[OVER_SECRET], "");
+    apply(&mut doc, None).unwrap();
+    let page = doc.get(pdfcraft_cos::ObjRef::new(3, 0)).as_dict().cloned().unwrap();
+    let fonts = page
+        .get(b"Resources")
+        .and_then(|r| doc.resolve(r).as_dict().cloned())
+        .and_then(|r| r.get(b"Font").and_then(|f| doc.resolve(f).as_dict().cloned()))
+        .unwrap();
+    assert!(fonts.contains(b"F1") && !fonts.contains(b"F2"), "{fonts:?}");
+    assert!(!holds(&doc, b"SECRET"));
+}
+
+#[test]
+fn copies_of_the_removed_words_elsewhere_in_the_document_are_cleared() {
+    // Re-review I5 (R6b-50): bookmark titles holding a removed word read "[Redacted]", document
+    // information values holding one are cleared, the XMP packet goes, and a named destination
+    // whose name holds one is renamed (with what goes to it).
+    let mut doc = pdf(vec![
+        b"<< /Type /Catalog /Pages 2 0 R /Outlines 7 0 R /Dests << /SECRET-clause [3 0 R /Fit] /Other [3 0 R /Fit] >> /Metadata 9 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> /Annots [11 0 R] >>".to_vec(),
+        stream("", SECRET_LINE),
+        FONT.replace("95 0 R", "6 0 R").into_bytes(),
+        widths(),
+        b"<< /Type /Outlines /First 8 0 R /Last 8 0 R /Count 1 >>".to_vec(),
+        b"<< /Title (The SECRET clause) /Parent 7 0 R /Dest /SECRET-clause >>".to_vec(),
+        stream("/Type /Metadata /Subtype /XML", b"<x:xmpmeta>SECRET</x:xmpmeta>"),
+        b"<< /Title (Public title) /Subject (About SECRET) >>".to_vec(),
+        b"<< /Type /Annot /Subtype /Link /Rect [200 200 250 220] /Dest /SECRET-clause >>".to_vec(),
+    ]);
+    doc.trailer_mut().set(b"Info".to_vec(), Object::Ref(pdfcraft_cos::ObjRef::new(10, 0)));
+    mark(&mut doc, 0, &[OVER_SECRET], "");
+    let report = apply_with(&mut doc, None, Options { black: true, document_copies: true }).unwrap();
+    assert!(!holds(&doc, b"SECRET"));
+    assert!(holds(&doc, b"Public title") && holds(&doc, b"[Redacted]") && holds(&doc, b"Other"));
+    assert_eq!((report.bookmarks_cleared, report.information_cleared, report.metadata_removed, report.destinations_renamed), (1, 1, 1, 1));
+    // The bookmark and the link still go where the name went.
+    let catalog = doc.get(doc.root().unwrap()).as_dict().cloned().unwrap();
+    let dests = catalog.get(b"Dests").and_then(|d| doc.resolve(d).as_dict().cloned()).unwrap();
+    let link = doc.get(pdfcraft_cos::ObjRef::new(11, 0)).as_dict().cloned().unwrap();
+    let renamed = link.get(b"Dest").and_then(Object::as_name).unwrap().to_vec();
+    assert!(dests.contains(&renamed), "{dests:?}");
+}
+
+#[test]
+fn applied_for_a_host_every_area_is_filled_black_and_overlays_are_ignored() {
+    // P6-33: the redactor ignores a mark's overlay entries and fills each area solid black.
+    let mut doc = one_page(SECRET_LINE, "", vec![]);
+    let shape = Shape::Redact { quads: vec![rect_quad(OVER_SECRET)], overlay: "Withheld".into(), look: Default::default() };
+    let mut style = Style::default_for(&shape);
+    style.fill = Some([1.0, 0.0, 0.0]);
+    add_annotation(&mut doc, &NewAnnotation { page: 0, shape, style, contents: String::new(), author: "Tester".into() }, &Meta::default()).unwrap();
+    apply_with(&mut doc, None, Options { black: true, document_copies: false }).unwrap();
+    let c = content(&doc, 0);
+    assert!(c.contains("0 0 0 rg") && !c.contains("1 0 0 rg") && !c.contains("Withheld"), "{c}");
 }

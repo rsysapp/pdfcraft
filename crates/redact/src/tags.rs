@@ -185,7 +185,8 @@ fn kids_of(doc: &Document, element: &Dict) -> Vec<(Object, Object)> {
         .collect()
 }
 
-const STANDS_FOR_CONTENT: [&[u8]; 3] = [b"Alt", b"ActualText", b"E"];
+// Embed build (follow-up 8, R6b-50 M1): an element's title (`/T`) can name what it holds.
+const STANDS_FOR_CONTENT: [&[u8]; 4] = [b"Alt", b"ActualText", b"E", b"T"];
 
 /// Take the text standing for content off `hits` and (Embed build, R6b-47) their ancestors,
 /// whose text stands for their descendants' content too; each once. Returns how many changed.

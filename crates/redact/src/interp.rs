@@ -48,6 +48,9 @@ struct Gs {
     /// Embed build: the font's glyphs cannot be placed (vertical writing, a CMap not read):
     /// text shown with it near a region fails verification.
     unplaceable: bool,
+    /// Embed build (R6b-50): the tiling pattern painting fills and strokes (`scn`/`SCN` with a
+    /// name), whose cell is redacted where it shows under a region.
+    patterns: [Option<Vec<u8>>; 2],
 }
 
 /// What processing a scope produced.
@@ -69,6 +72,11 @@ pub(crate) struct Output {
     pub drawn: Vec<Vec<u8>>,
     /// Embed build: forms rewritten, for the structure tree's references into them (`/Stm`).
     pub forms: Vec<FormRewrite>,
+    /// Embed build (R6b-50): tiling patterns whose cell was redacted, and graphics states whose
+    /// soft mask's group was: (resource name, the redacted copy), to set in the scope's
+    /// resources under the same name.
+    pub patterns: Vec<(Vec<u8>, ObjRef)>,
+    pub states: Vec<(Vec<u8>, Object)>,
 }
 
 /// Embed build: a form XObject the redaction rewrote into a new object.
@@ -108,6 +116,69 @@ pub(crate) fn names_drawn(doc: &Document, ops: &[&Op], xobjects: &Dict) -> std::
     drawn
 }
 
+/// Embed build (R6b-50): the resource names content names, by category (`Font`, `XObject`,
+/// `Pattern`, `Shading`, `ExtGState`, `ColorSpace`, `Properties`), with those the forms it draws
+/// that have no resources of their own (and so look up the same) name, recursively.
+fn names_used(
+    doc: &Document,
+    data: &[u8],
+    resources: &Dict,
+    depth: usize,
+    out: &mut std::collections::HashMap<&'static [u8], std::collections::HashSet<Vec<u8>>>,
+) {
+    let xobjects = res_dict(doc, resources, b"XObject");
+    for op in parse(data).ops {
+        let (category, operand): (&'static [u8], Option<&Object>) = match op.op.as_slice() {
+            b"Tf" => (b"Font", op.operands.first()),
+            b"Do" => (b"XObject", op.operands.first()),
+            b"scn" | b"SCN" => (b"Pattern", op.operands.last()),
+            b"sh" => (b"Shading", op.operands.first()),
+            b"gs" => (b"ExtGState", op.operands.first()),
+            b"cs" | b"CS" => (b"ColorSpace", op.operands.first()),
+            b"BDC" | b"DP" => (b"Properties", op.operands.get(1)),
+            _ => continue,
+        };
+        let Some(name) = operand.and_then(Object::as_name) else { continue };
+        if !out.entry(category).or_default().insert(name.to_vec()) || category != b"XObject" || depth >= MAX_DEPTH {
+            continue;
+        }
+        if let Some(r) = xobjects.get(name).and_then(Object::as_ref)
+            && let Object::Stream(form) = &*doc.get(r)
+            && form.dict.name(b"Subtype") == Some(b"Form")
+            && !form.dict.contains(b"Resources")
+            && let Ok(inner) = form.decoded()
+        {
+            names_used(doc, &inner, resources, depth + 1, out);
+        }
+    }
+}
+
+/// Embed build (R6b-50): remove from `resources` every entry the content `before` named and
+/// the content `after` (the redacted) no longer names: a font used only by the removed text, a
+/// pattern or shading painted only under a mark, … (Entries `before` did not name are left
+/// alone: something else may look them up.) How many went.
+pub(crate) fn forget_unused(doc: &Document, resources: &mut Dict, before: &[u8], after: &[u8]) -> usize {
+    let (mut was, mut is) = (std::collections::HashMap::new(), std::collections::HashMap::new());
+    names_used(doc, before, resources, 0, &mut was);
+    names_used(doc, after, resources, 0, &mut is);
+    let mut gone = 0;
+    for (category, names) in was {
+        let still = is.get(category);
+        let mut dict = res_dict(doc, resources, category);
+        let mut changed = false;
+        for name in names {
+            if !still.is_some_and(|still| still.contains(&name)) && dict.remove(&name).is_some() {
+                gone += 1;
+                changed = true;
+            }
+        }
+        if changed {
+            resources.set(category.to_vec(), Object::Dict(dict));
+        }
+    }
+    gone
+}
+
 /// Embed build: `xobjects` without the `dropped` names `drawn` does not hold. Whether any went.
 pub(crate) fn forget_dropped(xobjects: &mut Dict, dropped: &[Vec<u8>], drawn: &std::collections::HashSet<Vec<u8>>) -> bool {
     let mut gone = false;
@@ -137,6 +208,9 @@ pub(crate) struct Scope<'a> {
     /// outermost first: a name missing from a form's own resources is looked up there, as hayro
     /// does.
     parents: Vec<Dict>,
+    /// Embed build (R6b-50): the text of the glyphs removed, each run of them followed by a
+    /// space (for clearing copies of the removed words elsewhere in the document).
+    pub removed_text: String,
 }
 
 impl<'a> Scope<'a> {
@@ -152,6 +226,7 @@ impl<'a> Scope<'a> {
             used_names: Vec::new(),
             depth: 0,
             parents: Vec::new(),
+            removed_text: String::new(),
         }
     }
 
@@ -286,6 +361,8 @@ struct Glyph {
     /// Advance in unscaled text space (before `Th`).
     advance: f64,
     hit: bool,
+    /// Embed build (R6b-50): its code, for the text removed.
+    code: u32,
 }
 
 /// Process a scope's content streams (state flows from one stream to the next).
@@ -303,6 +380,7 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
         leading: 0.0,
         rise: 0.0,
         unplaceable: false,
+        patterns: [None, None],
     };
     let mut stack: Vec<Gs> = Vec::new();
     let (mut tm, mut tlm) = (Matrix::IDENTITY, Matrix::IDENTITY);
@@ -383,6 +461,17 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
                 let bbox = path_box.take();
                 let clips = std::mem::replace(&mut clip, false);
                 let hit = scope.mode == Mode::Apply && o != b"n" && bbox.is_some_and(|b| scope.hits(b));
+                // Embed build (R6b-50): a tiling pattern painted over a region shows its cell
+                // there: the cell is redacted too (its data would keep what lies under the box).
+                if hit && let Some(b) = bbox {
+                    let fills = matches!(o, b"f" | b"F" | b"f*" | b"B" | b"B*" | b"b" | b"b*");
+                    let strokes = matches!(o, b"S" | b"s" | b"B" | b"B*" | b"b" | b"b*");
+                    for (paints, slot) in [(fills, 0usize), (strokes, 1)] {
+                        if paints && let Some(name) = gs.patterns[slot].clone() {
+                            redact_pattern(doc, scope, &name, resources, ctm, b, &mut out);
+                        }
+                    }
+                }
                 if !hit {
                     ops.extend(body);
                     ops.push(op);
@@ -505,7 +594,8 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
                         b"TJ" => op.operands.first().and_then(Object::as_array).cloned().unwrap_or_default(),
                         _ => op.operands.last().cloned().into_iter().collect(),
                     };
-                    let (new_items, removed) = show(scope, &gs, &mut tm, &items, &mut drift);
+                    let mut removed_text = String::new();
+                    let (new_items, removed) = show(scope, &gs, &mut tm, &items, &mut drift, &mut removed_text);
                     // Embed build: unplaceable glyphs are never removed, only reported (above).
                     let removed = if gs.unplaceable && scope.mode == Mode::Apply { 0 } else { removed };
                     if removed == 0 {
@@ -519,6 +609,16 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
                     }
                     changed = true;
                     scope.report.glyphs += removed;
+                    scope.removed_text.push_str(&removed_text);
+                    scope.removed_text.push(crate::RUN_END);
+                    // Embed build (R6b-50): text filled with a tiling pattern shows its cell.
+                    if let Some(name) = gs.patterns[0].clone() {
+                        let all = scope
+                            .rects
+                            .iter()
+                            .fold([f64::MAX, f64::MAX, f64::MIN, f64::MIN], |u, r| [u[0].min(r[0]), u[1].min(r[1]), u[2].max(r[2]), u[3].max(r[3])]);
+                        redact_pattern(doc, scope, &name, resources, ctm, all, &mut out);
+                    }
                     match o {
                         b"\"" => {
                             ops.push(Op::new("Tw", vec![num(gs.word_spacing)]));
@@ -541,6 +641,19 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
                             changed = true;
                             continue;
                         }
+                    }
+                }
+                // Embed build (R6b-50): which tiling pattern paints, and soft masks' groups.
+                b"scn" | b"SCN" | b"sc" | b"SC" | b"cs" | b"CS" | b"g" | b"G" | b"rg" | b"RG" | b"k" | b"K" => {
+                    let slot = usize::from(o.first().is_some_and(u8::is_ascii_uppercase));
+                    gs.patterns[slot] = match o {
+                        b"scn" | b"SCN" => op.operands.last().and_then(Object::as_name).map(<[u8]>::to_vec),
+                        _ => None,
+                    };
+                }
+                b"gs" if scope.mode == Mode::Apply => {
+                    if let Some(name) = op.name(0) {
+                        redact_soft_mask(doc, scope, name, resources, &gs, &mut out);
                     }
                 }
                 b"sh" if scope.mode == Mode::Apply => {
@@ -575,6 +688,13 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
         }
         rewritten.push((ops, changed));
     }
+    // Embed build (R6b-50): a font left showing nothing (its every glyph removed) gives way to
+    // one the content still shows text with, so it can leave the file: its subset and map
+    // would spell the removed words. What is shown stays where it was: a text displacement
+    // depends on the size alone.
+    if scope.mode == Mode::Apply && rewritten.iter().any(|(_, changed)| *changed) {
+        silence_empty_fonts(&mut rewritten);
+    }
     // Embed build: a span whose glyphs (or anything else) the redaction changed no longer
     // carries text standing for them: its /ActualText, /Alt and /E would spell out the removed
     // words for copying and assistive technology (R6b-47).
@@ -591,10 +711,67 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
     out
 }
 
+/// Embed build (R6b-50): every `Tf` whose font shows only empty strings (as far as the font it
+/// sets is in effect, `q`/`Q` followed) is given the font of another `Tf` that shows text, the
+/// same size; the pieces it changes are marked changed.
+fn silence_empty_fonts(pieces: &mut [(Vec<Op>, bool)]) {
+    let shows = |op: &Op| -> Option<bool> {
+        match op.op.as_slice() {
+            b"Tj" | b"'" | b"\"" => Some(op.operands.last().and_then(Object::as_string).is_some_and(|s| !s.bytes.is_empty())),
+            b"TJ" => Some(
+                op.operands
+                    .first()
+                    .and_then(Object::as_array)
+                    .is_some_and(|items| items.iter().any(|item| item.as_string().is_some_and(|s| !s.bytes.is_empty()))),
+            ),
+            _ => None,
+        }
+    };
+    // Which `Tf` (piece, index) is in effect at each show, and which show text.
+    let mut current: Option<(usize, usize)> = None;
+    let mut stack: Vec<Option<(usize, usize)>> = Vec::new();
+    let mut showing: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+    let mut all: Vec<(usize, usize)> = Vec::new();
+    for (p, (ops, _)) in pieces.iter().enumerate() {
+        for (i, op) in ops.iter().enumerate() {
+            match op.op.as_slice() {
+                b"q" => stack.push(current),
+                b"Q" => current = stack.pop().unwrap_or(current),
+                b"Tf" => {
+                    current = Some((p, i));
+                    all.push((p, i));
+                }
+                _ => {
+                    if shows(op) == Some(true)
+                        && let Some(at) = current
+                    {
+                        showing.insert(at);
+                    }
+                }
+            }
+        }
+    }
+    let donor = all.iter().find(|at| showing.contains(at)).and_then(|(p, i)| pieces.get(*p)?.0.get(*i)?.name(0).map(<[u8]>::to_vec));
+    let Some(donor) = donor else { return };
+    for (p, i) in all {
+        if showing.contains(&(p, i)) {
+            continue;
+        }
+        if let Some((ops, changed)) = pieces.get_mut(p)
+            && let Some(op) = ops.get_mut(i)
+            && op.name(0).is_some_and(|name| name != donor.as_slice())
+            && let Some(first) = op.operands.first_mut()
+        {
+            *first = Object::Name(donor.clone());
+            *changed = true;
+        }
+    }
+}
+
 /// Lay out a shown string (or `TJ` array) glyph by glyph, advancing `tm`. Returns the `TJ`
 /// items with the glyphs under a region replaced by displacements, and how many were removed.
 /// `drift` (Embed build): how many codes of unplaceable text this line showed so far.
-fn show(scope: &Scope<'_>, gs: &Gs, tm: &mut Matrix, items: &[Object], drift: &mut f64) -> (Vec<Object>, usize) {
+fn show(scope: &Scope<'_>, gs: &Gs, tm: &mut Matrix, items: &[Object], drift: &mut f64, removed_text: &mut String) -> (Vec<Object>, usize) {
     let f = &gs.font;
     let size = gs.size;
     let mut out: Vec<Object> = Vec::new();
@@ -645,12 +822,18 @@ fn show(scope: &Scope<'_>, gs: &Gs, tm: &mut Matrix, items: &[Object], drift: &m
                         }
                         None => scope.glyph_hit(b, origin),
                     };
-                    glyphs.push(Glyph { bytes: pos..pos + len, advance, hit });
+                    glyphs.push(Glyph { bytes: pos..pos + len, advance, hit, code });
                     *tm = Matrix::translate(advance * gs.scale, 0.0).then(tm);
                     pos += len;
                 }
                 let mut run: Vec<u8> = Vec::new();
                 for g in &glyphs {
+                    // Embed build (R6b-50): the removed glyphs' text, runs apart.
+                    if g.hit {
+                        removed_text.push_str(f.text_of(g.code).unwrap_or("\u{fffd}"));
+                    } else if !removed_text.ends_with(crate::RUN_END) && !removed_text.is_empty() {
+                        removed_text.push(crate::RUN_END);
+                    }
                     if g.hit {
                         removed += 1;
                         if !run.is_empty() {
@@ -713,7 +896,26 @@ fn xobject(
             }
             match image::clear(doc, s, &gs.ctm, scope.rects) {
                 Ok(None) => None,
-                Ok(Some(new)) => {
+                Ok(Some(mut new)) => {
+                    // Embed build (R6b-50): its soft mask (and a stencil mask) cleared under the
+                    // regions too, at its own resolution; one that cannot be cleared removes
+                    // the image.
+                    for key in [&b"SMask"[..], b"Mask"] {
+                        let Some(mask_ref) = new.dict.get(key).and_then(Object::as_ref) else { continue };
+                        let mask = doc.get(mask_ref);
+                        let Object::Stream(mask) = &*mask else { continue };
+                        match image::clear(doc, mask, &gs.ctm, scope.rects) {
+                            Ok(None) => {}
+                            Ok(Some(cleared)) => {
+                                let cleared = doc.add(Object::Stream(cleared));
+                                new.dict.set(key.to_vec(), Object::Ref(cleared));
+                            }
+                            Err(()) => {
+                                scope.report.images_removed += 1;
+                                return Some(None);
+                            }
+                        }
+                    }
                     let nr = doc.add(Object::Stream(new));
                     let n = fresh_name(scope, xobjects);
                     xobjects.set(n.clone(), Object::Ref(nr));
@@ -788,12 +990,17 @@ fn xobject(
             if scope.mode == Mode::Verify {
                 return None;
             }
-            let new_data = inner.streams.into_iter().next().flatten();
-            if new_data.is_none() && inner.xobjects.is_empty() {
+            let new_data = inner.streams.first().cloned().flatten();
+            if new_data.is_none() && inner.xobjects.is_empty() && inner.patterns.is_empty() && inner.states.is_empty() {
                 return None;
             }
             let mut dict = s.dict.clone();
             dict.remove(b"Length");
+            // Embed build (R6b-50): the copy keeps nothing of the original but what it draws:
+            // not its XMP, an application's private data or its prepress (`/OPI`) data.
+            for key in [&b"Metadata"[..], b"PieceInfo", b"LastModified", b"OPI"] {
+                dict.remove(key);
+            }
             // Embed build: the names the redaction stopped drawing leave the form's resources
             // (with their unredacted originals).
             let mut xo = res_dict(doc, &res, b"XObject");
@@ -802,9 +1009,11 @@ fn xobject(
             }
             let drawn = names_drawn(doc, &parse(new_data.as_deref().unwrap_or(&data)).ops.iter().collect::<Vec<_>>(), &xo);
             let forgotten = forget_dropped(&mut xo, &inner.dropped, &drawn);
-            if own_changed || forgotten || !inner.xobjects.is_empty() {
+            if own_changed || forgotten || !inner.xobjects.is_empty() || !inner.patterns.is_empty() || !inner.states.is_empty() {
                 let mut res = res.clone();
                 res.set(b"XObject".to_vec(), Object::Dict(xo));
+                // Embed build (R6b-50): its redacted patterns and soft masks.
+                set_entries(doc, &mut res, &Output { patterns: inner.patterns.clone(), states: inner.states.clone(), ..Output::default() });
                 dict.set(b"Resources".to_vec(), Object::Dict(res));
             }
             let stream = match &new_data {
@@ -828,6 +1037,188 @@ fn xobject(
             Some(Some(Op::new("Do", vec![Object::Name(n)])))
         }
         _ => None,
+    }
+}
+
+/// The most tiles of a pattern a redaction looks at under one painted area; more is refused
+/// (the redaction is not applied).
+const MAX_TILES: usize = 4_096;
+
+/// Embed build (R6b-50): redact the cell of the tiling pattern `name` (in `resources`, or the
+/// enclosing scopes'), painted over `painted` (user space) while the scope's base matrix is
+/// `base`: the cell's content is processed against the regions under the painted area, moved
+/// into every tile that reaches it, and the copy is set under the same name. Once per name and
+/// scope; too many tiles fails the redaction (residue).
+fn redact_pattern(doc: &mut Document, scope: &mut Scope<'_>, name: &[u8], resources: &Dict, base: Matrix, painted: [f64; 4], out: &mut Output) {
+    if out.patterns.iter().any(|(done, _)| done.as_slice() == name) {
+        return;
+    }
+    let Some(r) = scope.resource(doc, &res_dict(doc, resources, b"Pattern"), b"Pattern", name).and_then(|o| o.as_ref()) else { return };
+    let obj = doc.get(r);
+    let Object::Stream(pattern) = &*obj else { return };
+    if pattern.dict.int(b"PatternType") != Some(1) {
+        return;
+    }
+    let matrix = pattern.dict.get(b"Matrix").and_then(|m| Matrix::from_operands(doc.resolve(m).as_array()?)).unwrap_or_default();
+    let to_user = matrix.then(&base);
+    let cell = pattern.dict.get(b"BBox").and_then(|b| {
+        let v: Vec<f64> = doc.resolve(b).as_array()?.iter().filter_map(Object::as_f64).collect();
+        (v.len() == 4).then(|| [v[0].min(v[2]), v[1].min(v[3]), v[0].max(v[2]), v[1].max(v[3])])
+    });
+    let steps =
+        (pattern.dict.get(b"XStep").and_then(Object::as_f64).map(f64::abs), pattern.dict.get(b"YStep").and_then(Object::as_f64).map(f64::abs));
+    let (Some(cell), (Some(x_step), Some(y_step)), Some(back)) = (cell, steps, to_user.invert()) else {
+        out.residue += 1;
+        return;
+    };
+    if x_step <= 0.0 || y_step <= 0.0 || !x_step.is_finite() || !y_step.is_finite() {
+        out.residue += 1;
+        return;
+    }
+    // The regions under the painted area, and the tiles that reach it.
+    let under: Vec<[f64; 4]> = scope
+        .rects
+        .iter()
+        .filter(|r| overlaps(**r, painted, 0.0))
+        .map(|r| [r[0].max(painted[0]), r[1].max(painted[1]), r[2].min(painted[2]), r[3].min(painted[3])])
+        .collect();
+    let area = back.bbox(painted);
+    let columns = ((area[0] - cell[2]) / x_step).floor() as i64..=((area[2] - cell[0]) / x_step).ceil() as i64;
+    let rows = ((area[1] - cell[3]) / y_step).floor() as i64..=((area[3] - cell[1]) / y_step).ceil() as i64;
+    let count = (columns.end() - columns.start() + 1).max(0).saturating_mul((rows.end() - rows.start() + 1).max(0));
+    if count <= 0 || count as usize > MAX_TILES {
+        out.residue += 1;
+        return;
+    }
+    // Each tile is the cell moved by a whole number of steps: in user space, a translation.
+    let origin = to_user.apply(0.0, 0.0);
+    let mut shifted = Vec::new();
+    for i in columns {
+        for j in rows.clone() {
+            let (x, y) = to_user.apply(i as f64 * x_step, j as f64 * y_step);
+            let (dx, dy) = (x - origin.0, y - origin.1);
+            shifted.extend(under.iter().map(|r| [r[0] - dx, r[1] - dy, r[2] - dx, r[3] - dy]));
+        }
+    }
+    let Ok(data) = pattern.decoded() else {
+        out.residue += 1;
+        return;
+    };
+    let own = pattern.dict.get(b"Resources").and_then(|o| doc.resolve(o).as_dict().cloned()).unwrap_or_default();
+    let mut report = Report::default();
+    let (inner, removed_text) = {
+        let mut cell_scope = Scope::new(&shifted, Mode::Apply, &mut report);
+        cell_scope.parents = scope.parents.clone();
+        cell_scope.parents.push(resources.clone());
+        cell_scope.depth = scope.depth + 1;
+        let inner = process(doc, &mut cell_scope, std::slice::from_ref(&data), &own, to_user);
+        (inner, std::mem::take(&mut cell_scope.removed_text))
+    };
+    scope.removed_text.push_str(&removed_text);
+    merge(scope.report, &report);
+    out.residue += inner.residue;
+    let mut dict = pattern.dict.clone();
+    for key in [&b"Length"[..], b"Filter", b"DecodeParms", b"DL"] {
+        dict.remove(key);
+    }
+    let mut own = own;
+    if !inner.xobjects.is_empty() || !inner.patterns.is_empty() || !inner.states.is_empty() {
+        set_entries(doc, &mut own, &inner);
+        dict.set(b"Resources".to_vec(), Object::Dict(own));
+    }
+    let new_data = inner.streams.into_iter().next().flatten().unwrap_or(data);
+    let nr = doc.add(Object::Stream(Stream::flate(dict, &new_data)));
+    out.patterns.push((name.to_vec(), nr));
+}
+
+/// Embed build (R6b-50): redact the group of the soft mask the graphics state `name` sets, when
+/// the group reaches a region: a copy of the state whose mask's group is processed against the
+/// regions, in the space current when the state is set, set under the same name.
+fn redact_soft_mask(doc: &mut Document, scope: &mut Scope<'_>, name: &[u8], resources: &Dict, gs: &Gs, out: &mut Output) {
+    if out.states.iter().any(|(done, _)| done.as_slice() == name) {
+        return;
+    }
+    let Some(entry) = scope.resource(doc, &res_dict(doc, resources, b"ExtGState"), b"ExtGState", name) else { return };
+    let Some(mut state) = doc.resolve(&entry).as_dict().cloned() else { return };
+    let Some(mut mask) = state.get(b"SMask").and_then(|m| doc.resolve(m).as_dict().cloned()) else { return };
+    let Some(group_ref) = mask.get(b"G").and_then(Object::as_ref) else { return };
+    let obj = doc.get(group_ref);
+    let Object::Stream(group) = &*obj else { return };
+    let matrix = group.dict.get(b"Matrix").and_then(|m| Matrix::from_operands(doc.resolve(m).as_array()?)).unwrap_or_default();
+    let to_user = matrix.then(&gs.ctm);
+    let reaches = group.dict.get(b"BBox").and_then(|b| {
+        let v: Vec<f64> = doc.resolve(b).as_array()?.iter().filter_map(Object::as_f64).collect();
+        (v.len() == 4).then(|| to_user.bbox([v[0].min(v[2]), v[1].min(v[3]), v[0].max(v[2]), v[1].max(v[3])]))
+    });
+    if reaches.is_some_and(|b| !scope.hits(b)) {
+        return;
+    }
+    let Ok(data) = group.decoded() else {
+        out.residue += 1;
+        return;
+    };
+    let own = group.dict.get(b"Resources").and_then(|o| doc.resolve(o).as_dict().cloned()).unwrap_or_default();
+    let rects = scope.rects.to_vec();
+    let mut report = Report::default();
+    let (inner, removed_text) = {
+        let mut group_scope = Scope::new(&rects, Mode::Apply, &mut report);
+        group_scope.parents = scope.parents.clone();
+        group_scope.parents.push(resources.clone());
+        group_scope.depth = scope.depth + 1;
+        let inner = process(doc, &mut group_scope, std::slice::from_ref(&data), &own, to_user);
+        (inner, std::mem::take(&mut group_scope.removed_text))
+    };
+    scope.removed_text.push_str(&removed_text);
+    merge(scope.report, &report);
+    out.residue += inner.residue;
+    let Some(new_data) = inner.streams.first().cloned().flatten() else {
+        if inner.xobjects.is_empty() && inner.patterns.is_empty() && inner.states.is_empty() {
+            return;
+        }
+        out.residue += 1;
+        return;
+    };
+    let mut dict = group.dict.clone();
+    for key in [&b"Length"[..], b"Filter", b"DecodeParms", b"DL", b"Metadata", b"PieceInfo", b"LastModified", b"OPI"] {
+        dict.remove(key);
+    }
+    let mut own = own;
+    set_entries(doc, &mut own, &inner);
+    dict.set(b"Resources".to_vec(), Object::Dict(own));
+    let nr = doc.add(Object::Stream(Stream::flate(dict, &new_data)));
+    mask.set(b"G".to_vec(), Object::Ref(nr));
+    state.set(b"SMask".to_vec(), Object::Dict(mask));
+    out.states.push((name.to_vec(), Object::Dict(state)));
+}
+
+/// Add up what a nested scope removed.
+fn merge(into: &mut Report, from: &Report) {
+    into.glyphs += from.glyphs;
+    into.images_removed += from.images_removed;
+    into.images_cleared += from.images_cleared;
+    into.paths_removed += from.paths_removed;
+    into.paths_clipped += from.paths_clipped;
+    into.forms_rewritten += from.forms_rewritten;
+    into.forms_removed += from.forms_removed;
+    into.tags += from.tags;
+}
+
+/// Embed build (R6b-50): set in `resources` what a scope's processing made: its new XObjects,
+/// and its redacted patterns and graphics states under their names.
+pub(crate) fn set_entries(doc: &Document, resources: &mut Dict, out: &Output) {
+    for (category, entries) in [
+        (&b"XObject"[..], out.xobjects.iter().map(|(n, r)| (n.clone(), Object::Ref(*r))).collect::<Vec<_>>()),
+        (b"Pattern", out.patterns.iter().map(|(n, r)| (n.clone(), Object::Ref(*r))).collect()),
+        (b"ExtGState", out.states.clone()),
+    ] {
+        if entries.is_empty() {
+            continue;
+        }
+        let mut dict = res_dict(doc, resources, category);
+        for (name, value) in entries {
+            dict.set(name, value);
+        }
+        resources.set(category.to_vec(), Object::Dict(dict));
     }
 }
 

@@ -114,5 +114,10 @@ fn decode_and_clear(doc: &Document, s: &Stream, ctm: &Matrix, rects: &[[f64; 4]]
     let mut dict = s.dict.clone();
     dict.remove(b"Length");
     dict.remove(b"DecodeParms");
+    // Embed build (R6b-50): nothing of the original but its samples: not its alternate
+    // versions, XMP, private or prepress data.
+    for key in [&b"Alternates"[..], b"Metadata", b"PieceInfo", b"LastModified", b"OPI"] {
+        dict.remove(key);
+    }
     Some(Some(Stream::flate(dict, &data)))
 }
