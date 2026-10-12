@@ -820,6 +820,65 @@ pub(crate) fn marked_pages_followed(
     Ok(true)
 }
 
+/// The digest a destination naming `name` (a name, or a string) has (see `Reader::encode`).
+fn name_digest(name: &[u8], string: bool) -> Digest {
+    let mut out = vec![if string { b's' } else { b'/' }];
+    out.extend_from_slice(&(name.len() as u64).to_le_bytes());
+    out.extend_from_slice(name);
+    sha256(&[&out])
+}
+
+/// Follow-up 8 (R6b-50): the named destinations a redaction renamed (a name holding a removed
+/// word, written again as `PCRedactedDest` and a number, the destination the same), paired in
+/// order: the edited file's names, and every destination naming them (bookmarks', links'), are
+/// read back as the base's, so the comparisons that follow judge them as unchanged. How many.
+pub(crate) fn rename_destinations(before: &Structure, after: &mut Structure) -> usize {
+    let opaque = |name: &[u8]| name.strip_prefix(b"PCRedactedDest").is_some_and(|digits| !digits.is_empty() && digits.iter().all(u8::is_ascii_digit));
+    let gone: Vec<&NamedKey> = before.named_destinations.keys().filter(|key| !after.named_destinations.contains_key(*key)).collect();
+    let fresh: Vec<NamedKey> =
+        after.named_destinations.keys().filter(|key| !before.named_destinations.contains_key(*key) && opaque(&key.1)).cloned().collect();
+    let mut renames: HashMap<Digest, Digest> = HashMap::new();
+    let mut used: HashSet<usize> = HashSet::new();
+    for new in fresh {
+        let Some(destination) = after.named_destinations.get(&new).cloned() else { continue };
+        let Some((at, old)) = gone
+            .iter()
+            .enumerate()
+            .find(|(at, old)| !used.contains(at) && old.0 == new.0 && before.named_destinations.get(**old) == Some(&destination))
+        else {
+            continue;
+        };
+        used.insert(at);
+        let old = (*old).clone();
+        after.named_destinations.remove(&new);
+        after.named_destinations.insert(old.clone(), destination);
+        for string in [false, true] {
+            renames.insert(name_digest(&new.1, string), name_digest(&old.1, string));
+        }
+    }
+    if renames.is_empty() {
+        return 0;
+    }
+    let back = |destination: &mut Destination| {
+        if let Destination::Named(digest) = destination
+            && let Some(old) = renames.get(digest)
+        {
+            *digest = *old;
+        }
+    };
+    for entry in &mut after.outline {
+        back(&mut entry.destination);
+    }
+    for page in &mut after.pages {
+        for annot in &mut page.annots {
+            if let Some(link) = annot.link.as_mut() {
+                back(link);
+            }
+        }
+    }
+    used.len()
+}
+
 /// Whether `part` is `whole` with some items taken away, the rest in their order.
 fn subsequence<T: PartialEq>(part: &[T], whole: &[T]) -> bool {
     let mut rest = whole.iter();

@@ -251,6 +251,8 @@ impl PdfCraftApp {
         // Embed build: the host refuses any change to the document information and records the
         // edit time itself, so no save of the embed build writes /Info (R6b-45).
         app.session.set_keep_document_information(true);
+        // Embed build (R6b-49): redactions are marked here and applied on the host's server.
+        app.session.set_redaction_marks_only(true);
         // Document scripts never run in view mode: they could open addresses or change fields.
         app.session.set_javascript(false);
         app.default_mode = Mode::Read;

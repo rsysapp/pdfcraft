@@ -1888,6 +1888,9 @@ pub struct Session {
     /// Embed build: saves leave the document information alone
     /// ([`Session::set_keep_document_information`]).
     keep_document_information: bool,
+    /// Embed build (R6b-49): redactions are marked, never applied
+    /// ([`Session::set_redaction_marks_only`]).
+    redaction_marks_only: bool,
 }
 
 /// Lay a dynamic XFA form out (pages and fields) and give its widgets appearances.
@@ -2001,6 +2004,18 @@ impl Session {
 
     pub fn keeps_document_information(&self) -> bool {
         self.keep_document_information
+    }
+
+    /// Embed build (R6b-49): redactions are only marked: applying them (and the sanitising
+    /// rewrites, which remove content as they do) is refused, whatever asks. The host applies
+    /// a save's marks on its server (`inspect::apply_marks`); a rewrite from the browser is
+    /// never accepted. The embed build sets this.
+    pub fn set_redaction_marks_only(&mut self, on: bool) {
+        self.redaction_marks_only = on;
+    }
+
+    pub fn redaction_marks_only(&self) -> bool {
+        self.redaction_marks_only
     }
 
     /// The options every save of this session writes with: `/ModDate` from the clock, unless
@@ -2285,6 +2300,10 @@ impl Session {
 
     /// Apply an edit. On success the previous state is undoable and the view data is refreshed.
     pub fn apply(&mut self, id: DocId, edit: Edit) -> Result<(), EditError> {
+        // Embed build (R6b-49): only the host's server applies redactions.
+        if self.redaction_marks_only && matches!(edit, Edit::ApplyRedactions { .. } | Edit::RemoveHidden { .. } | Edit::Sanitize) {
+            return Err(EditError::ReadOnly("redactions are applied when the document is saved, not here".into()));
+        }
         let now = self.now();
         let today = self.today();
         let js_off = self.js_off;

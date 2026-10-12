@@ -292,6 +292,45 @@ pub(crate) fn check(data: &[u8], base: &ContentBase, budget: &mut Budget) -> Res
     Ok(brought)
 }
 
+/// Follow-up 8 audit (operators): a content stream as the content serializer writes it
+/// (`pdfcraft_content::write_op`), from its operators (a comment, or bytes no operator reads,
+/// left out): what `apply_marks` writes for every content stream it brings, and what its
+/// self-check finds them to be, byte for byte.
+pub(crate) fn canonical(data: &[u8], budget: &mut Budget) -> Result<Vec<u8>, Fail> {
+    let mut out: Vec<u8> = Vec::with_capacity(data.len());
+    walk(data, budget, false, &mut |operator, operands| {
+        write_canonical(operator, operands, &mut out);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// One operator as the content serializer writes it: each operand and a space, the keyword, a
+/// line end; an inline image as `BI`, its entries, ` ID `, its data, a line end and `EI`.
+fn write_canonical(operator: &[u8], operands: &[Object], out: &mut Vec<u8>) {
+    if operator == b"BI" {
+        if let (Some(Object::Dict(dict)), Some(Object::String(image))) = (operands.first(), operands.get(1)) {
+            out.extend_from_slice(b"BI");
+            for (key, value) in dict.iter() {
+                out.push(b' ');
+                pdfcraft_cos::serialize(&Object::Name(key.clone()), out);
+                out.push(b' ');
+                pdfcraft_cos::serialize(value, out);
+            }
+            out.extend_from_slice(b" ID ");
+            out.extend_from_slice(&image.bytes);
+            out.extend_from_slice(b"\nEI\n");
+        }
+        return;
+    }
+    for operand in operands {
+        pdfcraft_cos::serialize(operand, out);
+        out.push(b' ');
+    }
+    out.extend_from_slice(operator);
+    out.push(b'\n');
+}
+
 /// The clip the redactor writes around each mark (`pdfcraft_redact`'s `clip_out`).
 const CLIP: [&[u8]; 12] = [b"m", b"l", b"l", b"l", b"h", b"m", b"l", b"l", b"l", b"h", b"W*", b"n"];
 

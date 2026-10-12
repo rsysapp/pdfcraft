@@ -95,6 +95,7 @@ use std::time::Duration;
 use pdfcraft_cos::{CosError, Document, ObjRef};
 use pdfcraft_render::content::{ContentDocument, ContentError, ContentOpenError, UprightRaster};
 
+mod apply;
 mod glyphs;
 mod images;
 mod jpeg;
@@ -104,6 +105,7 @@ mod outline;
 mod structure;
 mod visual;
 
+pub use apply::{Applied, AppliedFacts, ApplyError, apply_marks};
 use images::{Areas, Images};
 use structure::{Annot, Digest, Glyphs, PageFacts, Structure};
 
@@ -152,11 +154,23 @@ pub struct Inspection {
     /// colour (`/IC`) other than black. The redactor ignores them all and fills every area
     /// black (R6b-11); a host refuses such marks.
     pub marks_with_overlay: u32,
-    /// Follow-up 8 (P6-33), rewrites: form fields gone with every widget under a redaction area
-    /// of a page applied (the redactor removes the fields under a mark). Not counted in
-    /// `form_fields_changed`.
+    /// Follow-up 8 (P6-33), rewrites: form fields gone with every widget wholly under a
+    /// redaction area of a page applied (the redactor removes the fields under a mark). Not
+    /// counted in `form_fields_changed`.
     pub form_fields_removed_by_redaction: u32,
+    /// Follow-up 8 (P6-35), rewrites: one area per quadrilateral (or `/Rect`, without
+    /// `/QuadPoints`) of every base `Redact` mark counted in `annotations.redactions_applied`,
+    /// as (page number in the edited file, from 1; the area in that page's default user space,
+    /// before `/Rotate`, without `/UserUnit`), in the base's page order then the marks' order.
+    /// Each was found filled. A host applying marks checks these against the marks it asked for.
+    pub applied_areas: Vec<(u32, [f32; 4])>,
+    /// Follow-up 8 (P6-35), appended updates: form fields the update changed (filled) whose
+    /// every widget lies wholly under one of the edited file's marks on its page.
+    pub form_fields_under_marks: u32,
 }
+
+/// Areas on pages: (page number, from 1; `[x0, y0, x1, y1]`).
+pub type PageAreas = Vec<(u32, [f32; 4])>;
 
 /// The most marked areas an inspection reports.
 pub const MAX_MARKED_AREAS: usize = 10_000;
@@ -203,9 +217,15 @@ pub struct AnnotationChanges {
     /// Rewrites: base `Redact` marks gone from a page where their area is now uniformly filled.
     pub redactions_applied: u32,
     /// Follow-up 8 (P6-33), rewrites: base annotations (not `Redact` marks) gone from a page
-    /// whose redactions are applied, their `/Rect` reaching into a redaction area of that page
-    /// (the redactor removes what lies under a mark). Not counted in `removed`.
+    /// whose redactions are applied, their `/Rect` wholly inside one of that page's redaction
+    /// areas (within a point; the redactor removes what lies under a mark). Not counted in
+    /// `removed`; one without a `/Rect`, or reaching outside, is.
     pub removed_by_redaction: u32,
+    /// Follow-up 8 (P6-35), appended updates: added stamps, and added drawings (ink, line,
+    /// square, circle, polygon, polyline), whose `/Rect` lies wholly under one of the edited
+    /// file's marks on its page (within a point).
+    pub stamps_under_marks: u32,
+    pub drawings_under_marks: u32,
 }
 
 /// Among pages present in both files, glyph by glyph: a glyph is its name and its place (its em
@@ -349,6 +369,10 @@ pub struct DestinationChanges {
     /// go-to action) followed its page. Their annotation is otherwise unchanged: such a link is
     /// not counted in `annotations.changed`.
     pub links: u32,
+    /// Follow-up 8 (R6b-50), rewrites: named destinations whose name held a word a redaction
+    /// removed, renamed (`PCRedactedDest` and a number) with every destination naming them;
+    /// otherwise unchanged.
+    pub renamed: u32,
 }
 
 /// The page labels (the catalog's `/PageLabels`: what a viewer shows for a page in place of its
@@ -747,7 +771,9 @@ fn compare(base: &[u8], edited: &[u8], limits: Limits) -> Result<Inspection, Ins
     let base_kept = edited.starts_with(base);
     // A rewrite's image placements are compared against its redaction boxes.
     let before = read_side(base, None, !base_kept, &mut budget).map_err(|fail| fail.of(Role::Base))?;
-    let after = read_side(edited, Some((base, &before.structure, base_kept)), !base_kept, &mut budget).map_err(|fail| fail.of(Role::Edited))?;
+    let mut after = read_side(edited, Some((base, &before.structure, base_kept)), !base_kept, &mut budget).map_err(|fail| fail.of(Role::Edited))?;
+    // Follow-up 8 (R6b-50): named destinations the redactor renamed are read as the base's.
+    let renamed = if base_kept { 0 } else { structure::rename_destinations(&before.structure, &mut after.structure) };
     if let Some(key) = structure::catalog_change(&before.structure, &after.structure, base_kept) {
         return Err(InspectError::Edited(format!("the document's /{key} changed, which this comparison does not report")));
     }
@@ -819,6 +845,7 @@ fn compare(base: &[u8], edited: &[u8], limits: Limits) -> Result<Inspection, Ins
         outline::compare(&before.structure.outline, &after.structure.outline, outline_pairs, &followed, &mut budget).map_err(edited_fail)?;
     inspection.destinations.named =
         outline::named(&before.structure.named_destinations, &after.structure.named_destinations, &followed, &mut budget).map_err(edited_fail)?;
+    inspection.destinations.renamed = count(renamed);
     // The document's layer configuration decides what every page shows.
     let layers_changed = before.structure.layers != after.structure.layers;
     // Follow-up 8 (P6-33): every area the edited file's marks mark, and those with overlays.
@@ -857,8 +884,21 @@ fn compare(base: &[u8], edited: &[u8], limits: Limits) -> Result<Inspection, Ins
     };
     inspection.form_fields_removed_by_redaction = count(redacted.len());
     inspection.form_fields_changed = fields_changed(&before.structure, &after.structure, &redacted);
+    // Follow-up 8 (P6-35): fields an update fills wholly under its own marks.
+    if base_kept {
+        let marked = marks_by_page(&after.structure);
+        let filled =
+            after.structure.fields.iter().filter(|(name, digest)| before.structure.fields.get(*name) != Some(*digest)).filter(|(name, _)| {
+                let places = after.structure.field_places.get(*name).map(Vec::as_slice).unwrap_or_default();
+                !places.is_empty()
+                    && places.iter().all(|(page, rect)| {
+                        rect.is_some_and(|rect| within_area(&rect, u32::try_from(page.saturating_add(1)).unwrap_or(u32::MAX), &marked))
+                    })
+            });
+        inspection.form_fields_under_marks = count(filled.count());
+    }
     inspection.redaction_areas.sort_by(|(page_a, a), (page_b, b)| page_a.cmp(page_b).then(b[3].total_cmp(&a[3])).then(a[0].total_cmp(&b[0])));
-    (inspection.annotations, inspection.destinations.links) =
+    (inspection.annotations, inspection.destinations.links, inspection.applied_areas) =
         compare_annotations(&before, &after, &pairs, base_kept, &outside_pages, &inspection.redaction_areas.clone(), &mut budget, &mut rasters)?;
     if let Some(message) = after.unreached {
         return Err(InspectError::Edited(message));
@@ -2413,18 +2453,35 @@ fn annotations_in_order(base: &PageFacts, edited: &PageFacts, base_kept: bool) -
     common(base, &in_edited) == common(edited, &in_base)
 }
 
-/// Whether `rect` reaches into one of `areas` (on page `page`, from 1).
-fn reaches_area(rect: &[f64; 4], page: u32, areas: &[(u32, [f32; 4])]) -> bool {
+/// Whether `rect` lies wholly inside one of `areas` on page `page` (from 1), within a point
+/// (follow-up 8 audit: what only reaches into an area was not under the mark).
+fn within_area(rect: &[f64; 4], page: u32, areas: &[(u32, [f32; 4])]) -> bool {
+    const SLACK: f64 = 1.0;
     areas.iter().any(|(on, area)| {
         *on == page
-            && rect[2].min(f64::from(area[2])) > rect[0].max(f64::from(area[0]))
-            && rect[3].min(f64::from(area[3])) > rect[1].max(f64::from(area[1]))
+            && rect[0] >= f64::from(area[0]) - SLACK
+            && rect[1] >= f64::from(area[1]) - SLACK
+            && rect[2] <= f64::from(area[2]) + SLACK
+            && rect[3] <= f64::from(area[3]) + SLACK
     })
 }
 
+/// Follow-up 8 (P6-35): the edited file's marks' areas, by page (from 1).
+fn marks_by_page(after: &Structure) -> Vec<(u32, [f32; 4])> {
+    let mut areas = Vec::new();
+    for (index, page) in after.pages.iter().enumerate() {
+        for annot in page.annots.iter().filter(|annot| annot.subtype == b"Redact") {
+            for area in &annot.areas {
+                areas.push((u32::try_from(index.saturating_add(1)).unwrap_or(u32::MAX), area.map(|value| value as f32)));
+            }
+        }
+    }
+    areas
+}
+
 /// Follow-up 8 (P6-33): the base's terminal fields the edited file no longer has whose every
-/// widget lay on a page present in both files, not counted outside its redactions, and reached
-/// into one of its redaction areas.
+/// widget lay on a page present in both files, not counted outside its redactions, wholly
+/// inside one of its redaction areas.
 fn fields_under_areas(
     before: &Structure,
     after: &Structure,
@@ -2443,7 +2500,7 @@ fn fields_under_areas(
                 && places.iter().all(|(page, rect)| {
                     let Some(new) = followed.get(page).copied() else { return false };
                     !outside.contains(&new)
-                        && rect.is_some_and(|rect| reaches_area(&rect, u32::try_from(new.saturating_add(1)).unwrap_or(u32::MAX), areas))
+                        && rect.is_some_and(|rect| within_area(&rect, u32::try_from(new.saturating_add(1)).unwrap_or(u32::MAX), areas))
                 })
         })
         .cloned()
@@ -2486,6 +2543,8 @@ struct AnnotationContext<'s> {
     gone: std::cell::RefCell<BTreeSet<ObjRef>>,
     /// The redaction areas (see [`Inspection::redaction_areas`]).
     areas: &'s [(u32, [f32; 4])],
+    /// See [`Inspection::applied_areas`].
+    applied: std::cell::RefCell<Vec<(u32, [f32; 4])>>,
 }
 
 impl AnnotationContext<'_> {
@@ -2514,6 +2573,8 @@ impl AnnotationContext<'_> {
             let (base_raster, edited_raster) = rasters.get(self.before, self.after, pair, budget)?;
             if annot.areas.iter().all(|area| visual::area_filled(&base_raster, &edited_raster, *area)) {
                 changes.redactions_applied = changes.redactions_applied.saturating_add(1);
+                let page = u32::try_from(pair.1.saturating_add(1)).unwrap_or(u32::MAX);
+                self.applied.borrow_mut().extend(annot.areas.iter().map(|area| (page, area.map(|value| value as f32))));
                 return Ok(());
             }
         }
@@ -2522,7 +2583,7 @@ impl AnnotationContext<'_> {
             && annot.subtype != b"Redact"
             && let Some((_, new)) = pair
             && !self.outside_pages.contains(&new)
-            && annot.rect.is_some_and(|rect| reaches_area(&rect, u32::try_from(new.saturating_add(1)).unwrap_or(u32::MAX), self.areas))
+            && annot.rect.is_some_and(|rect| within_area(&rect, u32::try_from(new.saturating_add(1)).unwrap_or(u32::MAX), self.areas))
         {
             changes.removed_by_redaction = changes.removed_by_redaction.saturating_add(1);
             return Ok(());
@@ -2543,8 +2604,16 @@ fn compare_annotations(
     areas: &[(u32, [f32; 4])],
     budget: &mut Budget,
     rasters: &mut Rasters,
-) -> Result<(AnnotationChanges, u32), InspectError> {
-    let context = AnnotationContext { before, after, base_kept, outside_pages, gone: std::cell::RefCell::new(BTreeSet::new()), areas };
+) -> Result<(AnnotationChanges, u32, PageAreas), InspectError> {
+    let context = AnnotationContext {
+        before,
+        after,
+        base_kept,
+        outside_pages,
+        gone: std::cell::RefCell::new(BTreeSet::new()),
+        areas,
+        applied: std::cell::RefCell::new(Vec::new()),
+    };
     let mut changes = AnnotationChanges::default();
     let mut links = 0u32;
     let to_edited: HashMap<usize, usize> = pairs.iter().copied().collect();
@@ -2620,13 +2689,32 @@ fn compare_annotations(
             }
         }
     }
-    for (id, (_, annot)) in &edited_by_id {
+    // Follow-up 8 (P6-35): what an update adds wholly under its own marks.
+    let marked = if base_kept { marks_by_page(&after.structure) } else { Vec::new() };
+    let under = |changes: &mut AnnotationChanges, index: usize, annot: &Annot| {
+        let page = u32::try_from(index.saturating_add(1)).unwrap_or(u32::MAX);
+        if !base_kept || !annot.rect.is_some_and(|rect| within_area(&rect, page, &marked)) {
+            return;
+        }
+        match annot.subtype.as_slice() {
+            b"Stamp" => changes.stamps_under_marks = changes.stamps_under_marks.saturating_add(1),
+            b"Ink" | b"Line" | b"Square" | b"Circle" | b"Polygon" | b"PolyLine" => {
+                changes.drawings_under_marks = changes.drawings_under_marks.saturating_add(1);
+            }
+            _ => {}
+        }
+    };
+    for (id, (index, annot)) in &edited_by_id {
         if !seen.contains(id) {
             add_kind(&mut changes, &annot.subtype);
+            under(&mut changes, *index, annot);
         }
     }
-    for annot in by_content.values().flatten() {
-        add_kind(&mut changes, &annot.subtype);
+    for (index, annots) in &by_content {
+        for annot in annots {
+            add_kind(&mut changes, &annot.subtype);
+            under(&mut changes, *index, annot);
+        }
     }
     // Follow-up 7 audit (item 10): what stands for an annotation a rewrite took away goes too.
     if !base_kept
@@ -2637,11 +2725,13 @@ fn compare_annotations(
             "the structure tree keeps text standing for an annotation the rewrite took away, which this comparison does not report".into(),
         ));
     }
-    Ok((changes, links))
+    Ok((changes, links, context.applied.into_inner()))
 }
 
 #[cfg(test)]
 mod agreement_tests;
+#[cfg(test)]
+mod apply_tests;
 #[cfg(test)]
 mod conformance_tests;
 #[cfg(test)]

@@ -2127,3 +2127,31 @@ fn comments_without_appearances_are_drawn_but_not_saved() {
         assert!(reopened.get(r).as_dict().is_some_and(|d| !d.contains(b"AP")), "{r:?} is saved without /AP");
     }
 }
+
+#[test]
+fn a_marks_only_session_never_applies_redactions() {
+    // Embed build (R6b-49): the embed build's session marks redactions and refuses to apply
+    // them (or to sanitise, which removes content as applying does), even outside view mode.
+    let mut session = Session::new();
+    session.set_redaction_marks_only(true);
+    let id = session.open("a.pdf", None, std::sync::Arc::new(fixture(1)), None).unwrap();
+    let mark = Shape::Redact { quads: vec![crate::rect_quad([10.0, 10.0, 60.0, 30.0])], overlay: String::new(), look: Default::default() };
+    session
+        .apply(
+            id,
+            Edit::AddAnnotation(NewAnnotation {
+                page: 0,
+                style: Style::default_for(&mark),
+                shape: mark,
+                contents: String::new(),
+                author: "A".into(),
+            }),
+        )
+        .unwrap();
+    for edit in [Edit::ApplyRedactions { pages: None }, Edit::Sanitize, Edit::RemoveHidden { which: vec![] }] {
+        assert!(matches!(session.apply(id, edit), Err(EditError::ReadOnly(_))));
+    }
+    // The mark stays a mark: the save is an appended update.
+    let saved = session.save_bytes(id).unwrap();
+    assert!(saved.starts_with(&fixture(1)));
+}

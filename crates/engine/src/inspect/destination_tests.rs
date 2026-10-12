@@ -425,7 +425,7 @@ fn named_destinations_follow_their_pages() {
         ];
         for (case, edits, followed, deleted) in cases {
             let inspection = run(&base, &session(&base, edits)).unwrap_or_else(|error| panic!("{form}, {case}: {error:?}"));
-            assert_eq!(inspection.destinations, DestinationChanges { named: followed, links: 0 }, "{form}, {case}: {inspection:?}");
+            assert_eq!(inspection.destinations, DestinationChanges { named: followed, links: 0, renamed: 0 }, "{form}, {case}: {inspection:?}");
             assert_eq!(inspection.pages.deleted, deleted, "{form}, {case}");
             assert_eq!(inspection.content, ContentChanges::default(), "{form}, {case}: {inspection:?}");
         }
@@ -477,7 +477,7 @@ fn a_redaction_and_a_page_delete_on_a_file_with_named_destinations_are_accepted(
             }
             let inspection = run(&base, &session(&base, edits)).unwrap_or_else(|error| panic!("{form}, {case}: {error:?}"));
             assert_eq!(inspection.pages, PageChanges { before: 4, after: 3, deleted: 1, ..PageChanges::default() }, "{form}, {case}: {inspection:?}");
-            assert_eq!(inspection.destinations, DestinationChanges { named: 4, links: 0 }, "{form}, {case}: {inspection:?}");
+            assert_eq!(inspection.destinations, DestinationChanges { named: 4, links: 0, renamed: 0 }, "{form}, {case}: {inspection:?}");
             assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{form}, {case}: {inspection:?}");
             assert_eq!(inspection.redaction_areas.len(), redacted.len(), "{form}, {case}: {inspection:?}");
         }
@@ -530,7 +530,7 @@ fn links_follow_their_pages() {
         ];
         for (case, edits, followed) in cases {
             let inspection = run(&base, &session(&base, edits)).unwrap_or_else(|error| panic!("{form}, {case}: {error:?}"));
-            assert_eq!(inspection.destinations, DestinationChanges { named: 0, links: followed }, "{form}, {case}: {inspection:?}");
+            assert_eq!(inspection.destinations, DestinationChanges { named: 0, links: followed, renamed: 0 }, "{form}, {case}: {inspection:?}");
             assert_eq!(inspection.annotations.changed, 0, "{form}, {case}: {inspection:?}");
             assert_eq!(inspection.annotations.removed, 0, "{form}, {case}: {inspection:?}");
         }
@@ -790,7 +790,7 @@ fn destinations_that_give_their_page_by_number_follow_it() {
     };
     let inspection = run(&base, &follow("[1 /Fit]")).unwrap();
     assert_eq!(inspection.pages.deleted, 1, "{inspection:?}");
-    assert_eq!(inspection.destinations, DestinationChanges { named: 1, links: 1 }, "{inspection:?}");
+    assert_eq!(inspection.destinations, DestinationChanges { named: 1, links: 1, renamed: 0 }, "{inspection:?}");
     assert_eq!(inspection.outlines.destinations_changed, 1, "{inspection:?}");
     // Left on its number, or named by reference instead: not following its page by number.
     assert!(refused(run(&base, &follow("[2 /Fit]"))).contains("destination"));

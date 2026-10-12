@@ -470,3 +470,11 @@ fn the_embedded_session_never_writes_the_document_information() {
     assert!(h.state().session.keeps_document_information());
     assert!(!pdfcraft_ui_egui::PdfCraftApp::new().session.keeps_document_information());
 }
+
+#[test]
+fn the_embedded_session_never_applies_redactions() {
+    // R6b-49: the embed build marks redactions; only the host's server applies them.
+    let (h, _bridge) = embedded();
+    assert!(h.state().session.redaction_marks_only());
+    assert!(!pdfcraft_ui_egui::PdfCraftApp::new().session.redaction_marks_only());
+}
