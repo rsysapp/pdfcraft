@@ -174,14 +174,22 @@ fn read_name(bytes: &[u8]) -> Reading {
     if bytes.iter().all(|byte| (0x21..0x7F).contains(byte)) { Reading::Read(String::from_utf8_lossy(bytes).into_owned()) } else { Reading::Unread }
 }
 
-/// Case and diacritics folded (after NFKC): decomposed, marks and what is not shown taken out,
-/// lower case, ß as ss.
+/// Case and diacritics folded (after NFKC and the format strip): case folded, then decomposed
+/// and the marks taken out.
 fn fold_case(text: &str) -> String {
-    text.nfd()
-        .filter(|c| !unicode_normalization::char::is_combining_mark(*c) && !invisible(*c))
+    // Case first (full folding: ß and ẞ as ss, a final sigma as σ, İ as i and its dot), then the
+    // diacritics (the decomposed marks, a dot case folding gave among them), then anything the
+    // folding left that is not shown.
+    let cased: String = text
+        .chars()
         .flat_map(char::to_lowercase)
-        .flat_map(|c| if c == 'ß' { vec!['s', 's'] } else { vec![c] })
-        .collect()
+        .flat_map(|c| match c {
+            'ß' => vec!['s', 's'],
+            'ς' => vec!['σ'],
+            other => vec![other],
+        })
+        .collect();
+    cased.nfd().filter(|c| !unicode_normalization::char::is_combining_mark(*c) && !invisible(*c)).collect()
 }
 
 /// NFKC, format characters out: before folding.
@@ -241,7 +249,10 @@ impl Removed {
         for run in text.split(RUN_END) {
             let run = prepared(run);
             let mut run_pieces: Vec<String> = Vec::new();
-            for raw in run.split(|c: char| !c.is_alphanumeric()).filter(|word| !word.is_empty()) {
+            // Split where the candidate side splits once folded: at what is neither a letter or
+            // digit nor a mark or a character folded out.
+            let joins = |c: char| c.is_alphanumeric() || unicode_normalization::char::is_combining_mark(c) || invisible(c);
+            for raw in run.split(|c: char| !joins(c)).filter(|word| !word.is_empty()) {
                 let capitalised = raw.chars().next().is_some_and(char::is_uppercase);
                 let folded = fold_case(raw);
                 for word in words(&folded) {
@@ -830,6 +841,16 @@ mod tests {
         ("\u{3231}Andi", "Andi", true),
         ("Andi\u{b2}", "Andi2", true),
         ("Pro\u{fb01}t", "Profit", true),
+        ("\u{fb01}nal", "FINAL", true),
+        ("Stra\u{df}e", "STRASSE", true),
+        ("STRA\u{1e9e}E", "strasse", true),
+        ("\u{130}stanbul", "istanbul", true),
+        ("\u{39f}\u{394}\u{39f}\u{3a3}", "\u{3bf}\u{3b4}\u{3bf}\u{3c2}", true),
+        ("\u{3bf}\u{3b4}\u{3bf}\u{3c2}", "\u{39f}\u{394}\u{39f}\u{3a3}", true),
+        ("Ma\u{331}ria", "Maria", true),
+        ("Maria", "Ma\u{331}ria", true),
+        ("\u{301}Andi", "Andi", true),
+        ("Andi", "\u{ff21}\u{ff2e}\u{ff24}\u{ff29}", true),
         // Names that are also function words, as names.
         ("Dan", "Meeting with Dan", true),
         ("Ada", "Ada Lovelace notes", true),
@@ -863,6 +884,18 @@ mod tests {
         ("Andi\u{b2}", "andi2"),
         ("Andi\u{a0}Wijaya", "andi wijaya"),
         ("\u{1e9e}", "ss"),
+        // The order pinned (R6b-56): NFKC before folding, the format strip, case then diacritics.
+        ("\u{fb01}nal", "final"),
+        ("STRA\u{1e9e}E", "strasse"),
+        ("Stra\u{df}e", "strasse"),
+        ("\u{130}stanbul", "istanbul"),
+        ("\u{39f}\u{394}\u{39f}\u{3a3}", "\u{3bf}\u{3b4}\u{3bf}\u{3c3}"),
+        ("\u{3bf}\u{3b4}\u{3bf}\u{3c2}", "\u{3bf}\u{3b4}\u{3bf}\u{3c3}"),
+        ("\u{ff33}\u{ff25}\u{ff23}\u{ff32}\u{ff25}\u{ff34}", "secret"),
+        ("\u{301}Andi", "andi"),
+        ("Andi\u{301}", "andi"),
+        ("Ma\u{331}ria", "maria"),
+        ("A\u{ad}n\u{200b}d\u{2060}i", "andi"),
     ];
 
     #[test]
