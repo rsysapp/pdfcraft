@@ -64,6 +64,12 @@
 //!   object it lists (but for its own cross-reference stream and null objects) is reached from
 //!   the trailer's `/Root` or `/Info` through references, an object stream through what it
 //!   holds (R6b-48);
+//! - the page tree reads alike in every viewer (R6b-51): in both files every page's and node's
+//!   `/Parent` is the node listing it (PDFium and pdf.js inherit through `/Parent`, hayro and this
+//!   reader along the path walked) and the root has none; the nodes' own entries (other than
+//!   their kids, count, parent, type and inherited attributes) may not change; and each
+//!   marked-content kid of the structure tree stays on its page (`/Pg`), followed through the
+//!   pages' pairing;
 //! - work is bounded (pages, decoded bytes, hashed bytes, rendered pixels, nesting, a deadline),
 //!   and exceeding a bound is [`InspectError::TooComplex`].
 
@@ -695,6 +701,10 @@ fn compare(base: &[u8], edited: &[u8], limits: Limits) -> Result<Inspection, Ins
     if before.structure.name_tree_keys != after.structure.name_tree_keys {
         return Err(InspectError::Edited("an entry of the named destinations' tree changed, which this comparison does not report".into()));
     }
+    // Follow-up 8 (R6b-51, M5): page tree nodes' own entries, which no viewer draws.
+    if before.structure.page_tree_entries != after.structure.page_tree_entries {
+        return Err(InspectError::Edited("an entry of a page tree node changed, which this comparison does not report".into()));
+    }
     // The structure tree: an appended update leaves it as it was; a rewrite may only take text
     // and marked content away from it (a redaction cleans the tags of what it removed), element
     // by element (R6b-44), never add, change or move text, nor change anything else in it.
@@ -725,6 +735,12 @@ fn compare(base: &[u8], edited: &[u8], limits: Limits) -> Result<Inspection, Ins
     };
     let pairs =
         match_pages(&before.structure.pages, &after.structure.pages, &mut inspection.pages, &votes, &mut thumbs, &mut budget).map_err(edited_fail)?;
+    // Follow-up 8 (R6b-51, I2): the structure tree's marked content stays on its page.
+    if !structure::marked_pages_followed(&before.structure, &after.structure, &pairs, base_kept, &mut budget).map_err(edited_fail)? {
+        return Err(InspectError::Edited(
+            "the structure tree's marked content names another page (/Pg) than its page, which this comparison does not report".into(),
+        ));
+    }
     // Destinations are judged through the pages' pairing: one may follow its page, nothing more.
     let followed: BTreeMap<usize, usize> = pairs.iter().copied().collect();
     // R6b-43: a destination giving its page by number that no destination rule resolves (one

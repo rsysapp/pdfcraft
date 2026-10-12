@@ -2024,3 +2024,119 @@ fn text_added_outside_the_boxes_is_no_redaction() {
     // (A mark's overlay label is text added too: such a page was already outside its
     // redactions, the label breaking the box's uniform fill.)
 }
+
+// ── follow-up 8 (R6b-51): the page tree and the structure tree's pages ──────────────────────
+
+/// Two pages under node 2 (which gives page 1 its box, rotation and Helvetica): page 3 draws
+/// "Alpha" and names `parent` its parent; page 4 has its own box, rotation and Courier. `node`
+/// adds entries to node 2.
+fn two_under_one(parent: &str, node: &str) -> Vec<u8> {
+    let mut b = Builder::new();
+    b.object(1, b"<< /Type /Catalog /Pages 2 0 R >>");
+    b.object(2, format!("<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 200 300] /Rotate 0 {RESOURCES} {node} >>").as_bytes());
+    b.object(3, format!("<< /Type /Page /Parent {parent} /Contents 5 0 R >>").as_bytes());
+    b.object(
+        4,
+        b"<< /Type /Page /Parent 2 0 R /Contents 6 0 R /Rotate 90 /MediaBox [0 0 400 100] /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Courier >> >> >> >>",
+    );
+    b.object(5, &stream("", &text("Alpha")));
+    b.object(6, &stream("", b"BT /F1 12 Tf 20 50 Td (Bravo) Tj ET"));
+    let rows = b.offsets.clone();
+    b.finish(7, &rows, "")
+}
+
+#[test]
+fn a_page_whose_parent_is_not_the_node_listing_it_is_refused() {
+    // Re-review C1: PDFium and pdf.js inherit through a page's own /Parent; a page naming
+    // another page as its parent showed page 1 rotated, at 400 × 100, in Courier there, and
+    // was accepted with every fact zero.
+    let base = two_under_one("2 0 R", "");
+    assert_eq!(inspect(&base, &base, InspectLimits::default()).unwrap().pages.rotated, 0);
+    let update = update_section(&base, &[(3, b"<< /Type /Page /Parent 4 0 R /Contents 5 0 R >>")], Some(last_section(&base)), "");
+    for (case, edited) in [("an appended update", update), ("a rewrite", two_under_one("4 0 R", ""))] {
+        let message = refused_against(&base, &edited);
+        assert!(message.contains("/Parent"), "{case}: {message}");
+    }
+    // An intermediate node naming another parent, and a root naming one.
+    let nested = |inner_parent: &str, root: &str| {
+        let mut b = Builder::new();
+        b.object(1, b"<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, format!("<< /Type /Pages /Kids [7 0 R] /Count 1 /MediaBox [0 0 200 300] {RESOURCES} {root} >>").as_bytes());
+        b.object(7, format!("<< /Type /Pages /Parent {inner_parent} /Kids [3 0 R] /Count 1 >>").as_bytes());
+        b.object(3, b"<< /Type /Page /Parent 7 0 R /Contents 5 0 R >>");
+        b.object(5, &stream("", &text("Alpha")));
+        b.object(6, b"<< /Type /Pages /Kids [] /Count 0 /Rotate 90 >>");
+        let rows = b.offsets.clone();
+        b.finish(8, &rows, "")
+    };
+    let base = nested("2 0 R", "");
+    assert!(inspect(&base, &base, InspectLimits::default()).is_ok());
+    for (case, edited) in [("an intermediate node's", nested("6 0 R", "")), ("the root's", nested("2 0 R", "/Parent 6 0 R"))] {
+        let message = refused_against(&base, &edited);
+        assert!(message.contains("/Parent"), "{case}: {message}");
+    }
+    // The base itself read otherwise by viewers: no fact about it holds.
+    match inspect(&two_under_one("4 0 R", ""), &two_under_one("4 0 R", ""), InspectLimits::default()) {
+        Err(InspectError::Base(message)) => assert!(message.contains("/Parent"), "{message}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_page_tree_node_s_own_entries_are_compared() {
+    // Re-review M5: a node's entries other than its kids, count, parent, type and inherited
+    // attributes were compared in neither kind of save: /Secret (SECRET X) was accepted.
+    let base = two_under_one("2 0 R", "/Extra (kept)");
+    assert!(inspect(&base, &base, InspectLimits::default()).is_ok());
+    let node =
+        format!("<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 200 300] /Rotate 0 {RESOURCES} /Extra (kept) /Secret (SECRET X) >>");
+    let update = update_section(&base, &[(2, node.as_bytes())], Some(last_section(&base)), "");
+    for (case, edited) in [
+        ("added in an update", update),
+        ("added in a rewrite", two_under_one("2 0 R", "/Extra (kept) /Secret (SECRET X)")),
+        ("changed in a rewrite", two_under_one("2 0 R", "/Extra (SECRET X)")),
+        ("removed in a rewrite", two_under_one("2 0 R", "")),
+    ] {
+        let message = refused_against(&base, &edited);
+        assert!(message.contains("page tree node"), "{case}: {message}");
+    }
+}
+
+/// Two tagged pages: element 7 (`/Pg` `pg7`) holds page 1's "Alpha" (MCID 0), element 8 page
+/// 2's "Bravo" (MCID 0).
+fn tagged_pages(pg7: &str) -> Vec<u8> {
+    let mut b = Builder::new();
+    b.object(1, b"<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 6 0 R /MarkInfo << /Marked true >> >>");
+    b.object(2, format!("<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 200 300] {RESOURCES} >>").as_bytes());
+    b.object(3, b"<< /Type /Page /Parent 2 0 R /Contents 9 0 R /StructParents 0 >>");
+    b.object(4, b"<< /Type /Page /Parent 2 0 R /Contents 10 0 R /StructParents 1 >>");
+    b.object(5, b"null");
+    b.object(6, b"<< /Type /StructTreeRoot /K [7 0 R 8 0 R] /ParentTree << /Nums [0 [7 0 R] 1 [8 0 R]] >> >>");
+    b.object(7, format!("<< /S /P /P 6 0 R /Pg {pg7} /K 0 >>").as_bytes());
+    b.object(8, b"<< /S /P /P 6 0 R /Pg 4 0 R /K 0 >>");
+    b.object(9, &stream("", b"/P << /MCID 0 >> BDC BT /F1 12 Tf 20 150 Td (Alpha) Tj ET EMC"));
+    b.object(10, &stream("", b"/P << /MCID 0 >> BDC BT /F1 12 Tf 20 150 Td (Bravo) Tj ET EMC"));
+    let rows = b.offsets.clone();
+    b.finish(11, &rows, "")
+}
+
+#[test]
+fn marked_content_stays_on_its_page() {
+    // Re-review I2: an element's /Pg was left out of every comparison, so its marked content
+    // could be moved to another page (the tags then read "Bravo" twice and "Alpha" nowhere).
+    let base = tagged_pages("3 0 R");
+    assert!(inspect(&base, &base, InspectLimits::default()).is_ok());
+    let update = update_section(&base, &[(7, b"<< /S /P /P 6 0 R /Pg 4 0 R /K 0 >>")], Some(last_section(&base)), "");
+    for (case, edited) in [("an appended update", update), ("a rewrite", tagged_pages("4 0 R"))] {
+        let message = refused_against(&base, &edited);
+        assert!(message.contains("/Pg"), "{case}: {message}");
+    }
+    // Pages moved by the Session: the kids follow their pages.
+    let mut session = crate::Session::new().with_clock(|| 1_700_000_000);
+    session.set_keep_document_information(true);
+    let id = session.open("base.pdf", None, std::sync::Arc::new(base.clone()), None).unwrap();
+    session.apply(id, crate::Edit::MovePages { pages: vec![1], to: 0 }).unwrap();
+    let moved = session.save_bytes(id).unwrap();
+    let inspection = inspect(&base, &moved, InspectLimits::default()).unwrap();
+    assert_eq!(inspection.pages.moved, 1, "{inspection:?}");
+}

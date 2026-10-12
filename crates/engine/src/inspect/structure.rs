@@ -618,6 +618,10 @@ pub(crate) struct Structure {
     pub page_labels: PageLabels,
     /// The catalog's `/PageLabels` entry's digest (`None`: there is none).
     pub page_labels_digest: Option<Digest>,
+    /// Follow-up 8 (R6b-51, M5): the page tree nodes' entries but their kids, count, parent,
+    /// type and the attributes pages inherit (compared through the pages), by key and value,
+    /// sorted: no viewer draws them and no fact reports them, so they may not change.
+    pub page_tree_entries: Vec<(Vec<u8>, Digest)>,
 }
 
 /// The fingerprint pages are matched by: content, resources, images and text.
@@ -705,6 +709,53 @@ pub(crate) fn tags_kept(base: &StructFacts, edited: &StructFacts) -> Option<usiz
         && subsequence(&edited.marked, &base.marked)
         && subsequence(&edited.objects, &base.objects);
     kept.then(|| base.text.len().saturating_sub(edited.text.len()))
+}
+
+/// Follow-up 8 (R6b-51, I2): whether every marked-content kid of the edited structure tree is on
+/// the page its base kid was on, followed through the pages' pairing (`pairs`: base page, edited
+/// page), and in the same form (the same object in an appended update, which keeps numbers; a
+/// form or none alike in a rewrite). A kid's page is its own `/Pg`, else its element's or the
+/// nearest ancestor's: moved, the tree gives assistive technology and copying another page's
+/// text. A base kid on a deleted page may name no page of the edited file. Kids are aligned as
+/// [`tags_kept`] aligns them (each edited kid with the next base kid of the same element and
+/// MCID on the page it follows).
+pub(crate) fn marked_pages_followed(
+    before: &Structure,
+    after: &Structure,
+    pairs: &[(usize, usize)],
+    base_kept: bool,
+    budget: &mut Budget,
+) -> Result<bool, Fail> {
+    let index =
+        |structure: &Structure| -> HashMap<ObjRef, usize> { structure.pages.iter().enumerate().map(|(at, page)| (page.object, at)).collect() };
+    let (base_pages, edited_pages) = (index(before), index(after));
+    let followed: HashMap<usize, usize> = pairs.iter().copied().collect();
+    let follows = |base: &MarkedKid, edited: &MarkedKid| {
+        let page = match (base.page.and_then(|page| base_pages.get(&page)), edited.page.and_then(|page| edited_pages.get(&page))) {
+            (Some(old), Some(new)) => followed.get(old) == Some(new),
+            (Some(old), None) => !followed.contains_key(old),
+            (None, None) => true,
+            (None, Some(_)) => false,
+        };
+        let form = if base_kept { base.form == edited.form } else { base.form.is_some() == edited.form.is_some() };
+        page && form
+    };
+    let mut rest = before.structure_links.kids.iter();
+    for kid in &after.structure_links.kids {
+        budget.tick()?;
+        let mut matched = false;
+        for candidate in rest.by_ref() {
+            budget.tick()?;
+            if candidate.element == kid.element && candidate.mcid == kid.mcid && follows(candidate, kid) {
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Whether `part` is `whole` with some items taken away, the rest in their order.
@@ -811,6 +862,9 @@ pub(crate) fn unit_square(m: &Matrix) -> [f64; 4] {
     }
     if [x0, y0, x1, y1].iter().all(|v| v.is_finite()) { [x0, y0, x1, y1] } else { [f64::NAN; 4] }
 }
+
+/// Follow-up 8 (R6b-51, M5): page tree nodes' own entries, by key and value digest.
+type NodeEntries = Vec<(Vec<u8>, Digest)>;
 
 /// A leaf of the page tree with what it inherits.
 struct PageNode {
@@ -1417,16 +1471,41 @@ impl<'d, 'b> Reader<'d, 'b> {
 
     // ── page tree ───────────────────────────────────────────────────────────────────────────
 
-    fn page_tree(&mut self, root: &Dict) -> Result<Vec<PageNode>, Fail> {
+    /// The pages, in order, and the page tree nodes' entries no page inherits (see
+    /// [`Structure::page_tree_entries`]).
+    fn page_tree(&mut self, root: &Dict) -> Result<(Vec<PageNode>, NodeEntries), Fail> {
         let Some(Object::Ref(tree)) = root.get(b"Pages") else { return Err(read_error("the catalog has no page tree")) };
         let tree = *tree;
         let dict = self.get(tree)?.as_dict().cloned().ok_or_else(|| read_error("the page tree is not a dictionary"))?;
+        // Follow-up 8 (R6b-51, C1): the root has no parent; PDFium and pdf.js would inherit
+        // through one.
+        if dict.get(b"Parent").is_some_and(|parent| !matches!(parent, Object::Null)) {
+            return Err(read_error("the page tree's root names a /Parent, through which viewers inherit attributes"));
+        }
         let mut pages = Vec::new();
+        let mut entries = Vec::new();
         let mut nodes = BTreeSet::from([tree]);
         let mut seen = BTreeSet::new();
         let inherited = PageNode { obj: tree, dict: Dict::new(), resources: Vec::new(), media: None, crop: None, rotate: None };
-        self.walk(&dict, &inherited, 0, &mut nodes, &mut seen, &mut pages)?;
-        Ok(pages)
+        self.walk(tree, &dict, &inherited, 0, &mut nodes, &mut seen, &mut pages, &mut entries)?;
+        entries.sort_unstable();
+        Ok((pages, entries))
+    }
+
+    /// Follow-up 8 (R6b-51, M5): a page tree node's entries other than its kids, count, parent,
+    /// type and the attributes its pages inherit (each node's, by its key and value), which no
+    /// viewer draws but any tool reading the file finds.
+    fn node_entries(&mut self, node: &Dict, entries: &mut Vec<(Vec<u8>, Digest)>) -> Result<(), Fail> {
+        const NODE_KEYS: [&[u8]; 8] = [b"Type", b"Kids", b"Count", b"Parent", b"Resources", b"MediaBox", b"CropBox", b"Rotate"];
+        for (key, value) in node.iter() {
+            self.budget.tick()?;
+            if NODE_KEYS.contains(&key.as_slice()) {
+                continue;
+            }
+            let digest = self.digest(value)?;
+            entries.push((key.clone(), digest));
+        }
+        Ok(())
     }
 
     /// Embed build (follow-up 7 audit, item 6): in an edited file, a page tree node's `/Count`
@@ -1443,20 +1522,24 @@ impl<'d, 'b> Reader<'d, 'b> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn walk(
         &mut self,
+        node_ref: ObjRef,
         node: &Dict,
         inherited: &PageNode,
         depth: usize,
         nodes: &mut BTreeSet<ObjRef>,
         seen: &mut BTreeSet<ObjRef>,
         pages: &mut Vec<PageNode>,
+        entries: &mut Vec<(Vec<u8>, Digest)>,
     ) -> Result<(), Fail> {
         if depth > MAX_TREE_DEPTH {
             return Err(read_error("the page tree is too deep"));
         }
         let before = pages.len();
         let here = with_inherited(node, inherited);
+        self.node_entries(node, entries)?;
         let Some(kids) = node.get(b"Kids") else { return Err(read_error("a page tree node has no /Kids")) };
         let kids = self.array_of(Some(kids), "/Kids")?;
         for kid in kids {
@@ -1468,11 +1551,19 @@ impl<'d, 'b> Reader<'d, 'b> {
             if dict.name(b"Type") != Some(b"Pages") && dict.contains(b"Kids") {
                 return Err(read_error(format!("page tree entry {r} has /Kids but is not a /Pages node, which viewers read differently")));
             }
+            // Follow-up 8 (R6b-51, C1): PDFium and pdf.js inherit a page's rotation, boxes and
+            // resources through its own /Parent chain; hayro and this reader along the path
+            // walked. They agree only where every entry's /Parent is the node listing it.
+            if dict.get(b"Parent") != Some(&Object::Ref(node_ref)) {
+                return Err(read_error(format!(
+                    "page tree entry {r}'s /Parent is not the node listing it, so viewers would inherit another page tree's attributes"
+                )));
+            }
             if dict.name(b"Type") == Some(b"Pages") {
                 if !nodes.insert(r) {
                     return Err(read_error("the page tree loops"));
                 }
-                self.walk(&dict, &here, depth.saturating_add(1), nodes, seen, pages)?;
+                self.walk(r, &dict, &here, depth.saturating_add(1), nodes, seen, pages, entries)?;
             } else {
                 if !seen.insert(r) {
                     return Err(read_error(format!("page {r} appears twice in the page tree")));
@@ -4024,7 +4115,7 @@ pub(crate) fn read(
     let Some(root) = doc.root() else { return Err(read_error("the trailer's /Root is not a reference")) };
     let catalog = reader.get(root)?.as_dict().cloned().ok_or_else(|| read_error("the catalog is not a dictionary"))?;
     // The page tree first: the page bound is checked before any per-page work.
-    let nodes = reader.page_tree(&catalog)?;
+    let (nodes, page_tree_entries) = reader.page_tree(&catalog)?;
     let mut widgets = BTreeSet::new();
     let ((fields, field_order), form) = match reader.dict_of(catalog.get(b"AcroForm"), "/AcroForm")? {
         Some(form) => (reader.fields(&form, &mut widgets)?, Some(reader.digest_without(&form, &[b"Fields"])?)),
@@ -4094,6 +4185,7 @@ pub(crate) fn read(
             numbered_destinations: false,
             page_labels,
             page_labels_digest,
+            page_tree_entries,
         },
         known,
     ))
