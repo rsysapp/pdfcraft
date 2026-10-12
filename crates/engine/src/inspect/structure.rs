@@ -328,6 +328,16 @@ pub(crate) struct PageFacts {
     /// drawn differently from its base that draws with one counts outside the redactions, since
     /// a change hidden in hayro's pixels may show in another viewer.
     pub render_risk: Option<String>,
+    /// Follow-up 8 (R6b-51, C1): a content stream the page draws (its own, a form's, a tiling
+    /// pattern's cell, a soft mask's group) that a rewrite brings is not written as the
+    /// redactor writes (see `operators`): what it holds that draws nothing is compared by
+    /// nothing, so the page counts outside its redactions.
+    pub content_violation: Option<String>,
+    /// Follow-up 8 (R6b-51; the redaction re-review's C2): the resources the page draws with
+    /// but forms and images (fonts, patterns, shadings, colour spaces, graphics states, property
+    /// lists without their text), by content: a rewrite may draw only with what the base page
+    /// drew with, since what they hold under the boxes no comparison reads.
+    pub drawing_resources: BTreeSet<Digest>,
     /// The image pixels drawn, summed over every use.
     pub image_pixels: u64,
     /// Content bytes the interpreter reads for the page (forms counted per use).
@@ -369,6 +379,8 @@ impl PageFacts {
             entries: BTreeMap::new(),
             type3: BTreeSet::new(),
             render_risk: None,
+            content_violation: None,
+            drawing_resources: BTreeSet::new(),
             image_pixels: 0,
             interpreted: 0,
             annots: Vec::new(),
@@ -634,6 +646,9 @@ pub(crate) struct Structure {
     /// label dictionaries' digests, sorted), which label no page; and every range's.
     pub labels_past_the_end: Vec<Digest>,
     pub label_values: Vec<Digest>,
+    /// Follow-up 8 (R6b-51, C1): the content streams read and their marked content, gathered
+    /// for the base of a rewrite (see [`ContentRule::Gather`]).
+    pub content_base: ContentBase,
 }
 
 /// The fingerprint pages are matched by: content, resources, images and text.
@@ -853,6 +868,12 @@ struct Scan {
     digest: Digest,
     items: Vec<Item>,
     len: usize,
+    /// Follow-up 8 (R6b-51, C1): a content stream (or, for a page, one of its streams) the
+    /// rewrite brings: the resources it names must all exist.
+    new: bool,
+    /// Follow-up 8 (R6b-51, C1): why a content stream the rewrite brings is not written as the
+    /// redactor writes (see `operators`).
+    violation: Option<String>,
 }
 
 /// What a content stream draws that the comparison follows: which images, forms and patterns,
@@ -936,6 +957,8 @@ struct PageNode {
 /// What a page draws.
 #[derive(Default)]
 struct Drawn {
+    /// Follow-up 8 (R6b-51, C1): see [`PageFacts::content_violation`].
+    violation: Option<String>,
     images: Vec<Digest>,
     pixels: u64,
     interpreted: usize,
@@ -967,6 +990,8 @@ struct Drawn {
     /// The standard fonts offered (see [`PageFacts::unused_standard_fonts`]), the same way.
     standard: BTreeSet<(Digest, Digest)>,
     used: BTreeSet<Digest>,
+    /// See [`PageFacts::drawing_resources`].
+    drawing: BTreeSet<Digest>,
 }
 
 /// One level of marked content (`BDC`, `BMC`) the page's own content or a form it draws opens
@@ -1033,6 +1058,8 @@ struct Context {
     /// The form XObject whose content this is (`None`: the page's own content), for the
     /// marked-content levels it opens (R6b-47).
     form: Option<ObjRef>,
+    /// Follow-up 8 (R6b-51, C1): the content a rewrite brings: every resource it names exists.
+    new: bool,
 }
 
 struct Reader<'d, 'b> {
@@ -1076,6 +1103,31 @@ struct Reader<'d, 'b> {
     numbered: bool,
     /// See [`Structure::labels_past_the_end`]: (past the end, all), as read.
     label_values: (Vec<Digest>, Vec<Digest>),
+    /// Follow-up 8 (R6b-51, C1): what is done with each content stream decoded (see
+    /// [`ContentRule`]), and the base's content as gathered.
+    content_rule: ContentRule,
+    content_base: ContentBase,
+}
+
+/// Follow-up 8 (R6b-51, C1): the base's content streams, by their decoded data's digest, and
+/// the marked-content operators they hold (see `operators`).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ContentBase {
+    pub streams: HashSet<Digest>,
+    pub marked: HashSet<Digest>,
+    /// The operators written otherwise than the redactor writes them (see `operators::gather`).
+    pub odd: HashSet<Digest>,
+}
+
+/// What the reader does with each content stream it decodes.
+#[derive(Clone, Debug)]
+pub(crate) enum ContentRule {
+    /// Nothing.
+    None,
+    /// Gather them (the base of a rewrite).
+    Gather,
+    /// Check each that is no content stream of the base's (a rewrite).
+    Check(Arc<ContentBase>),
 }
 
 /// Which stream objects may declare a `/Length` other than their data's (R6b-30, R6b-35).
@@ -1101,7 +1153,7 @@ fn read_error(what: impl std::fmt::Display) -> Fail {
 }
 
 /// A decode failure: the budget's bound, or damaged data.
-fn decode_error(error: &pdfcraft_cos::CosError) -> Fail {
+pub(crate) fn decode_error(error: &pdfcraft_cos::CosError) -> Fail {
     let message = error.to_string();
     if message.contains("exceeds the limit") { Fail::TooComplex } else { Fail::Read(format!("a stream cannot be decoded: {message}")) }
 }
@@ -1727,16 +1779,25 @@ impl<'d, 'b> Reader<'d, 'b> {
             return Ok(found.clone());
         }
         let mut data = Vec::new();
+        let mut new = false;
+        let mut violation = None;
         for r in &key.0 {
             let obj = self.get(*r)?;
             let Object::Stream(stream) = &*obj else { return Err(read_error(format!("content stream {r} is not a stream"))) };
-            data.extend_from_slice(&self.decode(stream)?);
+            let decoded = self.decode(stream)?;
+            let (brought, why) = self.content_stream(&decoded)?;
+            new |= brought;
+            violation = violation.or(why);
+            data.extend_from_slice(&decoded);
             if array {
                 // As hayro joins them: at least one whitespace in between.
                 data.push(b' ');
             }
         }
-        let scan = Arc::new(self.scan(&data)?);
+        let mut scan = self.scan(&data)?;
+        scan.new = new;
+        scan.violation = violation;
+        let scan = Arc::new(scan);
         self.contents.insert(key, scan.clone());
         Ok(scan)
     }
@@ -1747,9 +1808,41 @@ impl<'d, 'b> Reader<'d, 'b> {
             return Ok(found.clone());
         }
         let data = self.decode(stream)?;
-        let scan = Arc::new(self.scan(&data)?);
+        let (new, violation) = self.content_stream(&data)?;
+        let mut scan = self.scan(&data)?;
+        scan.new = new;
+        scan.violation = violation;
+        let scan = Arc::new(scan);
         self.forms.insert(r, scan.clone());
         Ok(scan)
+    }
+
+    /// Follow-up 8 (R6b-51, C1): apply the [`ContentRule`] to one content stream's decoded
+    /// data; whether it is one the rewrite brings, and why it is not written as the redactor
+    /// writes (the page drawing it counts outside its redactions).
+    fn content_stream(&mut self, data: &[u8]) -> Result<(bool, Option<String>), Fail> {
+        match &self.content_rule {
+            ContentRule::None => Ok((false, None)),
+            ContentRule::Gather => {
+                self.budget.hashed(data.len())?;
+                if self.content_base.streams.insert(sha256(&[data])) {
+                    super::operators::gather(data, &mut self.content_base, self.budget)?;
+                }
+                Ok((false, None))
+            }
+            ContentRule::Check(base) => {
+                let base = base.clone();
+                self.budget.hashed(data.len())?;
+                if base.streams.contains(&sha256(&[data])) {
+                    return Ok((false, None));
+                }
+                match super::operators::check(data, &base, self.budget) {
+                    Ok(()) => Ok((true, None)),
+                    Err(Fail::Read(why)) => Ok((true, Some(why))),
+                    Err(other) => Err(other),
+                }
+            }
+        }
     }
 
     /// What a content stream draws that is followed: `Do` and inline images, for the images'
@@ -1842,7 +1935,7 @@ impl<'d, 'b> Reader<'d, 'b> {
             before = None;
             dict = None;
         }
-        Ok(Scan { digest: sha256(&[data]), items, len: data.len() })
+        Ok(Scan { digest: sha256(&[data]), items, len: data.len(), new: false, violation: None })
     }
 
     /// An inline image after `BI`: its digest and pixel count, and where it ends (after `EI`).
@@ -1947,6 +2040,25 @@ impl<'d, 'b> Reader<'d, 'b> {
     fn draw(&mut self, items: &[Item], chain: &[Arc<Dict>], at: Context, drawn: &mut Drawn) -> Result<(), Fail> {
         for item in items {
             self.budget.uses()?;
+            // Follow-up 8 (R6b-51, C1): content a rewrite brings names only resources that
+            // exist (a name drawing nothing could spell out text).
+            if at.new && drawn.violation.is_none() {
+                const DEVICE: [&[u8]; 7] = [b"DeviceGray", b"DeviceRGB", b"DeviceCMYK", b"Pattern", b"G", b"RGB", b"CMYK"];
+                let missing = match item {
+                    Item::Named(b"ColorSpace", name) => {
+                        !DEVICE.contains(&name.as_slice()) && self.resource_entry(chain, b"ColorSpace", name)?.is_none()
+                    }
+                    Item::Named(kind, name) => self.resource_entry(chain, kind, name)?.is_none(),
+                    Item::Draw(name) => self.xobject(chain, name)?.is_none(),
+                    Item::Pattern(name) => self.resource_entry(chain, b"Pattern", name)?.is_none(),
+                    Item::State(name) => self.resource_entry(chain, b"ExtGState", name)?.is_none(),
+                    Item::Span(_, PropertyList::Named(name), _) => self.resource_entry(chain, b"Properties", name)?.is_none(),
+                    _ => false,
+                };
+                if missing {
+                    drawn.violation = Some("content the rewrite brings names a resource that does not exist".into());
+                }
+            }
             match item {
                 Item::Named(kind, name) => {
                     let kind: &'static [u8] = match *kind {
@@ -2036,6 +2148,9 @@ impl<'d, 'b> Reader<'d, 'b> {
                                 return Err(Fail::TooComplex);
                             }
                             let scan = self.form_content(r, stream)?;
+                            if drawn.violation.is_none() {
+                                drawn.violation.clone_from(&scan.violation);
+                            }
                             let key = self.form_key(r, stream)?;
                             self.group_risk(&stream.dict, drawn)?;
                             self.note_keys(b"Form", &stream.dict, drawn)?;
@@ -2053,7 +2168,12 @@ impl<'d, 'b> Reader<'d, 'b> {
                             self.type3_fonts(&inner, &key, drawn)?;
                             // Embed build: the form's content may close only the levels it opened.
                             let floor = std::mem::replace(&mut drawn.floor, drawn.open.len());
-                            self.draw(&scan.items, &inner, Context { depth: at.depth.saturating_add(1), chain: key, form: Some(r), ..at }, drawn)?;
+                            self.draw(
+                                &scan.items,
+                                &inner,
+                                Context { depth: at.depth.saturating_add(1), chain: key, form: Some(r), new: scan.new, ..at },
+                                drawn,
+                            )?;
                             if !at.patterned && !at.masked {
                                 drawn.unbalanced |= drawn.open.len() != drawn.floor;
                                 drawn.open.truncate(drawn.floor);
@@ -2093,13 +2213,21 @@ impl<'d, 'b> Reader<'d, 'b> {
                         return Err(Fail::TooComplex);
                     }
                     let scan = self.form_content(r, stream)?;
+                    if drawn.violation.is_none() {
+                        drawn.violation.clone_from(&scan.violation);
+                    }
                     drawn.interpreted = drawn.interpreted.saturating_add(scan.len);
                     let (inner, key) = self.inner_chain(stream.dict.get(b"Resources"), "a pattern's /Resources", chain, &at.chain)?;
                     if let Some(own) = inner.first() {
                         self.offer_resources(own, drawn)?;
                     }
                     self.type3_fonts(&inner, &key, drawn)?;
-                    self.draw(&scan.items, &inner, Context { depth: at.depth.saturating_add(1), patterned: true, chain: key, ..at }, drawn)?;
+                    self.draw(
+                        &scan.items,
+                        &inner,
+                        Context { depth: at.depth.saturating_add(1), patterned: true, chain: key, new: scan.new, ..at },
+                        drawn,
+                    )?;
                 }
                 Item::State(name) => {
                     if let Some(entry) = self.resource_entry(chain, b"ExtGState", name)? {
@@ -2121,6 +2249,9 @@ impl<'d, 'b> Reader<'d, 'b> {
                         return Err(Fail::TooComplex);
                     }
                     let scan = self.form_content(group, stream)?;
+                    if drawn.violation.is_none() {
+                        drawn.violation.clone_from(&scan.violation);
+                    }
                     let key = self.form_key(group, stream)?;
                     self.group_risk(&stream.dict, drawn)?;
                     self.note_keys(b"Form", &stream.dict, drawn)?;
@@ -2132,7 +2263,12 @@ impl<'d, 'b> Reader<'d, 'b> {
                         self.offer_resources(own, drawn)?;
                     }
                     self.type3_fonts(&inner, &key, drawn)?;
-                    self.draw(&scan.items, &inner, Context { depth: at.depth.saturating_add(1), masked: true, chain: key, ..at }, drawn)?;
+                    self.draw(
+                        &scan.items,
+                        &inner,
+                        Context { depth: at.depth.saturating_add(1), masked: true, chain: key, new: scan.new, ..at },
+                        drawn,
+                    )?;
                 }
             }
         }
@@ -2196,6 +2332,34 @@ impl<'d, 'b> Reader<'d, 'b> {
     fn use_resource(&mut self, kind: &[u8], entry: &Object, drawn: &mut Drawn) -> Result<(), Fail> {
         let digest = self.resource_digest(kind, entry)?;
         drawn.used.insert(digest);
+        // Follow-up 8 (R6b-51; the redaction re-review's C2): what a page draws with but forms
+        // and images, whose data under the boxes no comparison reads (a pattern's cell, a
+        // shading's samples, a colour profile, a font's names and maps): a property list
+        // without its text, which is compared span by span.
+        if kind != b"XObject" {
+            let drawing = match (kind, &*self.resolve(entry)?) {
+                (b"Properties", Object::Dict(list)) => {
+                    let untexted: Dict =
+                        list.iter().filter(|(key, _)| !STRUCT_TEXT_KEYS.contains(&key.as_slice())).map(|(k, v)| (k.clone(), v.clone())).collect();
+                    let digest = self.digest(&Object::Dict(untexted))?;
+                    sha256(&[b"resource", kind, &digest])
+                }
+                // A soft mask's group is a form, compared as forms are (its glyphs, images and
+                // pixels): the state but for it.
+                (b"ExtGState", Object::Dict(state)) if state.contains(b"SMask") => {
+                    let mut state = state.clone();
+                    if let Some(Object::Dict(mask)) = state.get(b"SMask").map(|mask| self.resolve(mask)).transpose()?.as_deref() {
+                        let mut mask = mask.clone();
+                        mask.remove(b"G");
+                        state.set(b"SMask".to_vec(), Object::Dict(mask));
+                    }
+                    let digest = self.digest(&Object::Dict(state))?;
+                    sha256(&[b"resource", kind, &digest])
+                }
+                _ => digest,
+            };
+            drawn.drawing.insert(drawing);
+        }
         Ok(())
     }
 
@@ -2535,7 +2699,7 @@ impl<'d, 'b> Reader<'d, 'b> {
         }
         let resources = sha256(&[&levels]);
         let scan = self.page_content(&node.dict)?;
-        let mut drawn = Drawn { interpreted: scan.len, ..Drawn::default() };
+        let mut drawn = Drawn { interpreted: scan.len, violation: scan.violation.clone(), ..Drawn::default() };
         self.group_risk(&node.dict, &mut drawn)?;
         for level in &chain {
             self.note_keys(b"Resources", level, &mut drawn)?;
@@ -2545,7 +2709,12 @@ impl<'d, 'b> Reader<'d, 'b> {
             self.offer_resources(level, &mut drawn)?;
         }
         self.type3_fonts(&chain, &resources, &mut drawn)?;
-        self.draw(&scan.items, &chain, Context { depth: 0, patterned: false, masked: false, chain: resources, form: None }, &mut drawn)?;
+        self.draw(
+            &scan.items,
+            &chain,
+            Context { depth: 0, patterned: false, masked: false, chain: resources, form: None, new: scan.new },
+            &mut drawn,
+        )?;
         drawn.unbalanced |= !drawn.open.is_empty();
         drawn.images.sort_unstable();
         let (annots, annots_in_array) = self.annotations(node, widgets, annotation_ids, pages)?;
@@ -2567,6 +2736,8 @@ impl<'d, 'b> Reader<'d, 'b> {
             entries,
             image_pixels: drawn.pixels,
             render_risk: drawn.render_risk,
+            content_violation: drawn.violation,
+            drawing_resources: drawn.drawing,
             image_uses: Vec::new(),
             required: drawn.required,
             forms: drawn.forms,
@@ -4108,6 +4279,8 @@ impl Known {
             tolerated: self.tolerated.clone(),
             numbered: self.numbered,
             label_values: (Vec::new(), Vec::new()),
+            content_rule: ContentRule::None,
+            content_base: ContentBase::default(),
         }
     }
 
@@ -4244,6 +4417,7 @@ pub(crate) fn read(
     hayro_decoded: Arc<HashMap<ObjRef, Digest>>,
     sections: Vec<Section>,
     tolerated: Tolerated,
+    content_rule: ContentRule,
 ) -> Result<(Structure, Known), Fail> {
     let tolerated = Arc::new(tolerated);
     let data = doc.bytes().as_slice();
@@ -4269,6 +4443,8 @@ pub(crate) fn read(
         tolerated: tolerated.clone(),
         numbered: false,
         label_values: (Vec::new(), Vec::new()),
+        content_rule,
+        content_base: ContentBase::default(),
     };
     let Some(root) = doc.root() else { return Err(read_error("the trailer's /Root is not a reference")) };
     let catalog = reader.get(root)?.as_dict().cloned().ok_or_else(|| read_error("the catalog is not a dictionary"))?;
@@ -4356,6 +4532,7 @@ pub(crate) fn read(
             page_tree_entries,
             labels_past_the_end,
             label_values,
+            content_base: std::mem::take(&mut reader.content_base),
         },
         known,
     ))

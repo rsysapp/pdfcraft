@@ -269,7 +269,7 @@ impl Stream {
     /// read to its end within `max` bytes made.
     pub fn trailing_data(&self, max: usize) -> Result<(Option<&[u8]>, usize), CosError> {
         let Some((Filter::Flate, _)) = self.filters().first().cloned() else { return Ok((None, 0)) };
-        let (end, made) = pdfcraft_filters::flate_end(&self.raw, max).ok_or_else(|| CosError::Filter("the Flate data does not end".into()))?;
+        let (end, made) = pdfcraft_filters::flate_end(&self.raw, max).map_err(|e| CosError::Filter(e.to_string()))?;
         Ok((self.raw.get(end..).filter(|rest| !rest.is_empty()), made))
     }
 

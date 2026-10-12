@@ -224,9 +224,11 @@ fn with_predictor(step: Step, params: &Params, name: &'static str) -> Step {
 
 /// Embed build: where the Flate-encoded data in `data` ends (the rest, if any, is data no
 /// decoder reads), and how many bytes it inflated to (for a caller that charges the work);
-/// `None` when it does not decode to its end within `max` bytes made.
-pub fn flate_end(data: &[u8], max: usize) -> Option<(usize, usize)> {
-    flate::end(data, max)
+/// an error when it does not decode to its end, or not within `max` bytes made.
+pub fn flate_end(data: &[u8], max: usize) -> Result<(usize, usize), FilterError> {
+    flate::end(data, max).map_err(|limit| {
+        if limit { FilterError::LimitExceeded(max) } else { FilterError::Corrupt { filter: "FlateDecode", detail: "the data does not end".into() } }
+    })
 }
 
 /// Encodes `data` with `filter`. Supported: Flate (zlib, level 6), LZW, ASCIIHex,

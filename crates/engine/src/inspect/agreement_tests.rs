@@ -365,8 +365,10 @@ fn an_object_the_edited_file_brings_must_declare_its_length() {
     body.extend_from_slice(b"\nendstream");
     let message = refused_against(&base, &appended(&base, 4, &String::from_utf8(body).unwrap()));
     assert!(message.contains("does not have the length it declares"), "{message}");
-    // The same rewrite with the exact length is read like any other.
-    assert!(inspect(&base, &page_declaring(data.len(), &data), InspectLimits::default()).is_ok());
+    // The same rewrite with the exact length is read like any other; the comment its content
+    // brings counts the page outside its redactions (follow-up 8, R6b-51 C1).
+    let inspection = inspect(&base, &page_declaring(data.len(), &data), InspectLimits::default()).unwrap();
+    assert_eq!(inspection.content.pages_changed_outside_redactions, 1, "{inspection:?}");
     // A base object whose length is wrong, written again by a rewrite with that wrong length.
     let short = length_short_of_endstream();
     let message = refused_against(&sound(), &short);

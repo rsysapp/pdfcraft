@@ -35,31 +35,34 @@ pub(crate) fn decode(data: &[u8], max: usize) -> Step {
 
 /// Embed build: where the zlib (or raw deflate) data in `data` ends: past the deflate stream
 /// and, after a zlib header, its Adler-32 trailer (as far as it is there). `None` when the data
-/// does not inflate to its end within `max` bytes of output. Also the bytes it inflated to.
-pub(crate) fn end(data: &[u8], max: usize) -> Option<(usize, usize)> {
-    let raw_end = |input: &[u8]| -> Option<(usize, usize)> {
+/// does not inflate to its end within `max` bytes of output (`Some(true)`: past `max`). Also
+/// the bytes it inflated to.
+pub(crate) fn end(data: &[u8], max: usize) -> Result<(usize, usize), bool> {
+    let raw_end = |input: &[u8]| -> Result<(usize, usize), bool> {
         let mut d = Decompress::new(false);
         // Inflated a block at a time and dropped: only how far the input goes is wanted.
         let mut block = vec![0u8; 64 << 10];
         loop {
             let (consumed, made) = (d.total_in(), d.total_out());
-            let status = d.decompress(input.get(usize::try_from(consumed).ok()?..)?, &mut block, FlushDecompress::None).ok()?;
+            let rest = usize::try_from(consumed).ok().and_then(|consumed| input.get(consumed..)).ok_or(false)?;
+            let status = d.decompress(rest, &mut block, FlushDecompress::None).map_err(|_| false)?;
             if d.total_out() > max as u64 {
-                return None;
+                return Err(true);
             }
             if status == Status::StreamEnd {
-                return Some((usize::try_from(d.total_in()).ok()?, usize::try_from(d.total_out()).ok()?));
+                return Ok((usize::try_from(d.total_in()).map_err(|_| false)?, usize::try_from(d.total_out()).map_err(|_| false)?));
             }
             if d.total_in() == consumed && d.total_out() == made {
-                return None;
+                return Err(false);
             }
         }
     };
     match zlib_header(data) {
-        Some((_, flg)) if flg & 0x20 != 0 => None,
-        Some(_) => match raw_end(data.get(2..)?) {
-            Some((deflate, made)) => Some((data.len().min(deflate.saturating_add(2).saturating_add(4)), made)),
-            None => raw_end(data),
+        Some((_, flg)) if flg & 0x20 != 0 => Err(false),
+        Some(_) => match raw_end(data.get(2..).ok_or(false)?) {
+            Ok((deflate, made)) => Ok((data.len().min(deflate.saturating_add(2).saturating_add(4)), made)),
+            Err(true) => Err(true),
+            Err(false) => raw_end(data),
         },
         None => raw_end(data),
     }
@@ -121,12 +124,12 @@ mod tests {
         // Embed build: the data after the zlib stream (its Adler-32 included) is found.
         let mut data = encode(b"hello hello hello");
         let len = data.len();
-        assert_eq!(end(&data, 1 << 20), Some((len, 17)));
+        assert_eq!(end(&data, 1 << 20), Ok((len, 17)));
         data.extend_from_slice(b"SECRET");
-        assert_eq!(end(&data, 1 << 20).map(|(at, _)| at), Some(len));
+        assert_eq!(end(&data, 1 << 20).map(|(at, _)| at), Ok(len));
         // Bounded by what it may make, and data that does not end is no end.
-        assert_eq!(end(&encode(&[0; 4096]), 100), None);
-        assert_eq!(end(&data[..len / 2], 1 << 20), None);
+        assert_eq!(end(&encode(&[0; 4096]), 100), Err(true));
+        assert_eq!(end(&data[..len / 2], 1 << 20), Err(false));
     }
 
     #[test]

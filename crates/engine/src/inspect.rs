@@ -71,6 +71,13 @@
 //!   where its stream does, the cross-reference sections with only the writer's trailer entries
 //!   (or, in an update, the base's) and identifier, `startxref` and `%%EOF`; rows are checked
 //!   against the object header they name before anything is loaded;
+//! - a rewrite is the server's redaction (R6b-49), so its page content is checked as the
+//!   redactor writes it (R6b-51; the redaction re-review's C1 and C2): a content stream it brings
+//!   (one that is no content stream of the base's) holds only drawing operators with the
+//!   operands their kind takes, no comment, marked content only as the base had it, and names
+//!   only resources that exist; a changed page draws only with fonts, patterns, shadings, colour
+//!   spaces, graphics states and property lists its base page drew with; otherwise the page
+//!   counts outside its redactions;
 //! - the page tree reads alike in every viewer (R6b-51): in both files every page's and node's
 //!   `/Parent` is the node listing it (PDFium and pdf.js inherit through `/Parent`, hayro and this
 //!   reader along the path walked) and the root has none; the nodes' own entries (other than
@@ -92,6 +99,7 @@ mod glyphs;
 mod images;
 mod jpeg;
 mod layout;
+mod operators;
 mod outline;
 mod structure;
 mod visual;
@@ -943,7 +951,14 @@ fn read_side(bytes: &[u8], against: Option<(&[u8], &Structure, bool)>, placement
         Some((base_bytes, base, true)) => structure::Tolerated::Kept { kept_until: base_bytes.len(), objects: base.misdeclared.clone() },
         Some((_, _, false)) => structure::Tolerated::Kept { kept_until: 0, objects: BTreeSet::new() },
     };
-    let (structure, mut known) = structure::read(&doc, budget, Arc::new(decoded), sections, tolerated)?;
+    // Follow-up 8 (R6b-51, C1): a rewrite's base gathers its content streams; the rewrite's
+    // own are checked against them.
+    let content_rule = match against {
+        None if placements => structure::ContentRule::Gather,
+        Some((_, base, false)) => structure::ContentRule::Check(Arc::new(base.content_base.clone())),
+        _ => structure::ContentRule::None,
+    };
+    let (structure, mut known) = structure::read(&doc, budget, Arc::new(decoded), sections, tolerated, content_rule)?;
     if let Some((base_bytes, base, base_kept)) = against {
         structure::check_chain(&structure.sections, base_bytes.len(), &base.sections, base_kept)?;
     }
@@ -1169,9 +1184,10 @@ fn account_bytes(doc: &Document, from: usize, base_trailer: Option<&pdfcraft_cos
                 let stream_length = match &*found {
                     pdfcraft_cos::Object::Stream(stream) => {
                         budget.hashed(stream.raw.len())?;
-                        let (tail, made) = stream
-                            .trailing_data(budget.content_room())
-                            .map_err(|_| refuse(format!("stream {num}'s data cannot be read to its end")))?;
+                        let (tail, made) = stream.trailing_data(budget.content_room()).map_err(|error| match structure::decode_error(&error) {
+                            Fail::TooComplex => Fail::TooComplex,
+                            _ => refuse(format!("stream {num}'s data cannot be read to its end")),
+                        })?;
                         budget.content(made)?;
                         if tail.is_some_and(|tail| tail.iter().any(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n' | b'\x0c' | b'\0'))) {
                             return Err(refuse(format!("stream {num} holds data after its end, which no decoder reads")));
@@ -2025,6 +2041,13 @@ fn compare_pages(
                 outside |= !e.unused_resources.is_subset(&b.unused_resources);
                 // Follow-up 8 (R6b-51, I1): an unused standard font holds no data but its name.
                 outside |= !e.unused_standard_fonts.is_subset(&b.offered_resources);
+                // Follow-up 8 (R6b-51, C1): content the rewrite brings, written otherwise than
+                // the redactor writes (a comment, an unknown operator, a surplus operand, …).
+                outside |= e.content_violation.is_some();
+                // Follow-up 8 (the redaction re-review's C2): drawn only with what the base
+                // page drew with (the redactor makes no font, pattern, shading, colour space or
+                // graphics state).
+                outside |= !e.drawing_resources.is_subset(&b.drawing_resources);
             }
             let mut areas = Areas::new(&boxes);
             // Every removed glyph by its centre, and every image at its own resolution.
@@ -2489,5 +2512,7 @@ mod layer_tests;
 mod limit_tests;
 #[cfg(test)]
 mod placement_tests;
+#[cfg(test)]
+mod selfcheck_tests;
 #[cfg(test)]
 mod tests;

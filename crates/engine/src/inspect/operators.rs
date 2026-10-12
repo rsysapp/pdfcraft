@@ -1,0 +1,282 @@
+//! Follow-up 8 (R6b-51; the redaction re-review's C1): a content stream a rewrite brings (one
+//! whose decoded data is no content stream of the base's) is written as the redactor writes:
+//! drawing operators each with the operands its kind takes, in number and type, and nothing
+//! else. A comment, an operator no viewer knows (or one inside `BX`/`EX`), an operand left over
+//! or of another type, a `TJ` array holding anything but strings and numbers: each draws
+//! nothing, yet carries what it holds to anyone reading the file, so each is refused. Marked
+//! content (`BMC`, `BDC`, `MP`, `DP`) may only be what the base's content had: its tag, and
+//! its property list (named, or written in place, but for its text for assistive technology,
+//! which may only be taken away and is compared span by span elsewhere).
+
+use pdfcraft_cos::{Dict, Lexer, Object};
+
+use super::structure::{ContentBase, Digest, sha256};
+use super::{Budget, Fail};
+
+/// The operands an operator takes.
+#[derive(Clone, Copy)]
+enum Shape {
+    /// This many numbers.
+    Numbers(usize),
+    /// One name.
+    Name,
+    /// A name and a number (`Tf`).
+    NameNumber,
+    /// One string (`Tj`, `'`).
+    Text,
+    /// Two numbers and a string (`"`).
+    SpacedText,
+    /// An array of strings and numbers (`TJ`).
+    Shown,
+    /// An array of numbers and a number (`d`).
+    Dash,
+    /// One to four numbers (`sc`, `SC`).
+    Colour,
+    /// Numbers then, or only, a name (`scn`, `SCN`).
+    PatternColour,
+    /// A tag (`BMC`, `MP`).
+    Tag,
+    /// A tag and a property list, named or written in place (`BDC`, `DP`).
+    TagList,
+}
+
+fn shape(operator: &[u8]) -> Option<Shape> {
+    Some(match operator {
+        b"b" | b"B" | b"b*" | b"B*" | b"f" | b"F" | b"f*" | b"n" | b"s" | b"S" | b"h" | b"W" | b"W*" | b"q" | b"Q" | b"BT" | b"ET" | b"EMC"
+        | b"T*" => Shape::Numbers(0),
+        b"w" | b"J" | b"j" | b"M" | b"i" | b"Tc" | b"Tw" | b"Tz" | b"TL" | b"Tr" | b"Ts" | b"g" | b"G" => Shape::Numbers(1),
+        b"m" | b"l" | b"Td" | b"TD" | b"d0" => Shape::Numbers(2),
+        b"rg" | b"RG" => Shape::Numbers(3),
+        b"re" | b"v" | b"y" | b"k" | b"K" => Shape::Numbers(4),
+        b"c" | b"cm" | b"Tm" | b"d1" => Shape::Numbers(6),
+        b"ri" | b"gs" | b"Do" | b"sh" | b"cs" | b"CS" => Shape::Name,
+        b"Tf" => Shape::NameNumber,
+        b"Tj" | b"'" => Shape::Text,
+        b"\"" => Shape::SpacedText,
+        b"TJ" => Shape::Shown,
+        b"d" => Shape::Dash,
+        b"sc" | b"SC" => Shape::Colour,
+        b"scn" | b"SCN" => Shape::PatternColour,
+        b"BMC" | b"MP" => Shape::Tag,
+        b"BDC" | b"DP" => Shape::TagList,
+        _ => return None,
+    })
+}
+
+fn number(object: &Object) -> bool {
+    matches!(object, Object::Int(_) | Object::Real(_))
+}
+
+fn fits(shape: Shape, operands: &[Object]) -> bool {
+    match (shape, operands) {
+        (Shape::Numbers(count), _) => operands.len() == count && operands.iter().all(number),
+        (Shape::Name | Shape::Tag, [Object::Name(_)]) => true,
+        (Shape::NameNumber, [Object::Name(_), size]) => number(size),
+        (Shape::Text, [Object::String(_)]) => true,
+        (Shape::SpacedText, [word, character, Object::String(_)]) => number(word) && number(character),
+        (Shape::Shown, [Object::Array(items)]) => items.iter().all(|item| number(item) || matches!(item, Object::String(_))),
+        (Shape::Dash, [Object::Array(items), phase]) => number(phase) && items.iter().all(number),
+        (Shape::Colour, _) => (1..=4).contains(&operands.len()) && operands.iter().all(number),
+        (Shape::PatternColour, [rest @ .., Object::Name(_)]) => rest.len() <= 4 && rest.iter().all(number),
+        (Shape::PatternColour, _) => (1..=4).contains(&operands.len()) && operands.iter().all(number),
+        (Shape::TagList, [Object::Name(_), Object::Name(_) | Object::Dict(_)]) => true,
+        _ => false,
+    }
+}
+
+/// The entries of a property list that stand for content (taken away by a redaction, compared
+/// span by span elsewhere).
+const TEXT_KEYS: [&[u8]; 5] = [b"ActualText", b"Alt", b"E", b"Lang", b"T"];
+
+/// A marked-content operator by what it is: its keyword, its tag and its property list (a
+/// name, or a dictionary without its text), as a digest.
+fn marked(operator: &[u8], operands: &[Object]) -> Digest {
+    let mut encoded = Vec::new();
+    for operand in operands {
+        let operand = match operand {
+            Object::Dict(list) => Object::Dict(
+                list.iter().filter(|(key, _)| !TEXT_KEYS.contains(&key.as_slice())).map(|(k, v)| (k.clone(), v.clone())).collect::<Dict>(),
+            ),
+            other => other.clone(),
+        };
+        pdfcraft_cos::serialize(&operand, &mut encoded);
+        encoded.push(b' ');
+    }
+    sha256(&[b"marked", operator, &encoded])
+}
+
+fn refused(what: impl Into<String>) -> Fail {
+    Fail::Read(format!("a content stream the rewrite brings holds {}, which draws nothing but carries data", what.into()))
+}
+
+/// An operator with its operands, as a digest.
+fn whole(operator: &[u8], operands: &[Object]) -> Digest {
+    let mut encoded = Vec::new();
+    for operand in operands {
+        pdfcraft_cos::serialize(operand, &mut encoded);
+        encoded.push(b' ');
+    }
+    sha256(&[b"operator", operator, &encoded])
+}
+
+/// What a base's content stream holds that a rewrite may bring again: its marked-content
+/// operators (see [`marked`]), and the operators written otherwise than the redactor writes
+/// them (an unknown one, odd operands), each whole. Read leniently: the base is read as it is.
+pub(crate) fn gather(data: &[u8], base: &mut ContentBase, budget: &mut Budget) -> Result<(), Fail> {
+    walk(data, budget, false, &mut |operator, operands| {
+        if matches!(operator, b"BMC" | b"BDC" | b"MP" | b"DP") {
+            base.marked.insert(marked(operator, operands));
+        }
+        if shape(operator).is_none_or(|shape| !fits(shape, operands)) {
+            base.odd.insert(whole(operator, operands));
+        }
+        Ok(())
+    })
+}
+
+/// Check a content stream a rewrite brings (see the module documentation) against what the
+/// base's content streams hold (see [`gather`]): an operator written otherwise than the
+/// redactor writes may only be one the base's content had, operands and all.
+pub(crate) fn check(data: &[u8], base: &ContentBase, budget: &mut Budget) -> Result<(), Fail> {
+    // The editor's own wrapper around a page's original content (`pdfcraft_edit`), whose
+    // comment names the editor and nothing else.
+    if matches!(data, b"q %PdfCraft\n" | b"Q %PdfCraft\n") {
+        return Ok(());
+    }
+    walk(data, budget, true, &mut |operator, operands| {
+        let fitting = shape(operator).filter(|shape| fits(*shape, operands));
+        if fitting.is_none() && !base.odd.contains(&whole(operator, operands)) {
+            return Err(match shape(operator) {
+                None => refused(format!("the operator `{}`", String::from_utf8_lossy(operator))),
+                Some(_) => refused(format!("operands `{}` does not take", String::from_utf8_lossy(operator))),
+            });
+        }
+        if matches!(operator, b"BMC" | b"BDC" | b"MP" | b"DP") && !base.marked.contains(&marked(operator, operands)) {
+            return Err(refused(format!("marked content (`{}`) the base's content did not have", String::from_utf8_lossy(operator))));
+        }
+        Ok(())
+    })
+}
+
+/// What [`walk`] calls with each operator and its operands.
+type Each<'a> = dyn FnMut(&[u8], &[Object]) -> Result<(), Fail> + 'a;
+
+/// Read a content stream operator by operator, calling `each` with each operator and its
+/// operands. `strict`: a comment or operands no operator takes is refused (else skipped).
+/// Inline images (`BI` … `ID` data `EI`) are passed over whole.
+fn walk(data: &[u8], budget: &mut Budget, strict: bool, each: &mut Each<'_>) -> Result<(), Fail> {
+    let mut lexer = Lexer::new(data, 0);
+    let mut operands: Vec<Object> = Vec::new();
+    loop {
+        budget.tick()?;
+        // Whitespace, and a comment, which a strict reading refuses.
+        let mut pos = lexer.pos;
+        while let Some(&byte) = data.get(pos) {
+            match byte {
+                b' ' | b'\t' | b'\r' | b'\n' | b'\x0c' | b'\0' => pos += 1,
+                b'%' if strict => return Err(refused(format!("a comment at byte {pos}"))),
+                b'%' => pos += data.get(pos..).map_or(0, |rest| rest.iter().position(|byte| matches!(byte, b'\n' | b'\r')).unwrap_or(rest.len())),
+                _ => break,
+            }
+        }
+        lexer.pos = pos;
+        let Some(&byte) = data.get(pos) else { break };
+        if matches!(byte, b'/' | b'(' | b'<' | b'[' | b'+' | b'-' | b'.') || byte.is_ascii_digit() {
+            let operand = match lexer.object() {
+                Ok(operand) if lexer.pos > pos => operand,
+                _ if strict => return Err(refused(format!("an operand that cannot be read at byte {pos}"))),
+                // Read leniently: past the byte.
+                _ => {
+                    lexer.pos = pos.saturating_add(1);
+                    operands.clear();
+                    continue;
+                }
+            };
+            if matches!(operand, Object::Ref(_)) {
+                return Err(refused("a reference"));
+            }
+            operands.push(operand);
+            continue;
+        }
+        let keyword = lexer.token();
+        if keyword.is_empty() {
+            if !strict {
+                lexer.pos = pos.saturating_add(1);
+                operands.clear();
+                continue;
+            }
+            return Err(refused(format!("a stray byte at {pos}")));
+        }
+        let keyword = keyword.to_vec();
+        if matches!(keyword.as_slice(), b"true" | b"false" | b"null") {
+            operands.push(Object::Null);
+            continue;
+        }
+        if keyword == b"BI" {
+            if strict && !operands.is_empty() {
+                return Err(refused("operands before an inline image"));
+            }
+            match inline_image_end(data, lexer.pos) {
+                Some(end) => lexer.pos = end,
+                None if strict => return Err(refused("an inline image that does not end")),
+                None => break,
+            }
+            operands.clear();
+            continue;
+        }
+        each(&keyword, &operands)?;
+        operands.clear();
+    }
+    if strict && !operands.is_empty() {
+        return Err(refused("operands after the last operator"));
+    }
+    Ok(())
+}
+
+/// Where an inline image's data ends (after `EI`), from just after `BI`: its dictionary read
+/// up to `ID`; where its size, colour space and depth give its data's length (no filter), that
+/// many bytes after the one whitespace byte, then whitespace and `EI`; otherwise as the
+/// structure scan finds it (whitespace, `EI`, then whitespace, a delimiter or the end).
+fn inline_image_end(data: &[u8], from: usize) -> Option<usize> {
+    let mut lexer = Lexer::new(data, from);
+    let mut dict = Dict::new();
+    loop {
+        lexer.skip_ws();
+        if lexer.eat_keyword(b"ID") {
+            break;
+        }
+        let Ok(Object::Name(key)) = lexer.object() else { return None };
+        let value = lexer.object().ok()?;
+        dict.set(key, value);
+    }
+    let begin = lexer.pos.checked_add(1)?;
+    let int = |a: &[u8], b: &[u8]| dict.get(a).or_else(|| dict.get(b)).and_then(Object::as_int).and_then(|v| usize::try_from(v).ok());
+    let components = match dict.get(b"CS").or_else(|| dict.get(b"ColorSpace")).and_then(Object::as_name) {
+        Some(b"G" | b"DeviceGray") => Some(1),
+        Some(b"RGB" | b"DeviceRGB") => Some(3),
+        Some(b"CMYK" | b"DeviceCMYK") => Some(4),
+        _ => None,
+    };
+    let unfiltered = dict.get(b"F").is_none() && dict.get(b"Filter").is_none();
+    if let (true, Some(width), Some(height), Some(depth), Some(components)) =
+        (unfiltered, int(b"W", b"Width"), int(b"H", b"Height"), int(b"BPC", b"BitsPerComponent"), components)
+    {
+        let row = width.checked_mul(components)?.checked_mul(depth)?.div_ceil(8);
+        let end = begin.checked_add(row.checked_mul(height)?)?;
+        let rest = data.get(end..)?;
+        let ei = rest.iter().position(|byte| !byte.is_ascii_whitespace())?;
+        if rest.get(ei..ei.checked_add(2)?) == Some(b"EI") {
+            return end.checked_add(ei)?.checked_add(2);
+        }
+    }
+    let mut at = begin;
+    loop {
+        let (&e, &i) = (data.get(at)?, data.get(at.checked_add(1)?)?);
+        let before = at == begin || data.get(at.wrapping_sub(1)).is_some_and(|byte| byte.is_ascii_whitespace());
+        let after = data.get(at.checked_add(2)?).is_none_or(|byte| byte.is_ascii_whitespace() || b"()<>[]{}/%".contains(byte));
+        if e == b'E' && i == b'I' && before && after {
+            return at.checked_add(2);
+        }
+        at = at.checked_add(1)?;
+    }
+}
