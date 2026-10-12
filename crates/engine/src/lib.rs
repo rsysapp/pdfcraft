@@ -301,6 +301,12 @@ impl Document {
         self.generation
     }
 
+    /// Embed build: whether the working file differs from the file as opened or last saved (an
+    /// undo back to the start makes it equal again, whatever `dirty` says).
+    pub fn differs_from_saved(&self) -> bool {
+        self.editor.as_ref().is_some_and(|editor| editor.cos.is_modified())
+    }
+
     /// Edit a PDF ▸ Edit text: the lines of existing text on `page` (0-based).
     pub fn text_lines(&self, page: usize) -> Vec<pdfcraft_edit::TextLine> {
         self.editor.as_ref().and_then(|e| pdfcraft_edit::text_lines(&e.cos, page).ok()).unwrap_or_default()
@@ -1891,6 +1897,8 @@ pub struct Session {
     /// Embed build (R6b-49): redactions are marked, never applied
     /// ([`Session::set_redaction_marks_only`]).
     redaction_marks_only: bool,
+    /// Embed build: the host's date for an edit session's changes ([`Session::set_edit_date`]).
+    edit_date: Option<i64>,
 }
 
 /// Lay a dynamic XFA form out (pages and fields) and give its widgets appearances.
@@ -1981,6 +1989,19 @@ impl Session {
         Self::default()
     }
 
+    /// Embed build: the date an edit session stamps on what it creates or changes (`/M`): the
+    /// host's, in seconds since the Unix epoch. `None` goes back to the clock. The web build has
+    /// no clock at all, so without it nothing edit mode makes would carry a date. Saves still
+    /// write no `/ModDate` where the document information is kept (R6b-45).
+    pub fn set_edit_date(&mut self, unix_secs: Option<i64>) {
+        self.edit_date = unix_secs;
+    }
+
+    /// Embed build: that date as it is written into the file (`D:…`), if an edit session set one.
+    pub fn edit_date_text(&self) -> Option<String> {
+        self.edit_date.map(pdfcraft_cos::pdf_date)
+    }
+
     /// Use a fixed clock (tests) instead of the system time.
     pub fn with_clock(mut self, clock: fn() -> i64) -> Self {
         self.clock = Some(clock);
@@ -2027,6 +2048,10 @@ impl Session {
     }
 
     fn now(&self) -> Option<i64> {
+        // Embed build: an edit session's date is the host's.
+        if let Some(date) = self.edit_date {
+            return Some(date);
+        }
         if let Some(c) = self.clock {
             return Some(c());
         }
@@ -2415,6 +2440,18 @@ impl Session {
             doc.js_output.errors.push(XFA_SCRIPTS_OFF.into());
         }
         Ok(())
+    }
+
+    /// Embed build: forget the undo and redo history of document `id`, leaving it as it is: an
+    /// edit session that starts with another author or date must not bring back what an earlier
+    /// one made.
+    pub fn clear_history(&mut self, id: DocId) {
+        if let Ok(doc) = self.doc_mut(id)
+            && let Some(editor) = doc.editor.as_mut()
+        {
+            editor.undo.clear();
+            editor.redo.clear();
+        }
     }
 
     pub fn undo(&mut self, id: DocId) -> Result<String, EditError> {
