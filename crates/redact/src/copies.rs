@@ -25,8 +25,11 @@
 //! changing what the action does.
 //!
 //! **What clearing does.** Bookmark titles read "[Redacted]"; annotations' text entries holding
-//! one go; form fields' names (`/T`) holding one are renamed `Field<n>` (R6b-58), and an
-//! action naming a field by such a string refuses; groups' names read "[Redacted]"; prefixes go;
+//! one go; form fields' names (`/T`, or the full name across its segments) holding one are
+//! renamed `Field<n>` (R6b-58); a field's tooltip or mapping name, any action carrying text
+//! (JavaScript, a link's URI, a submit, reset or hide naming fields, another file's name;
+//! wherever written, inline too) and any name tree's key but the destinations' holding one
+//! refuse, since none can be rewritten without changing what it does or names; groups' names read "[Redacted]"; prefixes go;
 //! named destinations are renamed to opaque names, matched by their bytes (a name or a string, literal or hex alike), with every
 //! destination naming them (in links, bookmarks, the opening action, additional actions and
 //! chained actions), and the named destinations' tree written again in order.
@@ -326,7 +329,10 @@ fn action_holds(doc: &Document, action: &Object, removed: &Removed, work: &inter
     }
     // A page or a structure element is reached from an action by reference, not text in it.
     if let Object::Ref(r) = action
-        && doc.get(*r).as_dict().is_some_and(|d| matches!(d.name(b"Type"), Some(b"Page" | b"Pages" | b"StructElem")))
+        && let Object::Dict(d) = &*doc.get(*r)
+        && (matches!(d.name(b"Type"), Some(b"Page" | b"Pages" | b"StructElem" | b"OCG" | b"OCMD"))
+            // R6b-58: a field or an annotation named by reference (a reset's, a hide's).
+            || [&b"FT"[..], b"Kids", b"Parent", b"Subtype"].iter().any(|key| d.contains(key)))
     {
         return Ok(false);
     }
@@ -352,7 +358,7 @@ fn action_holds(doc: &Document, action: &Object, removed: &Removed, work: &inter
             let mut held = false;
             for (key, value) in dict.iter() {
                 // Where a destination goes is followed apart (renamed with its name).
-                if matches!(key.as_slice(), b"D" | b"Dest" | b"Type" | b"S") {
+                if matches!(key.as_slice(), b"D" | b"Dest" | b"Type" | b"S" | b"EF" | b"RF") {
                     continue;
                 }
                 held |= action_holds(doc, value, removed, work, depth + 1)?;
@@ -439,6 +445,10 @@ pub(crate) fn clear(doc: &mut Document, removed: &Removed, report: &mut Report, 
     }
     // R6b-58: form fields' names; every object the field tree reaches is a field or its widget.
     let in_form = rename_fields(doc, &catalog, removed, report, work)?;
+    // R6b-58: actions, scripts, links and name trees naming a removed word refuse.
+    if registries_hold(doc, &catalog, removed, work)? {
+        return Err(RedactError::Refused(Refusal::CopyNotClearable));
+    }
     let annotations = page_annotations(doc, work);
     // Final audit: a group written in place (no object of its own) cannot be renamed alone:
     // refused, never passed over.
@@ -560,6 +570,8 @@ struct FormNode {
     kind: Option<Vec<u8>>,
     /// A value, inherited (`/V`, not null).
     valued: bool,
+    /// Its parent's place in the walk (parents come first).
+    parent: Option<usize>,
 }
 
 /// The form's field tree from `/AcroForm /Fields`, every object once, depth first, as the
@@ -573,9 +585,12 @@ fn form_nodes(doc: &Document, catalog: &Dict, work: &interp::Work) -> Result<Vec
     let Object::Array(top) = top else { return Err(refuse()) };
     let mut seen: HashSet<ObjRef> = HashSet::new();
     // Each entry with what it inherits, its depth, and whether it is read as a field.
-    let mut stack: Vec<(Object, FormNode, usize)> =
-        top.into_iter().rev().map(|entry| (entry, FormNode { obj: ObjRef::new(0, 0), field: true, kind: None, valued: false }, 0)).collect();
-    while let Some((entry, FormNode { field, kind, valued, .. }, depth)) = stack.pop() {
+    let mut stack: Vec<(Object, FormNode, usize)> = top
+        .into_iter()
+        .rev()
+        .map(|entry| (entry, FormNode { obj: ObjRef::new(0, 0), field: true, kind: None, valued: false, parent: None }, 0))
+        .collect();
+    while let Some((entry, FormNode { field, kind, valued, parent, .. }, depth)) = stack.pop() {
         work.charge(2);
         if work.spent() {
             return Err(RedactError::TooComplex);
@@ -599,9 +614,10 @@ fn form_nodes(doc: &Document, catalog: &Dict, work: &interp::Work) -> Result<Vec
             let Some(kid_ref) = kid.as_ref() else { return Err(refuse()) };
             let Some(kid_dict) = doc.get(kid_ref).as_dict().cloned() else { return Err(refuse()) };
             let kid_field = kid_dict.contains(b"T") || kid_dict.contains(b"Kids");
-            stack.push((kid, FormNode { obj: kid_ref, field: kid_field, kind: kind.clone(), valued }, depth + 1));
+            let parent = Some(out.len());
+            stack.push((kid, FormNode { obj: kid_ref, field: kid_field, kind: kind.clone(), valued, parent }, depth + 1));
         }
-        out.push(FormNode { obj: r, field, kind, valued });
+        out.push(FormNode { obj: r, field, kind, valued, parent });
     }
     Ok(out)
 }
@@ -634,10 +650,11 @@ pub(crate) fn signed(doc: &Document, work: &interp::Work) -> Result<bool, Redact
     Ok(false)
 }
 
-/// R6b-58: the form fields whose name (`/T`) holds a removed word, or is not read alike, renamed
-/// `Field<n>` (a name no field of the form has), each counted, as destinations are. An action
-/// naming a field by a string holding one is refused: it cannot follow without changing what
-/// it does. Returns every object the form's tree reaches.
+/// R6b-58: the form fields whose name (`/T`) holds a removed word, or is not read alike, or
+/// whose full name (`parent.child`) does across its segments, renamed `Field<n>` (a name no
+/// field of the form has), each counted, as destinations are. A field's other names (`/TU`,
+/// `/TM`) holding one refuse: they are its tooltip and the name it is submitted under. Returns
+/// every object the form's tree reaches.
 fn rename_fields(
     doc: &mut Document,
     catalog: &Dict,
@@ -645,67 +662,161 @@ fn rename_fields(
     report: &mut Report,
     work: &interp::Work,
 ) -> Result<HashSet<ObjRef>, RedactError> {
+    let refuse = || RedactError::Refused(Refusal::CopyNotClearable);
     let nodes = form_nodes(doc, catalog, work)?;
     let reached: HashSet<ObjRef> = nodes.iter().map(|node| node.obj).collect();
+    let name_of = |doc: &Document, node: &FormNode| doc.get(node.obj).as_dict().and_then(|d| d.get(b"T").map(|t| Object::clone(&doc.resolve(t))));
     let mut taken: HashSet<Vec<u8>> = HashSet::new();
-    let mut doomed: Vec<ObjRef> = Vec::new();
-    for node in nodes.iter().filter(|node| node.field) {
-        let Some(dict) = doc.get(node.obj).as_dict().cloned() else { continue };
-        let Some(name) = dict.get(b"T").map(|t| Object::clone(&doc.resolve(t))) else { continue };
-        let reading = match &name {
-            Object::String(text) => {
-                taken.insert(text.bytes.clone());
-                read_text(&text.bytes)
-            }
-            _ => Reading::Unread,
-        };
-        if name_held(reading, removed, report) {
-            doomed.push(node.obj);
+    for node in &nodes {
+        if let Some(Object::String(text)) = name_of(doc, node) {
+            taken.insert(text.bytes.clone());
         }
     }
+    // Each field's full name as it will read, by its place in the walk (parents come first).
+    let mut full: Vec<String> = Vec::with_capacity(nodes.len());
     let mut next = 1usize;
-    for r in doomed {
-        let name = loop {
-            let name = format!("Field{next}");
+    for node in &nodes {
+        let parent = node.parent.and_then(|at| full.get(at)).cloned().unwrap_or_default();
+        let Some(dict) = doc.get(node.obj).as_dict().cloned() else { return Err(refuse()) };
+        for other in [&b"TU"[..], b"TM"] {
+            if let Some(value) = dict.get(other)
+                && holds(doc, value, removed, report)
+            {
+                return Err(refuse());
+            }
+        }
+        let Some(name) = node.field.then(|| name_of(doc, node)).flatten() else {
+            full.push(parent);
+            continue;
+        };
+        let reading = match &name {
+            Object::String(text) => read_text(&text.bytes),
+            _ => Reading::Unread,
+        };
+        let join = |segment: &str| if parent.is_empty() { segment.to_string() } else { format!("{parent}.{segment}") };
+        let own = match &reading {
+            Reading::Read(text) => Some(text.clone()),
+            Reading::Unread => None,
+        };
+        let held = match &own {
+            Some(text) => removed.held_in(text) || removed.held_in(&join(text)),
+            None => name_held(reading, removed, report),
+        };
+        if !held {
+            full.push(join(own.as_deref().unwrap_or_default()));
+            continue;
+        }
+        let fresh = loop {
+            let fresh = format!("Field{next}");
             next += 1;
-            if taken.insert(name.clone().into_bytes()) {
-                break name;
+            if taken.insert(fresh.clone().into_bytes()) {
+                break fresh;
             }
         };
-        doc.update_dict(r, |d| d.set(b"T".to_vec(), Object::String(PdfString::text(&name))))?;
+        // Renamed, the full name may still hold one only where the parent's ends it: refused.
+        if removed.held_in(&join(&fresh)) {
+            return Err(refuse());
+        }
+        doc.update_dict(node.obj, |d| d.set(b"T".to_vec(), Object::String(PdfString::text(&fresh))))?;
         report.field_names_renamed += 1;
+        full.push(join(&fresh));
     }
-    // Actions that name fields by their names: submitting, resetting, hiding.
-    for num in doc.object_numbers() {
+    Ok(reached)
+}
+
+/// The actions that carry text, and the entries holding it (a destination in this document is
+/// followed apart; in another, `/D` is text).
+const TEXT_ACTIONS: [(&[u8], &[&[u8]]); 10] = [
+    (b"JavaScript", &[b"JS"]),
+    (b"URI", &[b"URI"]),
+    (b"Launch", &[b"F", b"Win", b"Mac", b"Unix"]),
+    (b"GoToR", &[b"F", b"D"]),
+    (b"GoToE", &[b"F", b"D", b"T"]),
+    (b"SubmitForm", &[b"F", b"Fields"]),
+    (b"ResetForm", &[b"Fields"]),
+    (b"Hide", &[b"T"]),
+    (b"ImportData", &[b"F"]),
+    (b"Rendition", &[b"JS"]),
+];
+
+/// R6b-58 (registry fanout): every action in the document that carries text, wherever it is
+/// written (in an object of its own, or inline under `/A`, `/AA`, `/Next` or a name tree), and
+/// every key of a name tree but the destinations' (renamed apart), with an embedded file's
+/// names. One holding a removed word, or not read alike, cannot be rewritten without changing
+/// what it does or names: refused.
+fn registries_hold(doc: &Document, catalog: &Dict, removed: &Removed, work: &interp::Work) -> Result<bool, RedactError> {
+    fn inline(doc: &Document, value: &Object, removed: &Removed, work: &interp::Work, depth: usize) -> Result<bool, RedactError> {
+        if depth > 64 {
+            return Err(RedactError::TooComplex);
+        }
         work.charge(1);
         if work.spent() {
             return Err(RedactError::TooComplex);
         }
+        let dict = match value {
+            Object::Dict(dict) => dict,
+            Object::Stream(stream) => &stream.dict,
+            Object::Array(items) => {
+                for item in items {
+                    if inline(doc, item, removed, work, depth + 1)? {
+                        return Ok(true);
+                    }
+                }
+                return Ok(false);
+            }
+            _ => return Ok(false),
+        };
+        if let Some((_, keys)) = dict.name(b"S").and_then(|kind| TEXT_ACTIONS.iter().find(|(name, _)| *name == kind)) {
+            for key in keys.iter() {
+                if let Some(value) = dict.get(key)
+                    && action_holds(doc, value, removed, work, 0)?
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        for (_, value) in dict.iter() {
+            if inline(doc, value, removed, work, depth + 1)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    for num in doc.object_numbers() {
         let Ok(object) = doc.try_get(num) else { return Err(RedactError::Refused(Refusal::CopyNotClearable)) };
-        let dict = match &*object {
-            Object::Dict(d) => d.clone(),
-            Object::Stream(s) => s.dict.clone(),
-            _ => continue,
-        };
-        let key: &[u8] = match dict.name(b"S") {
-            Some(b"SubmitForm" | b"ResetForm") => b"Fields",
-            Some(b"Hide") => b"T",
-            _ => continue,
-        };
-        let Some(value) = dict.get(key).map(|v| Object::clone(&doc.resolve(v))) else { continue };
-        let strings: Vec<Object> = match value {
-            Object::Array(items) => items.iter().map(|item| Object::clone(&doc.resolve(item))).collect(),
-            other => vec![other],
-        };
-        for string in strings {
-            if let Object::String(text) = string
-                && name_held(read_text(&text.bytes), removed, report)
+        if inline(doc, &object, removed, work, 0)? {
+            return Ok(true);
+        }
+    }
+    let Some(names) = catalog.get(b"Names").and_then(|n| doc.resolve(n).as_dict().cloned()) else { return Ok(false) };
+    for (tree, top) in names.iter() {
+        if tree.as_slice() == b"Dests" {
+            continue;
+        }
+        let mut entries: Vec<(Vec<u8>, Object)> = Vec::new();
+        collect_tree(doc, top, &mut entries, &mut HashSet::new(), work, 0)?;
+        for (key, value) in entries {
+            let held = match read_text(&key) {
+                Reading::Read(text) => removed.held_in(&text),
+                Reading::Unread => true,
+            };
+            if held {
+                return Ok(true);
+            }
+            if tree.as_slice() == b"EmbeddedFiles"
+                && let Some(spec) = doc.resolve(&value).as_dict().cloned()
             {
-                return Err(RedactError::Refused(Refusal::CopyNotClearable));
+                for key in [&b"F"[..], b"UF", b"DOS", b"Mac", b"Unix", b"Desc"] {
+                    if let Some(name) = spec.get(key)
+                        && action_holds(doc, name, removed, work, 0)?
+                    {
+                        return Ok(true);
+                    }
+                }
             }
         }
     }
-    Ok(reached)
+    Ok(false)
 }
 
 /// The prefixes holding a removed word in the page-label number tree under `node`, removed.

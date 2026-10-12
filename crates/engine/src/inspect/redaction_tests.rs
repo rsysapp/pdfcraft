@@ -1747,3 +1747,75 @@ fn a_short_removed_word_matches_only_as_a_word() {
         assert_eq!(applied.facts.bookmarks_cleared, cleared, "{title}");
     }
 }
+
+#[test]
+fn every_registry_naming_a_removed_word_is_cleared_or_refuses() {
+    // R6b-58 (scan "registry fanout"): a field's name is held in more places than its /T. Its
+    // full name across segments is renamed; an action naming it (inline under /A or /AA too),
+    // JavaScript, a link's target, another name tree's key and the field's other names
+    // (/TU, /TM) cannot be rewritten alike: the redaction is refused.
+    let form = |widget: &str, more: Vec<Vec<u8>>, cat: &str| {
+        let mut extras =
+            vec![format!("<< /Type /Annot /Subtype /Widget /FT /Tx /T (box) /V (v) /Rect [150 10 190 30] /P 3 0 R {widget} >>").into_bytes()];
+        extras.extend(more);
+        Spec {
+            cat: format!("/AcroForm << /Fields [6 0 R] /DA (/Helv 0 Tf 0 g) >> {cat}"),
+            page: "/Annots [6 0 R]".into(),
+            extras,
+            ..Spec::new(&format!("{LINE}\n{KEEP}"))
+        }
+        .build()
+    };
+    let refused = [
+        ("an inline submit action", form("/A << /S /SubmitForm /F (https://example.org/f) /Fields [(SECRETWORD)] >>", vec![], "")),
+        ("an inline reset action in /AA", form("/AA << /K << /S /ResetForm /Fields [(x) (SECRETWORD)] >> >>", vec![], "")),
+        ("an inline hide action", form("/AA << /U << /S /Hide /T (SECRETWORD) >> >>", vec![], "")),
+        ("a calculation script", form("/AA << /C << /S /JavaScript /JS (this.getField\\(\"SECRETWORD\"\\).value = 1;) >> >>", vec![], "")),
+        ("a script in a stream", form("/AA << /F << /S /JavaScript /JS 7 0 R >> >>", vec![stream("", b"getField('SECRETWORD')")], "")),
+        (
+            "a document script",
+            form("", vec![b"<< /Names [(init) << /S /JavaScript /JS (var x = 'SECRETWORD';) >>] >>".to_vec()], "/Names << /JavaScript 7 0 R >>"),
+        ),
+        (
+            "a document script's name",
+            form("", vec![b"<< /Names [(SECRETWORD) << /S /JavaScript /JS (1;) >>] >>".to_vec()], "/Names << /JavaScript 7 0 R >>"),
+        ),
+        (
+            "an embedded file's name",
+            form("", vec![b"<< /Names [(SECRETWORD.txt) << /Type /Filespec /F (a.txt) >>] >>".to_vec()], "/Names << /EmbeddedFiles 7 0 R >>"),
+        ),
+        ("a document action", form("", vec![], "/AA << /WC << /S /JavaScript /JS (app.alert\\('SECRETWORD'\\)) >> >>")),
+        ("the field's tooltip", form("/TU (The SECRETWORD box)", vec![], "")),
+        ("the field's mapping name", form("/TM (SECRETWORD)", vec![], "")),
+    ];
+    for (what, base) in refused {
+        assert_eq!(apply(&base, &marked(&base, &[BOX])).map(|_| ()), Err(ApplyError::Refused(Refusal::CopyNotClearable)), "{what}");
+    }
+    // A link's target on the page.
+    let link = Spec {
+        page: "/Annots [6 0 R]".into(),
+        extras: vec![b"<< /Type /Annot /Subtype /Link /Rect [150 10 190 30] /A << /S /URI /URI (https://example.org/SECRETWORD) >> >>".to_vec()],
+        ..Spec::new(&format!("{LINE}\n{KEEP}"))
+    }
+    .build();
+    assert_eq!(apply(&link, &marked(&link, &[BOX])).map(|_| ()), Err(ApplyError::Refused(Refusal::CopyNotClearable)), "a link");
+    // A full name holding the removed word across its segments ("SECRET.WORD"): the segment
+    // completing it is renamed, once.
+    let base = Spec {
+        cat: "/AcroForm << /Fields [6 0 R] /DA (/Helv 0 Tf 0 g) >>".into(),
+        page: "/Annots [7 0 R]".into(),
+        extras: vec![
+            b"<< /T (SECRET) /Kids [7 0 R] >>".to_vec(),
+            b"<< /Type /Annot /Subtype /Widget /Parent 6 0 R /FT /Tx /T (WORD) /V (v) /Rect [150 10 190 30] /P 3 0 R >>".to_vec(),
+        ],
+        ..Spec::new(&format!("{LINE}\n{KEEP}"))
+    }
+    .build();
+    let applied = apply(&base, &marked(&base, &[BOX])).unwrap();
+    assert_eq!((applied.facts.field_names_renamed, applied.inspection.copies_cleared.field_names), (1, 1), "{:?}", applied.facts);
+    assert!(found(&applied.bytes, "WORD").is_empty(), "{:?}", found(&applied.bytes, "WORD"));
+    // Calculation order lists fields by reference, and a script not naming a removed word
+    // stays: accepted.
+    let base = form("/AA << /C << /S /JavaScript /JS (event.value = 1;) >> >>", vec![], "");
+    assert!(apply(&base, &marked(&base, &[BOX])).is_ok());
+}
