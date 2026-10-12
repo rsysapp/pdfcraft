@@ -42,12 +42,159 @@ pub enum RedactError {
     /// may do, or nests deeper than it may follow.
     #[error("the page's content is too complex to redact safely, so nothing was changed")]
     TooComplex,
+    /// Embed build (R6b-54): what lies under a mark cannot be removed exactly, for a reason a
+    /// host can name (see [`Refusal`]).
+    #[error("the marked areas can't be redacted ({}), so nothing was changed", .0.code())]
+    Refused(Refusal),
     #[error(transparent)]
     Edit(#[from] pdfcraft_edit::EditError),
     #[error(transparent)]
     Form(#[from] pdfcraft_forms::FormError),
     #[error(transparent)]
     Cos(#[from] pdfcraft_cos::CosError),
+}
+
+/// Embed build (R6b-54): why marks cannot be applied, as a closed list a host words in plain
+/// sentences: each is a kind of content under a mark the redactor will not guess about. The
+/// redaction is refused whole on every one (nothing changed).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Refusal {
+    /// A tiling pattern or a soft mask reaches a mark: its cell or group would keep part of what
+    /// lies under it, and changing it changes what shows outside the marks too.
+    PatternOrMaskUnderMark,
+    /// A shading (`sh`, or a shading pattern) reaches a mark without lying wholly under the
+    /// marks: its data can draw a picture, and it cannot be cut along the mark.
+    ShadingUnderMark,
+    /// Text under a mark has no readable characters (a font without Unicode information), and
+    /// the document holds copies elsewhere (bookmarks, document information, XMP) that could
+    /// spell it: what to clear there cannot be known.
+    UnreadableMarkedText,
+    /// A path under a mark cannot be cut exactly along it (a dashed stroke, a curve too
+    /// complex to flatten within the bounds).
+    PathNotClippable,
+    /// The content asks for more work, or nests deeper, than a redaction may do, or the deadline
+    /// passed.
+    TooComplex,
+    /// An image partly under a mark cannot have its pixels cleared (a codec the redactor does
+    /// not re-encode, such as JPEG, or a colour space without a black it can write).
+    ImageNotClearable,
+    /// Text near a mark is set in a font whose glyphs the redactor cannot place (vertical
+    /// writing, a character map it does not read, a skewed Type 3 font).
+    TextNotPlaceable,
+    /// The content's state cannot be followed exactly as a viewer follows it (a `Q` with no
+    /// `q`, text shown outside a text object, operands an operator does not take).
+    ContentNotFollowable,
+    /// A page's content cannot be read (a content stream that does not decode).
+    ContentUnreadable,
+    /// The save added an annotation of a kind the host does not count under marks (neither a
+    /// stamp nor a drawing) where a mark would remove it.
+    AddedAnnotationUnderMark,
+}
+
+impl Refusal {
+    /// Every refusal, in a fixed order.
+    pub const ALL: [Refusal; 10] = [
+        Refusal::PatternOrMaskUnderMark,
+        Refusal::ShadingUnderMark,
+        Refusal::UnreadableMarkedText,
+        Refusal::PathNotClippable,
+        Refusal::TooComplex,
+        Refusal::ImageNotClearable,
+        Refusal::TextNotPlaceable,
+        Refusal::ContentNotFollowable,
+        Refusal::ContentUnreadable,
+        Refusal::AddedAnnotationUnderMark,
+    ];
+
+    /// The code a host words (`snake_case`, stable).
+    pub fn code(self) -> &'static str {
+        match self {
+            Refusal::PatternOrMaskUnderMark => "pattern_or_mask_under_mark",
+            Refusal::ShadingUnderMark => "shading_under_mark",
+            Refusal::UnreadableMarkedText => "unreadable_marked_text",
+            Refusal::PathNotClippable => "path_not_clippable",
+            Refusal::TooComplex => "too_complex",
+            Refusal::ImageNotClearable => "image_not_clearable",
+            Refusal::TextNotPlaceable => "text_not_placeable",
+            Refusal::ContentNotFollowable => "content_not_followable",
+            Refusal::ContentUnreadable => "content_unreadable",
+            Refusal::AddedAnnotationUnderMark => "added_annotation_under_mark",
+        }
+    }
+}
+
+/// Embed build (R6b-55): **the one under-mark rule**, shared by the redactor, the inspector's
+/// counts of what an update adds under its marks, its account of what a redaction removed, and
+/// the server's self-check: an annotation (or a form field's widget) is under a mark when its
+/// `/Rect` overlaps one of the mark's areas by a positive area. A field is under a mark when any
+/// of its widgets is, and then goes whole.
+pub fn under_mark(rect: [f64; 4], area: [f64; 4]) -> bool {
+    pdfcraft_content::overlaps(area, rect, 0.0)
+}
+
+/// Embed build (R6b-55): a mark's areas, by the one rule both sides read them with. `quads` is
+/// `/QuadPoints` when it is an array of numbers only (else `None`), `rect` is `/Rect` when it is
+/// an array of numbers only. Each quadrilateral gives its bounding box when `/QuadPoints` holds
+/// a positive multiple of eight finite numbers; otherwise `/Rect` gives one area when it holds
+/// four finite numbers. Empty when neither does. A mark is usable only when this is not empty
+/// and every area has a positive width and height (see [`usable_areas`]).
+pub fn mark_areas(quads: Option<&[f64]>, rect: Option<&[f64]>) -> Vec<[f64; 4]> {
+    let boxed = |points: &[f64]| {
+        let (mut x0, mut y0, mut x1, mut y1) = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for point in points.chunks(2) {
+            if let [x, y] = point {
+                (x0, x1, y0, y1) = (x0.min(*x), x1.max(*x), y0.min(*y), y1.max(*y));
+            }
+        }
+        [x0, y0, x1, y1]
+    };
+    if let Some(points) = quads.filter(|v| !v.is_empty() && v.len().is_multiple_of(8) && v.iter().all(|x| x.is_finite())) {
+        return points.chunks(8).map(boxed).collect();
+    }
+    match rect {
+        Some(values @ [_, _, _, _]) if values.iter().all(|x| x.is_finite()) => vec![boxed(values)],
+        _ => Vec::new(),
+    }
+}
+
+/// Embed build (R6b-55): whether a mark's areas (see [`mark_areas`]) are usable: at least one,
+/// each with a positive width and height.
+pub fn usable_areas(areas: &[[f64; 4]]) -> bool {
+    !areas.is_empty() && areas.iter().all(|a| a[2] > a[0] && a[3] > a[1])
+}
+
+/// Embed build (R6b-54, N9): when a redaction must stop (natively: an instant; wasm32 has no
+/// clock here, so none is kept and only the work bound holds).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Deadline {
+    #[cfg(not(target_arch = "wasm32"))]
+    at: std::time::Instant,
+}
+
+impl Deadline {
+    /// `after` from now (`None` on wasm32, or past the clock's range).
+    pub fn after(after: std::time::Duration) -> Option<Deadline> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            std::time::Instant::now().checked_add(after).map(|at| Deadline { at })
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = after;
+            None
+        }
+    }
+
+    pub(crate) fn passed(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            std::time::Instant::now() >= self.at
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            false
+        }
+    }
 }
 
 /// A redaction mark on a page.
@@ -127,6 +274,13 @@ pub struct Report {
     pub information_cleared: usize,
     pub metadata_removed: usize,
     pub destinations_renamed: usize,
+    /// Embed build (R6b-55): the annotations removed (under a mark, or replying to one that
+    /// was, with replies to those), by object, pop-ups and form widgets left out: a host tells
+    /// apart those its save added from the base's own by these.
+    pub removed_annotations: Vec<ObjRef>,
+    /// Embed build (R6b-55): the form fields removed whole (a widget under a mark), by full
+    /// name.
+    pub removed_fields: Vec<String>,
 }
 
 /// Embed build (P6-33, R6b-50): how marks are applied.
@@ -140,6 +294,15 @@ pub struct Options {
     /// [`Report::bookmarks_cleared`]): bookmark titles, document information, the XMP packet,
     /// named destinations.
     pub document_copies: bool,
+    /// Embed build (R6b-54, N9): past it the redaction stops ([`RedactError::TooComplex`]),
+    /// checked as the work is done.
+    pub deadline: Option<Deadline>,
+    /// Embed build (R6b-54): refuse what cannot be removed exactly under a mark, with a named
+    /// reason ([`RedactError::Refused`]): a tiling pattern or soft mask reaching a mark, a
+    /// shading reaching one without lying wholly under the marks, text that cannot be placed.
+    /// What a host applying a save's marks requires; desktop redaction keeps redacting pattern
+    /// cells and soft-mask groups in place.
+    pub exact: bool,
 }
 
 /// Embed build (R6b-50): what ends a run of removed glyphs in the removed text.
@@ -175,32 +338,14 @@ pub fn marks(doc: &Document) -> Vec<Mark> {
             if d.name(b"Subtype") != Some(b"Redact") {
                 continue;
             }
-            let quads: Vec<f64> = d
-                .get(b"QuadPoints")
-                .and_then(|q| doc.resolve(q).as_array().map(|a| a.iter().filter_map(Object::as_f64).collect()))
-                .unwrap_or_default();
-            let mut rects: Vec<[f64; 4]> = quads
-                .as_chunks::<8>()
-                .0
-                .iter()
-                .map(|q| {
-                    let xs = [q[0], q[2], q[4], q[6]];
-                    let ys = [q[1], q[3], q[5], q[7]];
-                    [
-                        xs.iter().copied().fold(f64::MAX, f64::min),
-                        ys.iter().copied().fold(f64::MAX, f64::min),
-                        xs.iter().copied().fold(f64::MIN, f64::max),
-                        ys.iter().copied().fold(f64::MIN, f64::max),
-                    ]
-                })
-                .filter(|r| r.iter().all(|v| v.is_finite()))
-                .collect();
-            if rects.is_empty()
-                && let Some(r) = rect_of(doc, d.get(b"Rect"))
-            {
-                rects.push(r);
-            }
-            if rects.is_empty() {
+            // Embed build (R6b-55): the areas by the rule the inspector reads them with; a mark
+            // without usable ones is never applied (an update adding one is refused).
+            let numbers = |key: &[u8]| -> Option<Vec<f64>> {
+                let value = doc.resolve(d.get(key)?);
+                value.as_array()?.iter().map(|item| matches!(item, Object::Int(_) | Object::Real(_)).then(|| item.as_f64()).flatten()).collect()
+            };
+            let rects = mark_areas(numbers(b"QuadPoints").as_deref(), numbers(b"Rect").as_deref());
+            if !usable_areas(&rects) {
                 continue;
             }
             let overlay = d.get(b"OverlayText").and_then(|t| doc.resolve(t).as_string().map(|s| s.to_text())).unwrap_or_default();
@@ -312,6 +457,19 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
 
 /// Embed build: [`apply`], with `options`.
 pub fn apply_with(doc: &mut Document, pages: Option<&[usize]>, options: Options) -> Result<Report, RedactError> {
+    apply_chosen(doc, &|mark: &Mark| pages.is_none_or(|p| p.contains(&mark.page)), options)
+}
+
+/// Embed build (R6b-55): apply only the marks `which` names (by object), with `options`: a
+/// host applies the marks its save added, never a base's own unapplied ones, which stay as
+/// they are (annotations of the base).
+pub fn apply_only(doc: &mut Document, which: &[ObjRef], options: Options) -> Result<Report, RedactError> {
+    let which: std::collections::HashSet<ObjRef> = which.iter().copied().collect();
+    apply_chosen(doc, &|mark: &Mark| which.contains(&mark.obj), options)
+}
+
+fn apply_chosen(doc: &mut Document, chosen_by: &dyn Fn(&Mark) -> bool, options: Options) -> Result<Report, RedactError> {
+    use std::collections::HashSet;
     let mut all_marks = marks(doc);
     if options.black {
         for mark in &mut all_marks {
@@ -319,26 +477,39 @@ pub fn apply_with(doc: &mut Document, pages: Option<&[usize]>, options: Options)
             mark.overlay.clear();
         }
     }
-    let chosen: Vec<&Mark> = all_marks.iter().filter(|m| pages.is_none_or(|p| p.contains(&m.page))).collect();
+    let chosen: Vec<&Mark> = all_marks.iter().filter(|m| chosen_by(m)).collect();
     if chosen.is_empty() {
         return Err(RedactError::NothingToApply);
     }
+    let chosen_objects: HashSet<ObjRef> = chosen.iter().map(|m| m.obj).collect();
     let mut report = Report { marks: chosen.len(), ..Report::default() };
     let mut by_page: Vec<usize> = chosen.iter().map(|m| m.page).collect();
     by_page.sort_unstable();
     by_page.dedup();
     report.pages = by_page.len();
+    // Embed build (follow-up 8 audit, R6b-54 N9): one work bound, and the deadline, for every
+    // page and every loop below.
+    let work = interp::Work::new(interp::MAX_WORK, options.deadline);
+    let spent = |work: &interp::Work| if work.spent() { Err(RedactError::TooComplex) } else { Ok(()) };
     let mut doomed_fields: Vec<String> = Vec::new();
-    let widget_owner: Vec<(ObjRef, String)> =
-        pdfcraft_forms::fields(doc).into_iter().flat_map(|f| f.widgets.iter().map(|w| (w.obj, f.name.clone())).collect::<Vec<_>>()).collect();
+    let mut widget_owner: std::collections::HashMap<ObjRef, String> = std::collections::HashMap::new();
+    for field in pdfcraft_forms::fields(doc) {
+        for widget in &field.widgets {
+            work.charge(1);
+            widget_owner.insert(widget.obj, field.name.clone());
+        }
+    }
+    spent(&work)?;
     // Embed build (R6b-50): the removed glyphs' text, and every annotation removed.
     let mut removed_text = String::new();
-    // Embed build (follow-up 8 audit): one work bound for every page.
-    let work = std::rc::Rc::new(std::cell::Cell::new(interp::MAX_WORK));
     let mut all_removed: Vec<ObjRef> = Vec::new();
+    let mut removed_set: HashSet<ObjRef> = HashSet::new();
+    // The pages as they are before any is changed: each page is changed only while it is the
+    // one being redacted, so its dictionary here is current then.
+    let pages_before = pdfcraft_model::pages(doc);
 
     for &pi in &by_page {
-        let page = pdfcraft_model::pages(doc).swap_remove(pi);
+        let Some(page) = pages_before.get(pi).cloned() else { return Err(RedactError::Unreadable(pi + 1)) };
         let page_marks: Vec<&Mark> = chosen.iter().copied().filter(|m| m.page == pi).collect();
         let rects: Vec<[f64; 4]> = page_marks.iter().flat_map(|m| m.rects.iter().copied()).collect();
 
@@ -348,6 +519,7 @@ pub fn apply_with(doc: &mut Document, pages: Option<&[usize]>, options: Options)
         let (out, exhausted) = {
             let mut scope = Scope::new(&rects, Mode::Apply, &mut report);
             scope.work = work.clone();
+            scope.exact = options.exact;
             let out = process(doc, &mut scope, &data, &resources, pdfcraft_content::Matrix::IDENTITY);
             removed_text.push_str(&scope.removed_text);
             (out, scope.exhausted())
@@ -355,6 +527,10 @@ pub fn apply_with(doc: &mut Document, pages: Option<&[usize]>, options: Options)
         // Embed build (follow-up 8 audit): past the work bound, or nested too deep.
         if exhausted {
             return Err(RedactError::TooComplex);
+        }
+        // Embed build (R6b-54): what the redactor would not guess about, by its reason.
+        if let Some(refusal) = out.refusal {
+            return Err(RedactError::Refused(refusal));
         }
         // Embed build (R6b-50): a pattern cell or soft mask the redactor could not redact.
         if out.residue > 0 {
@@ -449,16 +625,20 @@ pub fn apply_with(doc: &mut Document, pages: Option<&[usize]>, options: Options)
         })?;
         report.thumbnails += usize::from(had_thumbnail);
 
-        // 2. Annotations: the marks, and whatever lies under them (with their pop-ups).
+        // 2. Annotations: the marks, and whatever lies under them (with their pop-ups), by the
+        // one under-mark rule (R6b-55).
         let annots = annots_of(doc, &doc.get(page.obj).as_dict().cloned().unwrap_or_default());
         let mut removed: Vec<ObjRef> = Vec::new();
+        let mut removed_here: HashSet<ObjRef> = HashSet::new();
         for a in &annots {
+            work.charge(rects.len().max(1));
             let Some(r) = a.as_ref() else { continue };
             let obj = doc.get(r);
             let Some(d) = obj.as_dict() else { continue };
             let subtype = d.name(b"Subtype").unwrap_or(b"");
             if subtype == b"Redact" {
-                if page_marks.iter().any(|m| m.obj == r) {
+                // Only the chosen marks go; any other (a base's unapplied mark) stays as it is.
+                if chosen_objects.contains(&r) && removed_here.insert(r) {
                     removed.push(r);
                 }
                 continue;
@@ -466,31 +646,41 @@ pub fn apply_with(doc: &mut Document, pages: Option<&[usize]>, options: Options)
             if subtype == b"Popup" {
                 continue;
             }
-            if rect_of(doc, d.get(b"Rect")).is_some_and(|b| rects.iter().any(|x| pdfcraft_content::overlaps(*x, b, 0.0))) {
+            if rect_of(doc, d.get(b"Rect")).is_some_and(|b| rects.iter().any(|x| under_mark(b, *x))) && removed_here.insert(r) {
                 removed.push(r);
-                if subtype == b"Widget" {
-                    if let Some((_, name)) = widget_owner.iter().find(|(w, _)| *w == r)
-                        && !doomed_fields.contains(name)
-                    {
-                        doomed_fields.push(name.clone());
+                match widget_owner.get(&r) {
+                    Some(name) if subtype == b"Widget" => {
+                        if !doomed_fields.contains(name) {
+                            doomed_fields.push(name.clone());
+                        }
                     }
-                } else {
-                    report.annotations += 1;
+                    // Embed build (R6b-55): a widget of no field is an annotation like any other.
+                    _ => {
+                        report.annotations += 1;
+                        report.removed_annotations.push(r);
+                    }
                 }
             }
         }
-        let kept: Vec<Object> = annots
-            .into_iter()
-            .filter(|a| {
-                let Some(r) = a.as_ref() else { return true };
-                if removed.contains(&r) {
-                    return false;
+        spent(&work)?;
+        // Pop-ups of removed annotations go too; one with an appearance of its own is an
+        // annotation a viewer draws, and is counted (as the inspector counts it).
+        for a in &annots {
+            let Some(r) = a.as_ref() else { continue };
+            let obj = doc.get(r);
+            let Some(d) = obj.as_dict() else { continue };
+            if d.name(b"Subtype") == Some(b"Popup")
+                && d.get(b"Parent").and_then(Object::as_ref).is_some_and(|p| removed_here.contains(&p))
+                && removed_here.insert(r)
+            {
+                removed.push(r);
+                if d.contains(b"AP") {
+                    report.annotations += 1;
+                    report.removed_annotations.push(r);
                 }
-                // Pop-ups of removed annotations go too.
-                let obj = doc.get(r);
-                !obj.as_dict().and_then(|d| d.get(b"Parent")).and_then(Object::as_ref).is_some_and(|p| removed.contains(&p))
-            })
-            .collect();
+            }
+        }
+        let kept: Vec<Object> = annots.into_iter().filter(|a| !a.as_ref().is_some_and(|r| removed_here.contains(&r))).collect();
         doc.update_dict(page.obj, |d| {
             if kept.is_empty() {
                 d.remove(b"Annots");
@@ -501,22 +691,30 @@ pub fn apply_with(doc: &mut Document, pages: Option<&[usize]>, options: Options)
         // Embed build: the tags naming a removed annotation lose its text, and the reference
         // (follow-up 7 audit, item 10).
         report.tags += tags::clean_objects(doc, &removed)?;
+        removed_set.extend(removed.iter().copied());
         all_removed.extend(removed);
     }
 
     // Embed build (R6b-50): replies to a removed annotation (`/IRT`, any page), replies to
     // them, and their pop-ups go too: each would keep it reachable.
-    let replies = remove_threads(doc, &mut all_removed)?;
+    let replies = remove_threads(doc, &mut removed_set, &work)?;
     report.annotations += replies.len();
+    report.removed_annotations.extend(replies.iter().copied());
     report.tags += tags::clean_objects(doc, &replies)?;
+    all_removed.extend(replies);
+    spent(&work)?;
 
     // 3. Form fields with a widget under a mark (all their widgets go).
+    let present: HashSet<String> = widget_owner.values().cloned().collect();
     for name in &doomed_fields {
-        if pdfcraft_forms::fields(doc).iter().any(|f| &f.name == name) {
+        work.charge(1);
+        if present.contains(name) {
             pdfcraft_forms::delete_field(doc, name)?;
             report.fields += 1;
+            report.removed_fields.push(name.clone());
         }
     }
+    spent(&work)?;
 
     // 4. The boxes.
     for &pi in &by_page {
@@ -529,32 +727,48 @@ pub fn apply_with(doc: &mut Document, pages: Option<&[usize]>, options: Options)
 
     // 5. Verify: nothing readable may remain under a region.
     let mut residue = 0;
+    let pages_after = pdfcraft_model::pages(doc);
     for &pi in &by_page {
-        let page = pdfcraft_model::pages(doc).swap_remove(pi);
+        let Some(page) = pages_after.get(pi) else { return Err(RedactError::Unreadable(pi + 1)) };
         let rects: Vec<[f64; 4]> = chosen.iter().filter(|m| m.page == pi).flat_map(|m| m.rects.iter().copied()).collect();
-        let (list, data) = page_streams(doc, &page.dict, pi)?;
-        // The overlay stream (last) draws text of its own: the overlay label is allowed.
-        let original: Vec<Vec<u8>> = list
-            .iter()
-            .zip(data)
-            .filter(|(o, _)| doc.resolve(o).as_dict().and_then(|d| d.name(b"PCMark")) != Some(b"Redaction"))
-            .map(|(_, d)| d)
-            .collect();
-        let resources = page.dict.get(b"Resources").and_then(|r| doc.resolve(r).as_dict().cloned()).unwrap_or_default();
-        let mut scratch = Report::default();
-        let mut scope = Scope::new(&rects, Mode::Verify, &mut scratch);
-        residue += process(doc, &mut scope, &original, &resources, pdfcraft_content::Matrix::IDENTITY).residue;
+        residue += verify_page(doc, page, pi, &rects, &work)?;
     }
+    spent(&work)?;
     if residue > 0 {
         return Err(RedactError::Residue(residue));
     }
     // Embed build (R6b-50): copies of the removed words elsewhere in the document.
     if options.document_copies {
-        clear_copies(doc, &removed_words(&removed_text), &mut report)?;
+        clear_copies(doc, &removed_words(&removed_text), &mut report, &work)?;
+        spent(&work)?;
     }
     // The previous revision still holds the removed content: the next save must rewrite.
     doc.require_full_save();
     Ok(report)
+}
+
+/// What is still under `rects` on `page` (index `index`), but for the redaction's own boxes
+/// (the stream marked `/PCMark /Redaction`): glyphs and inline images (the verifier's count).
+fn verify_page(
+    doc: &mut Document,
+    page: &pdfcraft_model::Page,
+    index: usize,
+    rects: &[[f64; 4]],
+    work: &std::rc::Rc<interp::Work>,
+) -> Result<usize, RedactError> {
+    let (list, data) = page_streams(doc, &page.dict, index)?;
+    // The overlay stream (last) draws text of its own: the overlay label is allowed.
+    let original: Vec<Vec<u8>> = list
+        .iter()
+        .zip(data)
+        .filter(|(o, _)| doc.resolve(o).as_dict().and_then(|d| d.name(b"PCMark")) != Some(b"Redaction"))
+        .map(|(_, d)| d)
+        .collect();
+    let resources = page.dict.get(b"Resources").and_then(|r| doc.resolve(r).as_dict().cloned()).unwrap_or_default();
+    let mut scratch = Report::default();
+    let mut scope = Scope::new(rects, Mode::Verify, &mut scratch);
+    scope.work = work.clone();
+    Ok(process(doc, &mut scope, &original, &resources, pdfcraft_content::Matrix::IDENTITY).residue)
 }
 
 /// Remove redaction marks without applying them (`None` = all).
@@ -584,53 +798,75 @@ pub fn clear_marks(doc: &mut Document, pages: Option<&[usize]>) -> Result<usize,
 
 /// Embed build (R6b-50): remove every annotation whose `/IRT` chain reaches one in `removed`
 /// (on any page), and the pop-ups of those removed; `removed` grows with them. Returns those
-/// removed here.
-fn remove_threads(doc: &mut Document, removed: &mut Vec<ObjRef>) -> Result<Vec<ObjRef>, RedactError> {
-    let mut gone: Vec<ObjRef> = Vec::new();
+/// removed here (pop-ups left out: part of their markup), in object order. Linear (R6b-54, N9):
+/// one pass reads who replies to whom, one walk follows the threads, one pass rewrites the
+/// pages' lists, each step charged to `work`.
+fn remove_threads(doc: &mut Document, removed: &mut std::collections::HashSet<ObjRef>, work: &interp::Work) -> Result<Vec<ObjRef>, RedactError> {
+    use std::collections::{HashMap, HashSet};
     let pages = pdfcraft_model::pages(doc);
-    // Until nothing more goes (each pass removes at least one, or stops).
-    loop {
-        let mut more = false;
-        for page in &pages {
-            let current = doc.get(page.obj).as_dict().cloned().unwrap_or_default();
-            let annots = annots_of(doc, &current);
-            let doomed: Vec<ObjRef> = annots
-                .iter()
-                .filter_map(Object::as_ref)
-                .filter(|r| !removed.contains(r))
-                .filter(|r| {
-                    let obj = doc.get(*r);
-                    let dict = obj.as_dict();
-                    let reply = dict.and_then(|d| d.get(b"IRT")).and_then(Object::as_ref).is_some_and(|to| removed.contains(&to));
-                    let popup = dict.is_some_and(|d| d.name(b"Subtype") == Some(b"Popup"))
-                        && dict.and_then(|d| d.get(b"Parent")).and_then(Object::as_ref).is_some_and(|to| removed.contains(&to));
-                    reply || popup
-                })
-                .collect();
-            if doomed.is_empty() {
-                continue;
+    let mut replies: HashMap<ObjRef, Vec<(ObjRef, bool)>> = HashMap::new();
+    for page in &pages {
+        let current = doc.get(page.obj).as_dict().cloned().unwrap_or_default();
+        for annot in annots_of(doc, &current) {
+            work.charge(1);
+            let Some(r) = annot.as_ref() else { continue };
+            let obj = doc.get(r);
+            let Some(dict) = obj.as_dict() else { continue };
+            // A pop-up is part of its markup, not counted, unless it draws an appearance of its
+            // own (then a viewer draws it, and the inspector counts it).
+            let popup = dict.name(b"Subtype") == Some(b"Popup") && !dict.contains(b"AP");
+            if let Some(to) = dict.get(b"IRT").and_then(Object::as_ref) {
+                replies.entry(to).or_default().push((r, popup));
             }
-            more = true;
-            let kept: Vec<Object> = annots.into_iter().filter(|a| !a.as_ref().is_some_and(|r| doomed.contains(&r))).collect();
-            doc.update_dict(page.obj, |d| {
-                if kept.is_empty() {
-                    d.remove(b"Annots");
-                } else {
-                    d.set(b"Annots".to_vec(), Object::Array(kept));
-                }
-            })?;
-            for r in doomed {
-                // A pop-up is part of its markup, not counted on its own.
-                if doc.get(r).as_dict().is_some_and(|d| d.name(b"Subtype") != Some(b"Popup")) {
-                    gone.push(r);
-                }
-                removed.push(r);
+            if dict.name(b"Subtype") == Some(b"Popup")
+                && let Some(to) = dict.get(b"Parent").and_then(Object::as_ref)
+            {
+                replies.entry(to).or_default().push((r, popup));
             }
         }
-        if !more {
-            return Ok(gone);
+        if work.spent() {
+            return Err(RedactError::TooComplex);
         }
     }
+    let mut queue: Vec<ObjRef> = removed.iter().copied().collect();
+    let mut doomed: HashSet<ObjRef> = HashSet::new();
+    let mut gone: Vec<ObjRef> = Vec::new();
+    while let Some(target) = queue.pop() {
+        work.charge(1);
+        for &(reply, popup) in replies.get(&target).map(Vec::as_slice).unwrap_or_default() {
+            if removed.insert(reply) {
+                doomed.insert(reply);
+                queue.push(reply);
+                if !popup {
+                    gone.push(reply);
+                }
+            }
+        }
+        if work.spent() {
+            return Err(RedactError::TooComplex);
+        }
+    }
+    if doomed.is_empty() {
+        return Ok(gone);
+    }
+    for page in &pages {
+        work.charge(1);
+        let current = doc.get(page.obj).as_dict().cloned().unwrap_or_default();
+        let annots = annots_of(doc, &current);
+        let kept: Vec<Object> = annots.iter().filter(|a| !a.as_ref().is_some_and(|r| doomed.contains(&r))).cloned().collect();
+        if kept.len() == annots.len() {
+            continue;
+        }
+        doc.update_dict(page.obj, |d| {
+            if kept.is_empty() {
+                d.remove(b"Annots");
+            } else {
+                d.set(b"Annots".to_vec(), Object::Array(kept));
+            }
+        })?;
+    }
+    gone.sort();
+    Ok(gone)
 }
 
 /// Embed build (R6b-50): what a copy of the removed text elsewhere could hold: each run of
@@ -663,7 +899,7 @@ fn holds_word(text: &str, words: &[String]) -> bool {
 /// bookmark titles holding one read "[Redacted]", document information entries holding one go,
 /// the document's XMP packet goes, and named destinations whose name holds one are renamed
 /// (with every destination naming them).
-fn clear_copies(doc: &mut Document, words: &[String], report: &mut Report) -> Result<(), RedactError> {
+fn clear_copies(doc: &mut Document, words: &[String], report: &mut Report, work: &interp::Work) -> Result<(), RedactError> {
     let Some(root) = doc.root() else { return Ok(()) };
     let mut catalog = doc.get(root).as_dict().cloned().unwrap_or_default();
     if catalog.remove(b"Metadata").is_some() {
@@ -676,13 +912,16 @@ fn clear_copies(doc: &mut Document, words: &[String], report: &mut Report) -> Re
     // Bookmarks: depth first, bounded.
     let mut todo: Vec<Object> =
         catalog.get(b"Outlines").and_then(|o| doc.resolve(o).as_dict().and_then(|d| d.get(b"First").cloned())).into_iter().collect();
-    let mut seen: Vec<ObjRef> = Vec::new();
+    let mut seen: std::collections::HashSet<ObjRef> = std::collections::HashSet::new();
     while let Some(entry) = todo.pop() {
+        work.charge(words.len().max(1));
+        if work.spent() {
+            return Err(RedactError::TooComplex);
+        }
         let Some(r) = entry.as_ref() else { continue };
-        if seen.contains(&r) || seen.len() > 100_000 {
+        if seen.len() > 100_000 || !seen.insert(r) {
             continue;
         }
-        seen.push(r);
         let Some(item) = doc.get(r).as_dict().cloned() else { continue };
         if item.get(b"Title").and_then(|t| doc.resolve(t).as_string().map(|s| s.to_text())).is_some_and(|title| holds_word(&title, words)) {
             doc.update_dict(r, |d| d.set(b"Title".to_vec(), Object::String(pdfcraft_cos::PdfString::text("[Redacted]"))))?;
@@ -741,6 +980,10 @@ fn clear_copies(doc: &mut Document, words: &[String], report: &mut Report) -> Re
     // Every destination naming a renamed one: links' and bookmarks' /Dest, go-to actions' /D.
     let numbers: Vec<u32> = doc.object_numbers();
     for num in numbers {
+        work.charge(1);
+        if work.spent() {
+            return Err(RedactError::TooComplex);
+        }
         let r = ObjRef::new(num, 0);
         let Some(dict) = doc.get(r).as_dict().cloned() else { continue };
         let mut changed = dict.clone();

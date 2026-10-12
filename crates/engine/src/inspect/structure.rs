@@ -256,6 +256,9 @@ pub(crate) struct Annot {
     /// Follow-up 8 (P6-33): a `Redact` mark carrying overlay entries (see
     /// [`super::Inspection::marks_with_overlay`]).
     pub overlay: bool,
+    /// Follow-up 9 (R6b-55, P6-40 (d)): the annotation this one belongs to: its `/IRT` (a
+    /// reply), or for a pop-up its `/Parent`. A redaction removing that one removes this one too.
+    pub reply_to: Option<ObjRef>,
 }
 
 /// What one page is, as far as the comparison goes.
@@ -2917,17 +2920,15 @@ impl<'d, 'b> Reader<'d, 'b> {
             let widget = subtype == b"Widget" && id.is_some_and(|id| widgets.contains(&id));
             let silent_popup = subtype == b"Popup" && !dict.contains(b"AP");
             let areas = if subtype == b"Redact" { self.marked_areas(&dict)? } else { Vec::new() };
-            // Follow-up 8 (P6-33): a mark asking for more than the black fill the redactor
-            // gives every area: overlay text, a form for its look, repetition, another colour.
-            let overlay = subtype == b"Redact" && {
-                let black = match dict.get(b"IC").map(|fill| self.resolve(fill)).transpose()?.as_deref() {
-                    None => true,
-                    Some(Object::Array(parts)) => parts.iter().all(|part| part.as_f64() == Some(0.0)) && matches!(parts.len(), 1 | 3),
-                    Some(_) => false,
-                };
-                !black || dict.contains(b"OverlayText") || dict.contains(b"RO") || dict.contains(b"Repeat")
+            // Follow-up 8 (P6-33), follow-up 9 (R6b-55): a mark asking for more than the black
+            // fill the redactor gives every area, by the host's rule.
+            let overlay = subtype == b"Redact" && self.mark_overlay(&dict)?;
+            let reply_to = match dict.get(b"IRT") {
+                Some(Object::Ref(to)) => Some(*to),
+                _ if subtype == b"Popup" => dict.get(b"Parent").and_then(Object::as_ref),
+                _ => None,
             };
-            annots.push(Annot { id, subtype, digest, tracked: !widget && !silent_popup, areas, bare, rect, link, overlay });
+            annots.push(Annot { id, subtype, digest, tracked: !widget && !silent_popup, areas, bare, rect, link, overlay, reply_to });
         }
         Ok((annots, in_array))
     }
@@ -3381,22 +3382,54 @@ impl<'d, 'b> Reader<'d, 'b> {
         }
     }
 
-    /// A redaction mark's areas: each quadrilateral's box, or the rectangle.
+    /// A redaction mark's areas, by the rule the redactor reads them with
+    /// (`pdfcraft_redact::mark_areas`): each quadrilateral's box, or the rectangle.
     fn marked_areas(&mut self, dict: &Dict) -> Result<Vec<[f64; 4]>, Fail> {
-        let numbers = |items: Vec<Object>| items.iter().map(Object::as_f64).collect::<Option<Vec<f64>>>().filter(|v| v.iter().all(|x| x.is_finite()));
-        let boxed = |points: &[f64]| {
-            let xs = points.iter().step_by(2);
-            let ys = points.iter().skip(1).step_by(2);
-            let (x0, x1) = xs.clone().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), x| (lo.min(*x), hi.max(*x)));
-            let (y0, y1) = ys.fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), y| (lo.min(*y), hi.max(*y)));
-            [x0, y0, x1, y1]
+        let numbers = |items: Vec<Object>| {
+            items.iter().map(|item| matches!(item, Object::Int(_) | Object::Real(_)).then(|| item.as_f64()).flatten()).collect::<Option<Vec<f64>>>()
         };
-        let quads = self.array_of(dict.get(b"QuadPoints"), "/QuadPoints")?;
-        if let Some(points) = numbers(quads).filter(|v| !v.is_empty() && v.len() % 8 == 0) {
-            return Ok(points.chunks(8).map(boxed).collect());
+        let quads = numbers(self.array_of(dict.get(b"QuadPoints"), "/QuadPoints")?);
+        let rect = numbers(self.array_of(dict.get(b"Rect"), "/Rect")?);
+        Ok(pdfcraft_redact::mark_areas(quads.as_deref(), rect.as_deref()))
+    }
+
+    /// Follow-up 9 (R6b-55, P6-33): whether a `Redact` mark carries an overlay, by the host's
+    /// rule: any `/OverlayText`, `/RO`, `/Repeat`, `/DA` or `/Q` entry; an `/IC` that is not
+    /// black (absent, `[0]`, `[0 0 0]` and `[0 0 0 1]` are); or an `/AP` that is not plain. Plain
+    /// is exactly one `/N` entry, a single stream (not a dictionary of states), whose resources
+    /// hold no `/XObject`, `/Font`, `/Shading` or `/Pattern`, and whose content constructs and
+    /// paints paths, sets colours, line styles and graphics states only (no text, image, form,
+    /// shading or marked content).
+    fn mark_overlay(&mut self, dict: &Dict) -> Result<bool, Fail> {
+        if [&b"OverlayText"[..], b"RO", b"Repeat", b"DA", b"Q"].iter().any(|key| dict.contains(key)) {
+            return Ok(true);
         }
-        let rect = self.array_of(dict.get(b"Rect"), "/Rect")?;
-        Ok(numbers(rect).filter(|v| v.len() == 4).map(|v| vec![boxed(&v)]).unwrap_or_default())
+        let black = match dict.get(b"IC").map(|fill| self.resolve(fill)).transpose()?.as_deref() {
+            None => true,
+            Some(Object::Array(parts)) => {
+                let values: Option<Vec<f64>> =
+                    parts.iter().map(|part| matches!(part, Object::Int(_) | Object::Real(_)).then(|| part.as_f64()).flatten()).collect();
+                matches!(values.as_deref(), Some([0.0] | [0.0, 0.0, 0.0] | [0.0, 0.0, 0.0, 1.0]))
+            }
+            Some(_) => false,
+        };
+        if !black {
+            return Ok(true);
+        }
+        let Some(appearance) = dict.get(b"AP") else { return Ok(false) };
+        let Some(appearance) = self.dict_of(Some(appearance), "/AP")? else { return Ok(true) };
+        if appearance.len() != 1 {
+            return Ok(true);
+        }
+        let Some(Object::Ref(normal)) = appearance.get(b"N") else { return Ok(true) };
+        let object = self.get(*normal)?;
+        let Object::Stream(stream) = &*object else { return Ok(true) };
+        let resources = self.dict_of(stream.dict.get(b"Resources"), "an appearance's /Resources")?.unwrap_or_default();
+        if [&b"XObject"[..], b"Font", b"Shading", b"Pattern"].iter().any(|key| resources.contains(key)) {
+            return Ok(true);
+        }
+        let data = self.decode(stream)?;
+        Ok(!super::operators::plain_drawing(&data, self.budget)?)
     }
 
     // ── form fields ─────────────────────────────────────────────────────────────────────────

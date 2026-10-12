@@ -640,7 +640,7 @@ fn text_the_redactor_cannot_place_near_a_mark_refuses_the_redaction() {
         };
         let mut doc = make();
         mark(&mut doc, 0, &[[90.0, 212.0, 112.0, 228.0]], "");
-        assert!(matches!(apply(&mut doc, None), Err(RedactError::Residue(_))), "{encoding}");
+        assert_eq!(apply(&mut doc, None), Err(RedactError::Refused(Refusal::TextNotPlaceable)), "{encoding}");
         // Far from the text, the mark is applied.
         let mut doc = make();
         mark(&mut doc, 0, &[[5.0, 5.0, 25.0, 25.0]], "");
@@ -981,7 +981,7 @@ fn copies_of_the_removed_words_elsewhere_in_the_document_are_cleared() {
     ]);
     doc.trailer_mut().set(b"Info".to_vec(), Object::Ref(pdfcraft_cos::ObjRef::new(10, 0)));
     mark(&mut doc, 0, &[OVER_SECRET], "");
-    let report = apply_with(&mut doc, None, Options { black: true, document_copies: true }).unwrap();
+    let report = apply_with(&mut doc, None, Options { black: true, document_copies: true, ..Options::default() }).unwrap();
     assert!(!holds(&doc, b"SECRET"));
     assert!(holds(&doc, b"Public title") && holds(&doc, b"[Redacted]") && holds(&doc, b"Other"));
     assert_eq!((report.bookmarks_cleared, report.information_cleared, report.metadata_removed, report.destinations_renamed), (1, 1, 1, 1));
@@ -1001,7 +1001,7 @@ fn applied_for_a_host_every_area_is_filled_black_and_overlays_are_ignored() {
     let mut style = Style::default_for(&shape);
     style.fill = Some([1.0, 0.0, 0.0]);
     add_annotation(&mut doc, &NewAnnotation { page: 0, shape, style, contents: String::new(), author: "Tester".into() }, &Meta::default()).unwrap();
-    apply_with(&mut doc, None, Options { black: true, document_copies: false }).unwrap();
+    apply_with(&mut doc, None, Options { black: true, ..Options::default() }).unwrap();
     let c = content(&doc, 0);
     assert!(c.contains("0 0 0 rg") && !c.contains("1 0 0 rg") && !c.contains("Withheld"), "{c}");
 }

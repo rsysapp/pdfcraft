@@ -746,7 +746,7 @@ fn an_unknown_key_in_any_dictionary_is_refused_or_reported() {
     let clean = inspect(&base, &base, InspectLimits::default()).unwrap();
     assert_eq!(clean, Inspection { base_kept: true, pages: PageChanges { before: 1, after: 1, ..PageChanges::default() }, ..Inspection::default() });
     let redacted = inspect(&base, &with_every_dictionary(true, None), InspectLimits::default()).unwrap();
-    assert_eq!((redacted.content.pages_changed_outside_redactions, redacted.redaction_areas.len()), (0, 1), "{redacted:?}");
+    assert_eq!((redacted.content.pages_changed_outside_redactions, redacted.filled_areas.len()), (0, 1), "{redacted:?}");
     // Refused, or a change reported.
     let caught = |result: Result<Inspection, InspectError>| match result {
         Err(InspectError::Edited(_)) => true,
@@ -873,7 +873,7 @@ fn reordering_anything_whose_order_has_meaning_is_refused_or_reported() {
     let clean = inspect(&base, &base, InspectLimits::default()).unwrap();
     assert_eq!(clean, Inspection { base_kept: true, pages: PageChanges { before: 2, after: 2, ..PageChanges::default() }, ..Inspection::default() });
     let redacted = inspect(&base, &assemble(&ordered_objects(true, "")), InspectLimits::default()).unwrap();
-    assert_eq!((redacted.content.pages_changed_outside_redactions, redacted.redaction_areas.len()), (0, 1), "{redacted:?}");
+    assert_eq!((redacted.content.pages_changed_outside_redactions, redacted.filled_areas.len()), (0, 1), "{redacted:?}");
     let caught = |result: &Result<Inspection, InspectError>| match result {
         Err(InspectError::Edited(_)) => true,
         Ok(inspection) => {
@@ -978,7 +978,7 @@ fn the_document_information_is_compared_in_both_kinds_of_save() {
     ] {
         let inspection = inspect(&base, &informed(true, info, trailer), InspectLimits::default()).unwrap_or_else(|error| panic!("{case}: {error:?}"));
         assert!(!inspection.base_kept, "{case}");
-        assert_eq!(inspection.redaction_areas.len(), 1, "{case}: {inspection:?}");
+        assert_eq!(inspection.filled_areas.len(), 1, "{case}: {inspection:?}");
         assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{case}: {inspection:?}");
         assert_eq!(inspection.info.changed, keys, "{case}: {inspection:?}");
     }
@@ -1041,7 +1041,7 @@ fn every_removal_a_rewrite_makes_is_reported() {
         let inspection = inspect(&base, &edited, InspectLimits::default()).unwrap_or_else(|error| panic!("{case}: {error:?}"));
         assert_eq!(inspection.structure_removed, expected, "{case}: {inspection:?}");
         assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{case}: {inspection:?}");
-        assert_eq!(inspection.redaction_areas.len(), 1, "{case}: {inspection:?}");
+        assert_eq!(inspection.filled_areas.len(), 1, "{case}: {inspection:?}");
     }
     // An appended update may take none of these away: a page's entries count as its content
     // changed (and the tags and the XMP packet fail), never as a removal.
@@ -1156,7 +1156,7 @@ fn structure_tree_text_is_compared_element_by_element() {
             Some(taken) => {
                 let inspection = result.unwrap_or_else(|error| panic!("{case}: {error:?}"));
                 assert_eq!(inspection.structure_removed.tagged_text, taken, "{case}: {inspection:?}");
-                assert_eq!(inspection.redaction_areas.len(), 1, "{case}: {inspection:?}");
+                assert_eq!(inspection.filled_areas.len(), 1, "{case}: {inspection:?}");
             }
             None => match result {
                 Err(InspectError::Edited(message)) => assert!(message.contains("structure tree"), "{case}: {message}"),

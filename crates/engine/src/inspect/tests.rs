@@ -294,7 +294,7 @@ fn reports_a_redaction_that_removed_only_an_image() {
     assert!(!inspection.base_kept);
     assert_eq!(inspection.text, TextChanges::default());
     // The box that removed the image is its area.
-    assert!(!inspection.redaction_areas.is_empty());
+    assert!(!inspection.filled_areas.is_empty());
     assert_eq!(inspection.content, ContentChanges { pages_with_images_removed: 1, pages_with_content_removed: 1, ..ContentChanges::default() });
 }
 
@@ -509,7 +509,7 @@ fn glyphs_without_text_are_named_by_their_font_and_glyph() {
     let inspection = run(&named, &redacted).unwrap();
     assert_eq!(inspection.text, TextChanges { pages_with_text_removed: 1, pages_with_text_added: 0 }, "{inspection:?}");
     assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{inspection:?}");
-    assert_eq!(inspection.redaction_areas.len(), 1);
+    assert_eq!(inspection.filled_areas.len(), 1);
     // Another glyph of the font in its place is not the same glyph.
     let swapped = glyphs_without_text_drawing("5 0 R", "BT /F2 12 Tf 20 150 Td <0024004F0053004B0045> Tj ET");
     assert_eq!(run(&named, &swapped).unwrap().text, TextChanges { pages_with_text_removed: 1, pages_with_text_added: 1 });
@@ -734,8 +734,8 @@ fn a_real_redaction_through_a_word_adds_no_text() {
     assert_eq!(inspection.annotations, AnnotationChanges::default());
     assert_eq!(inspection.pages, PageChanges { before: 1, after: 1, ..PageChanges::default() });
     // The applied box, where the mark was.
-    assert_eq!(inspection.redaction_areas.len(), 1, "{:?}", inspection.redaction_areas);
-    let (page, area) = inspection.redaction_areas[0];
+    assert_eq!(inspection.filled_areas.len(), 1, "{:?}", inspection.filled_areas);
+    let (page, area) = inspection.filled_areas[0];
     assert_eq!(page, 1);
     for (got, want) in area.iter().zip([18.0, 144.0, 61.0, 163.0]) {
         assert!((got - want).abs() < 0.5, "{area:?}");
@@ -831,7 +831,7 @@ fn a_deletion_under_a_coloured_box_is_not_a_redaction() {
         // The glyphs left are the base's, where they were: only the box can tell.
         assert_eq!(inspection.text, TextChanges { pages_with_text_removed: 1, pages_with_text_added: 0 }, "{case}");
         assert_eq!(inspection.content.pages_changed_outside_redactions, 1, "{case}");
-        assert!(inspection.redaction_areas.is_empty(), "{case}");
+        assert!(inspection.filled_areas.is_empty(), "{case}");
     }
 }
 
@@ -840,8 +840,8 @@ fn the_same_deletion_under_a_black_box_is_reported_as_a_redaction_there() {
     let base = may_not_terminate(None);
     let inspection = run(&base, &may_not_terminate(Some("0 g"))).unwrap();
     assert_eq!(inspection.content.pages_changed_outside_redactions, 0);
-    assert_eq!(inspection.redaction_areas.len(), 1, "{:?}", inspection.redaction_areas);
-    let (page, area) = inspection.redaction_areas[0];
+    assert_eq!(inspection.filled_areas.len(), 1, "{:?}", inspection.filled_areas);
+    let (page, area) = inspection.filled_areas[0];
     assert_eq!(page, 1);
     let x0 = 20.0 + width_of("Buyer may ") - 0.5;
     for (got, want) in area.iter().zip([x0, 146.0, x0 + width_of("not") + 1.0, 162.0]) {
@@ -874,7 +874,7 @@ fn removed_text_that_does_not_show_must_lie_under_a_redaction_box() {
             let inspection = run(&base, &hidden_line(hide, true, unrelated)).unwrap();
             assert_eq!(inspection.text, TextChanges { pages_with_text_removed: 1, pages_with_text_added: 0 }, "{case}, box elsewhere: {unrelated}");
             assert_eq!(inspection.content.pages_changed_outside_redactions, 1, "{case}, box elsewhere: {unrelated}");
-            assert!(inspection.redaction_areas.is_empty(), "{case}");
+            assert!(inspection.filled_areas.is_empty(), "{case}");
         }
     }
 }
@@ -885,7 +885,7 @@ fn a_box_that_removes_nothing_is_not_a_redaction_area() {
     let boxed = pages_pdf(&[page(&format!("{}0 g 20 20 60 20 re f\n", text_line(20.0, 150.0, "Buyer pays Seller")))], &[]);
     let inspection = run(&base, &boxed).unwrap();
     assert_eq!(inspection.content.pages_changed_outside_redactions, 0);
-    assert!(inspection.redaction_areas.is_empty(), "{:?}", inspection.redaction_areas);
+    assert!(inspection.filled_areas.is_empty(), "{:?}", inspection.filled_areas);
 }
 
 // ── 10. encryption ──────────────────────────────────────────────────────────────────────────
@@ -1154,13 +1154,13 @@ fn a_repeated_character_removed_outside_the_box_is_not_taken_for_the_one_inside(
     let inspection = run(&base, &scan_with_hidden_text(&wrong, &boxed)).unwrap();
     assert_eq!(inspection.text, TextChanges { pages_with_text_removed: 1, pages_with_text_added: 0 });
     assert_eq!(inspection.content.pages_changed_outside_redactions, 1);
-    assert!(inspection.redaction_areas.is_empty(), "{:?}", inspection.redaction_areas);
+    assert!(inspection.filled_areas.is_empty(), "{:?}", inspection.filled_areas);
     // The boxed glyph itself left out: a redaction there.
     // As the redactor writes it: the line kept, the removed glyph's advance a displacement.
     let right = format!("1 0 0 1 20 150 Tm [(10) -{:.4} (1)] TJ ", width_of("0") * 1000.0 / 12.0);
     let inspection = run(&base, &scan_with_hidden_text(&right, &boxed)).unwrap();
     assert_eq!(inspection.content.pages_changed_outside_redactions, 0);
-    assert_eq!(inspection.redaction_areas.len(), 1);
+    assert_eq!(inspection.filled_areas.len(), 1);
 }
 
 #[test]
@@ -1240,7 +1240,7 @@ fn redactions_with_page_rotation_deletion_and_moves_are_accepted() {
         assert_eq!(inspection.pages, pages, "{case}");
         assert_eq!(inspection.text, TextChanges { pages_with_text_removed: 1, pages_with_text_added: 0 }, "{case}");
         assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{case}");
-        assert_eq!(inspection.redaction_areas.len(), 1, "{case}");
+        assert_eq!(inspection.filled_areas.len(), 1, "{case}");
     }
 }
 
@@ -1289,14 +1289,14 @@ fn a_full_page_scan_replaced_under_one_small_box_is_refused() {
     }
     let inspection = run(&base, &full_page_scan(grey_flate(width, height, &forged), boxed)).unwrap();
     assert_eq!(inspection.content.pages_changed_outside_redactions, 1, "{inspection:?}");
-    assert!(inspection.redaction_areas.is_empty());
+    assert!(inspection.filled_areas.is_empty());
     let inspection = run(&base, &full_page_scan(grey_flate(width, height, &redacted), boxed)).unwrap();
     assert_eq!(
         inspection.content,
         ContentChanges { pages_with_images_removed: 1, pages_with_content_removed: 1, ..ContentChanges::default() },
         "{inspection:?}"
     );
-    assert_eq!(inspection.redaction_areas.len(), 1);
+    assert_eq!(inspection.filled_areas.len(), 1);
     // Another size of image at the same place, under the small box: refused.
     let smaller = texture(200, 300);
     let inspection = run(&base, &full_page_scan(grey_flate(200, 300, &smaller), boxed)).unwrap();
@@ -1314,7 +1314,7 @@ fn a_real_image_redaction_is_accepted() {
     assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{inspection:?}");
     assert_eq!(inspection.content.pages_with_images_removed, 1);
     assert_eq!(inspection.content.pages_with_images_added, 0);
-    assert_eq!(inspection.redaction_areas.len(), 1);
+    assert_eq!(inspection.filled_areas.len(), 1);
 }
 
 /// Scanned pages (`/Im1`, `/Im2`, … over each whole page, 400 × 600 Flate grey pixels), page `i`
@@ -1357,9 +1357,9 @@ fn a_scan_redacted_with_an_earlier_page_deleted_pairs_by_its_render() {
         let inspection = run(&base, &session_edit(base.clone(), edits)).unwrap_or_else(|error| panic!("{case}: {error:?}"));
         assert_eq!(inspection.pages.deleted, u32::from(deleted.is_some()), "{case}: {inspection:?}");
         assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{case}: {inspection:?}");
-        assert_eq!(inspection.redaction_areas.len(), 1, "{case}: {inspection:?}");
+        assert_eq!(inspection.filled_areas.len(), 1, "{case}: {inspection:?}");
         let page = redacted + 1 - usize::from(deleted.is_some_and(|deleted| deleted < redacted));
-        assert_eq!(inspection.redaction_areas.first().map(|area| area.0 as usize), Some(page), "{case}: {inspection:?}");
+        assert_eq!(inspection.filled_areas.first().map(|area| area.0 as usize), Some(page), "{case}: {inspection:?}");
     }
     // Two pages that show the same scan: which one is left cannot be told, so the save fails.
     let base = scans(&[4, 4]);
@@ -1421,7 +1421,7 @@ fn a_jpeg_re_encoded_by_the_redactor_is_accepted_within_bounds() {
         assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{case}: {inspection:?}");
         assert_eq!(inspection.content.pages_with_images_removed, 1, "{case}");
         assert_eq!(inspection.content.pages_with_images_added, 0, "{case}");
-        assert_eq!(inspection.redaction_areas.len(), 1, "{case}");
+        assert_eq!(inspection.filled_areas.len(), 1, "{case}");
     }
     // Cleared pixels that cut through blocks: coding the image again rings around the black
     // region, outside the box, which the page render refuses (the samples themselves stay within
@@ -1549,5 +1549,5 @@ fn known_failure_a_session_redaction_of_a_jpeg_scan_is_a_redaction() {
     let base = full_page_scan(dct_image(width, height, &jpeg_grey(width, height, &photo(width as usize, height as usize), 80)), "");
     let saved = session_edit(base.clone(), vec![annotation(0, redact([40.0, 40.0, 100.0, 100.0])), Edit::ApplyRedactions { pages: None }]);
     let inspection = run(&base, &saved).unwrap();
-    assert_eq!((inspection.content.pages_changed_outside_redactions, inspection.redaction_areas.len()), (0, 1), "{inspection:?}");
+    assert_eq!((inspection.content.pages_changed_outside_redactions, inspection.filled_areas.len()), (0, 1), "{inspection:?}");
 }

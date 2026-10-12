@@ -103,7 +103,7 @@ fn content_moved_into_or_out_of_a_layer_that_is_off_is_outside_the_redactions() 
     // A redaction that leaves the layers as they were is a redaction like any other.
     let base = page(OFF, &format!("/OC /L BDC {MARK} EMC\n{CLAUSE}\n{WORD}"));
     let inspection = run(&base, &page(OFF, &format!("/OC /L BDC {MARK} EMC\n{CLAUSE}\n{BOX}"))).unwrap();
-    assert_eq!((inspection.content.pages_changed_outside_redactions, inspection.redaction_areas.len()), (0, 1), "{inspection:?}");
+    assert_eq!((inspection.content.pages_changed_outside_redactions, inspection.filled_areas.len()), (0, 1), "{inspection:?}");
 }
 
 #[test]
@@ -176,7 +176,7 @@ fn optional_content_that_cannot_be_evaluated_is_refused() {
     let expression = "<< /Type /OCMD /VE [/Or [/Not 6 0 R] 6 0 R] >>";
     let base = file(OFF, &format!("/OC /M BDC {CLAUSE} EMC\n{WORD}"), &empty_form(), expression);
     let inspection = run(&base, &file(OFF, &format!("/OC /M BDC {CLAUSE} EMC\n{BOX}"), &empty_form(), expression)).unwrap();
-    assert_eq!((inspection.content.pages_changed_outside_redactions, inspection.redaction_areas.len()), (0, 1), "{inspection:?}");
+    assert_eq!((inspection.content.pages_changed_outside_redactions, inspection.filled_areas.len()), (0, 1), "{inspection:?}");
 }
 
 #[test]
@@ -223,7 +223,7 @@ fn what_a_layer_covers_is_compared_with_the_layer_on_and_off() {
     // A redaction elsewhere, the layered content as it was, is accepted in every view.
     let edited = file(OFF, &format!("{MARK}\n{hidden_cover}\n{CLAUSE}\n{BOX}"), &empty_form(), membership);
     let inspection = run(&base, &edited).unwrap();
-    assert_eq!((inspection.content.pages_changed_outside_redactions, inspection.redaction_areas.len()), (0, 1), "{inspection:?}");
+    assert_eq!((inspection.content.pages_changed_outside_redactions, inspection.filled_areas.len()), (0, 1), "{inspection:?}");
 }
 
 // ── R6b-36: every combination of a changed page's layers ────────────────────────────────────
@@ -267,7 +267,7 @@ fn a_mark_under_a_cover_in_another_layer_is_compared_in_every_combination() {
         // The layered content as it was, a redaction elsewhere: a redaction in every view.
         let redacted = two_layers(default, &covered(Some(MARK), true), COVER_GROUP);
         let inspection = run(&base, &redacted).unwrap();
-        assert_eq!((inspection.content.pages_changed_outside_redactions, inspection.redaction_areas.len()), (0, 1), "{case}: {inspection:?}");
+        assert_eq!((inspection.content.pages_changed_outside_redactions, inspection.filled_areas.len()), (0, 1), "{case}: {inspection:?}");
     }
 }
 
@@ -294,7 +294,7 @@ fn usage_on_a_group_a_changed_page_uses_is_refused() {
     let base = file(unused, &format!("/OC /L BDC {MARK} EMC\n{CLAUSE}\n{WORD}"), &empty_form(), COVER_GROUP_USAGE);
     let edited = file(unused, &format!("/OC /L BDC {MARK} EMC\n{CLAUSE}\n{BOX}"), &empty_form(), COVER_GROUP_USAGE);
     let inspection = run(&base, &edited).unwrap();
-    assert_eq!((inspection.content.pages_changed_outside_redactions, inspection.redaction_areas.len()), (0, 1), "{inspection:?}");
+    assert_eq!((inspection.content.pages_changed_outside_redactions, inspection.filled_areas.len()), (0, 1), "{inspection:?}");
 }
 
 /// A 200 × 300 page whose content draws, for each of `groups` groups (objects 5…), a small grey
@@ -335,7 +335,7 @@ fn a_changed_page_is_compared_in_up_to_sixty_four_views_of_its_layers() {
     // R6b-36: six groups are 64 combinations, each rendered and compared; seven are too many.
     let base = many_layers(6, &format!("{CLAUSE}\n{WORD}"));
     let inspection = run(&base, &many_layers(6, &format!("{CLAUSE}\n{BOX}"))).unwrap();
-    assert_eq!((inspection.content.pages_changed_outside_redactions, inspection.redaction_areas.len()), (0, 1), "{inspection:?}");
+    assert_eq!((inspection.content.pages_changed_outside_redactions, inspection.filled_areas.len()), (0, 1), "{inspection:?}");
     let base = many_layers(7, &format!("{CLAUSE}\n{WORD}"));
     assert_eq!(run(&base, &base).map(|inspection| inspection.content), Ok(ContentChanges::default()), "unchanged pages are not rendered");
     assert_eq!(run(&base, &many_layers(7, &format!("{CLAUSE}\n{BOX}"))), Err(InspectError::TooComplex));

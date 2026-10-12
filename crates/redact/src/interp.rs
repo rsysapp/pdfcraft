@@ -23,7 +23,7 @@ use std::rc::Rc;
 use pdfcraft_content::{Matrix, Op, contains, num, overlaps, parse, serialize_ops, string};
 use pdfcraft_cos::{Dict, Document, ObjRef, Object, Stream};
 
-use crate::{Report, image};
+use crate::{Deadline, Refusal, Report, image};
 use pdfcraft_fonts::pdf::Metrics;
 
 const MAX_DEPTH: usize = 12;
@@ -35,6 +35,40 @@ pub(crate) const MAX_NESTING: u32 = MAX_DEPTH as u32;
 /// Embed build (follow-up 8 audit): the work one redaction may do (see [`Scope::work`]): about
 /// a second or two.
 pub(crate) const MAX_WORK: u64 = 400_000_000;
+
+/// Embed build (follow-up 8 audit; R6b-54, N9): the work left for a whole redaction (an
+/// operator, a glyph or pixel tested against each region, an annotation, a bookmark, …), shared
+/// by every scope and loop, and the deadline, checked every few hundred charges. Spent (no work
+/// left, or the deadline passed), the redaction fails.
+pub(crate) struct Work {
+    left: std::cell::Cell<u64>,
+    deadline: Option<Deadline>,
+    charges: std::cell::Cell<u32>,
+}
+
+impl Work {
+    pub fn new(units: u64, deadline: Option<Deadline>) -> Rc<Work> {
+        Rc::new(Work { left: std::cell::Cell::new(units), deadline, charges: std::cell::Cell::new(0) })
+    }
+
+    /// Spend `units` of work.
+    pub fn charge(&self, units: usize) {
+        self.left.set(self.left.get().saturating_sub(u64::try_from(units).unwrap_or(u64::MAX)));
+        let charges = self.charges.get().wrapping_add(1);
+        self.charges.set(charges);
+        if charges.is_multiple_of(256) && self.deadline.is_some_and(|deadline| deadline.passed()) {
+            self.left.set(0);
+        }
+    }
+
+    /// Whether the work is spent, or the deadline passed.
+    pub fn spent(&self) -> bool {
+        if self.left.get() > 0 && self.deadline.is_some_and(|deadline| deadline.passed()) {
+            self.left.set(0);
+        }
+        self.left.get() == 0
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Mode {
@@ -85,6 +119,23 @@ pub(crate) struct Output {
     /// resources under the same name.
     pub patterns: Vec<(Vec<u8>, ObjRef)>,
     pub states: Vec<(Vec<u8>, Object)>,
+    /// Embed build (R6b-54): the first thing under a mark the redactor would not guess about,
+    /// by its reason: the redaction is refused.
+    pub refusal: Option<Refusal>,
+}
+
+impl Output {
+    /// Refuse the redaction for `reason` (the first reason found is the one given).
+    fn refuse(&mut self, reason: Refusal) {
+        self.refusal.get_or_insert(reason);
+    }
+
+    /// What a nested scope refused for, refused here too.
+    fn take_refusal(&mut self, inner: &Output) {
+        if let Some(reason) = inner.refusal {
+            self.refuse(reason);
+        }
+    }
 }
 
 /// Embed build: a form XObject the redaction rewrote into a new object.
@@ -222,7 +273,11 @@ pub(crate) struct Scope<'a> {
     /// Embed build (follow-up 8 audit): the work left for the whole redaction (an operator, a
     /// glyph or pixel tested against each region), shared by every nested scope; at zero the
     /// redaction fails (see [`Scope::exhausted`]).
-    pub work: std::rc::Rc<std::cell::Cell<u64>>,
+    pub work: Rc<Work>,
+    /// Embed build (R6b-54): refuse, with a reason, what cannot be removed exactly (a tiling
+    /// pattern or soft mask reaching a mark, a shading reaching one that cannot be removed
+    /// whole, text that cannot be placed): what a host applying marks requires.
+    pub exact: bool,
 }
 
 impl<'a> Scope<'a> {
@@ -239,18 +294,19 @@ impl<'a> Scope<'a> {
             depth: 0,
             parents: Vec::new(),
             removed_text: String::new(),
-            work: std::rc::Rc::new(std::cell::Cell::new(MAX_WORK)),
+            work: Work::new(MAX_WORK, None),
+            exact: false,
         }
     }
 
     /// Embed build (follow-up 8 audit): spend `units` of work.
     fn charge(&self, units: usize) {
-        self.work.set(self.work.get().saturating_sub(units as u64));
+        self.work.charge(units);
     }
 
-    /// Embed build (follow-up 8 audit): whether the work bound is spent.
+    /// Embed build (follow-up 8 audit): whether the work bound is spent (or the deadline passed).
     pub fn exhausted(&self) -> bool {
-        self.work.get() == 0
+        self.work.spent()
     }
 
     /// Embed build: resource `name` of `category`: in `own` (the scope's resources, by
@@ -594,7 +650,7 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
             // `q`, text shown outside a text object, an operator with operands it does not take)
             // makes every glyph place after it a guess: the redaction is refused.
             if scope.mode == Mode::Apply && !scope.rects.is_empty() && drifts(o, &op.operands, stack.is_empty(), in_text) {
-                out.residue += 1;
+                out.refuse(Refusal::ContentNotFollowable);
             }
             match o {
                 b"q" => stack.push(gs.clone()),
@@ -676,8 +732,15 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
                     };
                     let mut removed_text = String::new();
                     let (new_items, removed) = show(scope, &gs, &mut tm, &items, &mut drift, &mut removed_text);
-                    // Embed build: unplaceable glyphs are never removed, only reported (above).
-                    let removed = if gs.unplaceable && scope.mode == Mode::Apply { 0 } else { removed };
+                    // Embed build: unplaceable glyphs are never removed: near a region, the
+                    // redaction is refused (R6b-54: by its reason), and verification counts them.
+                    if gs.unplaceable && scope.mode == Mode::Apply {
+                        if removed > 0 {
+                            out.refuse(Refusal::TextNotPlaceable);
+                        }
+                        ops.push(op);
+                        continue;
+                    }
                     if removed == 0 {
                         ops.push(op);
                         continue;
@@ -878,7 +941,7 @@ fn show(scope: &Scope<'_>, gs: &Gs, tm: &mut Matrix, items: &[Object], drift: &m
                 *drift += s.bytes.len() as f64;
                 let reach = (*drift + 1.0) * 2.0;
                 let trm = Matrix([size * gs.scale, 0.0, 0.0, size, 0.0, gs.rise]).then(tm).then(&gs.ctm);
-                if scope.hits(trm.bbox([-reach, -reach, reach, reach])) && scope.mode == Mode::Verify {
+                if scope.hits(trm.bbox([-reach, -reach, reach, reach])) {
                     removed += s.bytes.len().max(1);
                 }
                 out.push(item.clone());
@@ -1072,6 +1135,7 @@ fn xobject(
             }
             scope.fonts = saved_fonts;
             out.residue += inner.residue;
+            out.take_refusal(&inner);
             if scope.mode == Mode::Verify {
                 return None;
             }
@@ -1148,6 +1212,12 @@ fn redact_pattern(doc: &mut Document, scope: &mut Scope<'_>, name: &[u8], resour
     if pattern.dict.int(b"PatternType") != Some(1) {
         return;
     }
+    // Embed build (R6b-54): for a host, a tiling pattern painted over a mark is refused by its
+    // reason: its cell repeats outside the mark, so redacting it changes what shows there.
+    if scope.exact {
+        out.refuse(Refusal::PatternOrMaskUnderMark);
+        return;
+    }
     let matrix = pattern.dict.get(b"Matrix").and_then(|m| Matrix::from_operands(doc.resolve(m).as_array()?)).unwrap_or_default();
     let to_user = matrix.then(&base);
     let cell = pattern.dict.get(b"BBox").and_then(|b| {
@@ -1208,12 +1278,14 @@ fn redact_pattern(doc: &mut Document, scope: &mut Scope<'_>, name: &[u8], resour
         cell_scope.parents.push(resources.clone());
         cell_scope.depth = scope.depth + 1;
         cell_scope.work = scope.work.clone();
+        cell_scope.exact = scope.exact;
         let inner = process(doc, &mut cell_scope, std::slice::from_ref(&data), &own, to_user);
         (inner, std::mem::take(&mut cell_scope.removed_text))
     };
     scope.removed_text.push_str(&removed_text);
     merge(scope.report, &report);
     out.residue += inner.residue;
+    out.take_refusal(&inner);
     let mut dict = pattern.dict.clone();
     for key in [&b"Length"[..], b"Filter", b"DecodeParms", b"DL"] {
         dict.remove(key);
@@ -1254,6 +1326,12 @@ fn redact_soft_mask(doc: &mut Document, scope: &mut Scope<'_>, name: &[u8], reso
     if reaches.is_some_and(|b| !scope.hits(b)) {
         return;
     }
+    // Embed build (R6b-54): for a host, a soft mask reaching a mark is refused by its reason: its
+    // group shapes what shows outside the mark too.
+    if scope.exact {
+        out.refuse(Refusal::PatternOrMaskUnderMark);
+        return;
+    }
     let Ok(data) = group.decoded() else {
         out.residue += 1;
         return;
@@ -1267,12 +1345,14 @@ fn redact_soft_mask(doc: &mut Document, scope: &mut Scope<'_>, name: &[u8], reso
         group_scope.parents.push(resources.clone());
         group_scope.depth = scope.depth + 1;
         group_scope.work = scope.work.clone();
+        group_scope.exact = scope.exact;
         let inner = process(doc, &mut group_scope, std::slice::from_ref(&data), &own, to_user);
         (inner, std::mem::take(&mut group_scope.removed_text))
     };
     scope.removed_text.push_str(&removed_text);
     merge(scope.report, &report);
     out.residue += inner.residue;
+    out.take_refusal(&inner);
     let Some(new_data) = inner.streams.first().cloned().flatten() else {
         if inner.xobjects.is_empty() && inner.patterns.is_empty() && inner.states.is_empty() {
             return;

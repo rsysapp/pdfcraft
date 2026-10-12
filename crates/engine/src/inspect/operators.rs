@@ -292,6 +292,30 @@ pub(crate) fn check(data: &[u8], base: &ContentBase, budget: &mut Budget) -> Res
     Ok(brought)
 }
 
+/// Follow-up 9 (R6b-55, P6-33): whether `data` only constructs and paints paths, sets colours,
+/// line styles and graphics states (`m l c v y h re`, `S s f F f* B B* b b* n`, `g G rg RG k K
+/// cs CS sc SC scn SCN`, `w J j M d`, `q Q cm gs`), each with the operands its kind takes, and
+/// holds nothing else (no comment, text, image, form, shading or marked content): a redaction
+/// mark's plain appearance, by the host's rule.
+pub(crate) fn plain_drawing(data: &[u8], budget: &mut Budget) -> Result<bool, Fail> {
+    const PLAIN: [&[u8]; 38] = [
+        b"m", b"l", b"c", b"v", b"y", b"h", b"re", b"S", b"s", b"f", b"F", b"f*", b"B", b"B*", b"b", b"b*", b"n", b"g", b"G", b"rg", b"RG", b"k",
+        b"K", b"cs", b"CS", b"sc", b"SC", b"scn", b"SCN", b"w", b"J", b"j", b"M", b"d", b"q", b"Q", b"cm", b"gs",
+    ];
+    let result = walk(data, budget, true, &mut |operator, operands| {
+        if PLAIN.contains(&operator) && shape(operator).is_some_and(|shape| fits(shape, operands)) {
+            Ok(())
+        } else {
+            Err(refused("an operator a plain appearance does not hold"))
+        }
+    });
+    match result {
+        Ok(()) => Ok(true),
+        Err(Fail::Read(_)) => Ok(false),
+        Err(other) => Err(other),
+    }
+}
+
 /// Follow-up 8 audit (operators): a content stream as the content serializer writes it
 /// (`pdfcraft_content::write_op`), from its operators (a comment, or bytes no operator reads,
 /// left out): what `apply_marks` writes for every content stream it brings, and what its

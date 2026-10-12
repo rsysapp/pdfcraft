@@ -219,25 +219,20 @@ fn copies_of_the_removed_words_go_and_the_self_check_reports_them() {
 
 #[test]
 fn what_an_update_adds_under_its_marks_is_counted_and_goes_with_them() {
-    // P6-35: an update's own stamps and drawings wholly under its marks are counted, and the
-    // server's redaction removes them (reported as removed by the redaction, never plain
-    // removals).
+    // P6-35, R6b-55: an update's own stamps and drawings under its marks (a positive-area
+    // overlap, the one rule) are counted, and the server's redaction removes them, reported as
+    // the update's own removed by the redaction, never plain removals.
     let base = file(&[LINES], &[]);
     let under = Shape::Stamp { rect: [20.0, 198.0, 60.0, 212.0], stamp: pdfcraft_annot::StampKind::Approved, by: None };
     let reaching = Shape::Rectangle { rect: [90.0, 198.0, 150.0, 212.0] };
-    let edited = marking_session(&base, vec![annotation(0, under), annotation(0, reaching.clone()), mark(0, &[[16.0, 196.0, 100.0, 214.0]])]);
+    let edited = marking_session(&base, vec![annotation(0, under), annotation(0, reaching), mark(0, &[[16.0, 196.0, 100.0, 214.0]])]);
     let inspection = inspect(&base, &edited, InspectLimits::default()).unwrap();
-    assert_eq!((inspection.annotations.stamps_under_marks, inspection.annotations.drawings_under_marks), (1, 0), "{inspection:?}");
-    // The rectangle reaches out of the mark: the redactor removes what reaches in, which is no
-    // removal by the redaction (it was not wholly under the mark): the server refuses.
-    assert!(matches!(apply_marks(&base, &edited, InspectLimits::default()), Err(ApplyError::SelfCheck(_))));
-    let edited = marking_session(
-        &base,
-        vec![
-            annotation(0, Shape::Stamp { rect: [20.0, 198.0, 60.0, 212.0], stamp: pdfcraft_annot::StampKind::Approved, by: None }),
-            mark(0, &[[16.0, 196.0, 100.0, 214.0]]),
-        ],
-    );
+    assert_eq!((inspection.added_under_marks.stamps, inspection.added_under_marks.drawings), (1, 1), "{inspection:?}");
     let applied = apply_marks(&base, &edited, InspectLimits::default()).unwrap();
-    assert_eq!((applied.inspection.annotations.removed_by_redaction, applied.inspection.annotations.removed), (1, 0), "{:?}", applied.inspection);
+    assert_eq!(
+        (applied.inspection.annotations.removed_by_redaction, applied.inspection.annotations.removed),
+        (RemovedByRedaction { stamps: 1, drawings: 1, earlier: 0 }, 0),
+        "{:?}",
+        applied.inspection
+    );
 }

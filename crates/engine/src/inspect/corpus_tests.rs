@@ -107,7 +107,7 @@ fn assert_redacted(name: &str, inspection: &Inspection, count: u32, deleted: u32
     assert_eq!(inspection.pages, PageChanges { before: count, after: count - deleted, deleted, ..PageChanges::default() }, "{name}: {inspection:?}");
     assert_eq!(inspection.text, TextChanges { pages_with_text_removed: 1, pages_with_text_added: 0 }, "{name}: {inspection:?}");
     assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{name}: {inspection:?}");
-    assert!(!inspection.redaction_areas.is_empty(), "{name}: {inspection:?}");
+    assert!(!inspection.filled_areas.is_empty(), "{name}: {inspection:?}");
 }
 
 /// Nothing changed but what `pages` says, the outline facts, `removed` annotations (those of a

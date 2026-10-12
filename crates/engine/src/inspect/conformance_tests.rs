@@ -167,7 +167,7 @@ fn content_after_an_operator_that_ends_the_reading_is_refused() {
     let edited = page_file("", "", &format!("{}\n{WORD_BOX}", text(20, 150, "Alpha")), "", &[]);
     let inspection = run(&base_of_alpha(), &edited).unwrap();
     assert_eq!(inspection.content.pages_changed_outside_redactions, 0);
-    assert_eq!(inspection.redaction_areas.len(), 1);
+    assert_eq!(inspection.filled_areas.len(), 1);
 }
 
 fn base_of_alpha() -> Vec<u8> {
@@ -199,7 +199,7 @@ fn a_type3_glyph_procedure_changed_outside_any_box_is_a_change_outside_redaction
     let recoded = with_glyph(flate_stream("", GLYPH.as_bytes()), WORD_BOX);
     let inspection = run(&base, &recoded).unwrap();
     assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{inspection:?}");
-    assert_eq!(inspection.redaction_areas.len(), 1);
+    assert_eq!(inspection.filled_areas.len(), 1);
 }
 
 #[test]
@@ -253,7 +253,7 @@ fn a_form_encoded_otherwise_with_the_same_content_is_unchanged() {
     let inspection = run(&base, &rewrite).unwrap();
     assert!(!inspection.base_kept);
     assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{inspection:?}");
-    assert_eq!(inspection.redaction_areas.len(), 1);
+    assert_eq!(inspection.filled_areas.len(), 1);
 }
 
 #[test]
@@ -297,7 +297,7 @@ fn a_form_whose_decoded_content_differs_outside_the_boxes_is_a_change_outside_re
     let inspection = run(&base, &redacted).unwrap();
     assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{inspection:?}");
     assert_eq!(inspection.text.pages_with_text_removed, 1);
-    assert_eq!(inspection.redaction_areas.len(), 1);
+    assert_eq!(inspection.filled_areas.len(), 1);
 }
 
 // ── (c) every image the content draws is drawn ──────────────────────────────────────────────
@@ -646,7 +646,7 @@ fn text_added_in_a_layer_that_is_off_is_a_change_outside_redactions() {
     let inspection = run(&base, &edited).unwrap();
     assert_eq!(inspection.text, TextChanges { pages_with_text_removed: 1, pages_with_text_added: 0 }, "{inspection:?}");
     assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{inspection:?}");
-    assert_eq!(inspection.redaction_areas.len(), 1);
+    assert_eq!(inspection.filled_areas.len(), 1);
 }
 
 #[test]
@@ -769,7 +769,7 @@ fn a_redaction_inside_a_form_drawn_once_is_judged_by_the_page() {
     let inspection = run(&base, &redacted).unwrap();
     assert_eq!(inspection.text, TextChanges { pages_with_text_removed: 1, pages_with_text_added: 0 }, "{inspection:?}");
     assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{inspection:?}");
-    assert_eq!(inspection.redaction_areas.len(), 1);
+    assert_eq!(inspection.filled_areas.len(), 1);
     // A change the page shows outside the box still counts (grey: a black box is a box).
     let changed = wrapped(&format!("{}\n{WORD_BOX}\n0.5 g 20 250 30 30 re f", text(20, 150, "Alpha")));
     assert_eq!(run(&base, &changed).unwrap().content.pages_changed_outside_redactions, 1);
@@ -987,7 +987,7 @@ fn a_redaction_on_a_page_drawn_with_what_viewers_render_differently_is_outside_t
         let base = redacted(state, &[], WORD);
         let inspection = run(&base, &redacted(state, &[], WORD_BOX)).unwrap();
         assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{case}: {inspection:?}");
-        assert_eq!(inspection.redaction_areas.len(), 1, "{case}");
+        assert_eq!(inspection.filled_areas.len(), 1, "{case}");
     }
     // A knockout group, drawn by a form.
     let knockout = |word: &str| {

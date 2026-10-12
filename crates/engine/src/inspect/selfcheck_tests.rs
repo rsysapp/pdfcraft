@@ -53,7 +53,7 @@ fn page(content: &str, resources: &str, extra: &[Vec<u8>]) -> Vec<u8> {
 /// redaction area found.
 fn passes(base: &[u8], edited: &[u8]) -> bool {
     match inspect(base, edited, InspectLimits::default()) {
-        Ok(inspection) => inspection.content.pages_changed_outside_redactions == 0 && !inspection.redaction_areas.is_empty(),
+        Ok(inspection) => inspection.content.pages_changed_outside_redactions == 0 && !inspection.filled_areas.is_empty(),
         Err(_) => false,
     }
 }
@@ -245,11 +245,14 @@ fn what_a_redaction_removes_under_a_mark_is_reported_apart() {
     // P6-33: annotations and form fields the redactor removes under a mark are counted as such,
     // never as annotations removed or form fields changed.
     let note = "<< /Type /Annot /Subtype /FreeText /Rect [20 148 100 162] /Contents (SECRETWORD) /DA (/Helv 12 Tf 0 g) >>";
+    // Judged against the applied marks' areas (R6b-55): the marked file is what the output is
+    // compared with.
     let base = page(&format!("{LINE}\n{KEEP}"), "", &[]).replace_annotations(note);
-    let redacted = session_marks(&base, vec![mark([16.0, 144.0, 112.0, 166.0], "")], true);
-    let inspection = inspect(&base, &redacted, InspectLimits::default()).unwrap();
+    let marked = session_marks(&base, vec![mark([16.0, 144.0, 112.0, 166.0], "")], false);
+    let redacted = session_marks(&marked, Vec::new(), true);
+    let inspection = inspect(&marked, &redacted, InspectLimits::default()).unwrap();
     assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{inspection:?}");
-    assert_eq!((inspection.annotations.removed, inspection.annotations.removed_by_redaction), (0, 1), "{inspection:?}");
+    assert_eq!((inspection.annotations.removed, inspection.annotations.removed_by_redaction.total()), (0, 1), "{inspection:?}");
     // A form field whose widget lies under the mark.
     let field = page(&format!("{LINE}\n{KEEP}"), "", &[]);
     let with_field = {
@@ -272,10 +275,11 @@ fn what_a_redaction_removes_under_a_mark_is_reported_apart() {
         out.extend_from_slice(format!("trailer\n<< /Size 6 /Root 1 0 R /Prev {prev} >>\nstartxref\n{xref}\n%%EOF\n").as_bytes());
         out
     };
-    let redacted = session_marks(&with_field, vec![mark([16.0, 144.0, 112.0, 166.0], "")], true);
-    let inspection = inspect(&with_field, &redacted, InspectLimits::default()).unwrap();
+    let marked = session_marks(&with_field, vec![mark([16.0, 144.0, 112.0, 166.0], "")], false);
+    let redacted = session_marks(&marked, Vec::new(), true);
+    let inspection = inspect(&marked, &redacted, InspectLimits::default()).unwrap();
     assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{inspection:?}");
-    assert_eq!((inspection.form_fields_changed, inspection.form_fields_removed_by_redaction), (0, 1), "{inspection:?}");
+    assert_eq!((inspection.form_fields_changed, inspection.form_fields_removed_by_redaction.total()), (0, 1), "{inspection:?}");
 }
 
 #[test]

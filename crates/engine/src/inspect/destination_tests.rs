@@ -184,7 +184,7 @@ fn a_redaction_and_an_earlier_page_deleted_pair_by_content() {
         assert_eq!(inspection.pages, PageChanges { before: 4, after: 3, deleted: 1, ..PageChanges::default() }, "{case}: {inspection:?}");
         assert_eq!(inspection.text, TextChanges { pages_with_text_removed: 1, pages_with_text_added: 0 }, "{case}: {inspection:?}");
         assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{case}: {inspection:?}");
-        assert_eq!(inspection.redaction_areas.len(), 1, "{case}: {inspection:?}");
+        assert_eq!(inspection.filled_areas.len(), 1, "{case}: {inspection:?}");
         assert_eq!(inspection.outlines, OutlineChanges { destinations_changed: destinations, ..OutlineChanges::default() }, "{case}: {inspection:?}");
     }
     // Without an outline nothing tells them apart: the redaction leaves page 4 showing what a
@@ -262,8 +262,8 @@ fn pages_that_cannot_be_told_apart_are_refused_unless_a_destination_says() {
     let edited = session_whole(&pages_drawing(4, "", true, |_| String::new(), &[], numbered(3)), vec![Edit::DeletePages { pages: vec![0] }]);
     let inspection = run(&base, &edited).unwrap();
     assert_eq!(inspection.pages, PageChanges { before: 4, after: 3, deleted: 1, ..PageChanges::default() }, "{inspection:?}");
-    assert_eq!((inspection.content.pages_changed_outside_redactions, inspection.redaction_areas.len()), (0, 1), "{inspection:?}");
-    assert_eq!(inspection.redaction_areas.first().map(|area| area.0), Some(3), "{inspection:?}");
+    assert_eq!((inspection.content.pages_changed_outside_redactions, inspection.filled_areas.len()), (0, 1), "{inspection:?}");
+    assert_eq!(inspection.filled_areas.first().map(|area| area.0), Some(3), "{inspection:?}");
     assert_eq!(inspection.outlines.destinations_changed, 4, "{inspection:?}");
 }
 
@@ -289,7 +289,7 @@ fn a_page_replaced_by_a_copy_of_another_is_refused() {
     // One page redacted in place is certain.
     let redacted = two_pages("", CLAUSE_X_BOX);
     let inspection = run(&base, &redacted).unwrap();
-    assert_eq!((inspection.content.pages_changed_outside_redactions, inspection.redaction_areas.len()), (0, 1), "{inspection:?}");
+    assert_eq!((inspection.content.pages_changed_outside_redactions, inspection.filled_areas.len()), (0, 1), "{inspection:?}");
 }
 
 #[test]
@@ -305,7 +305,7 @@ fn near_identical_pages_swapped_are_reported_moved() {
     };
     let inspection = run(&base, &swapped).unwrap();
     assert_eq!(inspection.pages, PageChanges { before: 2, after: 2, moved: 1, ..PageChanges::default() }, "{inspection:?}");
-    assert_eq!(inspection.redaction_areas.first().map(|area| area.0), Some(1), "{inspection:?}");
+    assert_eq!(inspection.filled_areas.first().map(|area| area.0), Some(1), "{inspection:?}");
 }
 
 /// Page `own`'s glyphs, as far as pairing goes: `glyphs` glyphs (glyph `g` is `shared(g)`, at
@@ -479,7 +479,7 @@ fn a_redaction_and_a_page_delete_on_a_file_with_named_destinations_are_accepted(
             assert_eq!(inspection.pages, PageChanges { before: 4, after: 3, deleted: 1, ..PageChanges::default() }, "{form}, {case}: {inspection:?}");
             assert_eq!(inspection.destinations, DestinationChanges { named: 4, links: 0, renamed: 0 }, "{form}, {case}: {inspection:?}");
             assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{form}, {case}: {inspection:?}");
-            assert_eq!(inspection.redaction_areas.len(), redacted.len(), "{form}, {case}: {inspection:?}");
+            assert_eq!(inspection.filled_areas.len(), redacted.len(), "{form}, {case}: {inspection:?}");
         }
     }
     // A null page where the base page is still there is not a deleted page's destination.

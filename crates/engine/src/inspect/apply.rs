@@ -14,7 +14,7 @@ use std::time::Duration;
 use pdfcraft_cos::{Dict, Document, ObjRef, Object, SaveOptions, Stream};
 
 use super::structure::sha256;
-use super::{Budget, InspectError, InspectLimits, Inspection, Limits, inspect, operators};
+use super::{Budget, Fail, FieldsRemovedByRedaction, InspectError, InspectLimits, Inspection, Limits, RemovedByRedaction, inspect, operators};
 
 /// What applying a save's marks gives: the document to store, the inspector's account of it
 /// against the edited document (see [`apply_marks`]), and what the redaction did.
@@ -68,43 +68,80 @@ pub struct AppliedFacts {
 pub enum ApplyError {
     /// The edited file is not an appended update of the base that passes inspection.
     Inspect(InspectError),
-    /// It holds no redaction mark.
+    /// It adds no redaction mark (a base's own unapplied marks are never applied).
     NothingToApply,
-    /// The redactor refused (content it cannot place or verify under a mark).
-    Refused(String),
+    /// The redactor refused, for a reason a host words (R6b-54): content under a mark it will
+    /// not guess about.
+    Refused(pdfcraft_redact::Refusal),
     /// The output failed its own inspection: something besides the marks applied changed.
     SelfCheck(String),
     /// A work bound or the deadline was exceeded.
     TooComplex,
 }
 
+impl ApplyError {
+    /// The code a host words (`snake_case`, stable; a closed list: [`ApplyError::CODES`]).
+    pub fn code(&self) -> &'static str {
+        match self {
+            ApplyError::Inspect(_) => "not_an_update",
+            ApplyError::NothingToApply => "nothing_to_apply",
+            ApplyError::Refused(refusal) => refusal.code(),
+            ApplyError::SelfCheck(_) => "self_check_failed",
+            ApplyError::TooComplex => "too_complex",
+        }
+    }
+
+    /// Every code [`ApplyError::code`] gives.
+    pub const CODES: [&'static str; 13] = [
+        "not_an_update",
+        "nothing_to_apply",
+        "pattern_or_mask_under_mark",
+        "shading_under_mark",
+        "unreadable_marked_text",
+        "path_not_clippable",
+        "too_complex",
+        "image_not_clearable",
+        "text_not_placeable",
+        "content_not_followable",
+        "content_unreadable",
+        "added_annotation_under_mark",
+        "self_check_failed",
+    ];
+}
+
 fn count(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
 
-/// Apply the redaction marks of `edited` (the base plus an appended update holding them) to
-/// it. Bounded as [`inspect`] is: `limits.deadline` covers the whole call natively (both
-/// inspections and the redaction between them); the redactor has a work bound of its own, and
-/// every inspection its work bounds.
+/// Apply the redaction marks `edited` adds (to the base, as an appended update holding them).
+/// Bounded as [`inspect`] is: `limits.deadline` covers the whole call natively (both
+/// inspections, the redaction between them, which checks the clock as it works, and the
+/// self-check); the redactor has a work bound of its own, and every inspection its work bounds.
 ///
 /// In order:
-/// - `inspect(base, edited)` must succeed with `edited` an appended update of `base` holding at
-///   least one mark;
-/// - every mark of `edited` is applied (`pdfcraft_redact::apply_with`, every area filled black,
-///   overlays ignored, document-level copies of the removed words cleared);
+/// - `inspect(base, edited)` must succeed with `edited` an appended update of `base` adding at
+///   least one mark (each with a usable area); a mark the base already held is the base's
+///   annotation and is not applied;
+/// - the marks the update added are applied (`pdfcraft_redact::apply_only`, every area filled
+///   black, overlays ignored, document-level copies of the removed words cleared, content that
+///   cannot be removed exactly refused by its reason);
 /// - the document is written whole: the file identifier made fresh, every content stream the
 ///   redaction wrote re-emitted from its operators as the content serializer writes them;
 /// - the output is inspected against `edited`, and accepted only as a rewrite with every mark
-///   applied (each of its areas filled) and nothing else changed: no page added, removed,
-///   moved or rotated, nothing outside the redactions, no text or image added, no annotation
-///   added, removed or changed but the marks, no form field changed, no outline, destination
-///   or page-label change but the copies cleared, no document information change but entries
-///   removed; every filled area within a point of a mark area; every content stream the output
-///   brings exactly as the content serializer writes it, byte for byte.
+///   applied (its areas, by value and in order, the update's marked areas) and nothing else
+///   changed: no page added, removed, moved or rotated, nothing outside the redactions, no text
+///   or image added, no annotation added, removed or changed but the marks and what the one
+///   under-mark rule removes with them, no form field changed but those removed whole, no
+///   outline, destination or page-label change but the copies cleared, no document information
+///   change but entries removed; every filled area within the marks; every content stream the
+///   output brings exactly as the content serializer writes it, byte for byte;
+/// - what the redaction removed is split by who added it (R6b-55): the update's own stamps,
+///   drawings and filled fields, which must be exactly what its inspection counted under its
+///   marks, and the base's own.
 pub fn apply_marks(base: &[u8], edited: &[u8], limits: InspectLimits) -> Result<Applied, ApplyError> {
     match catch_unwind(AssertUnwindSafe(|| run(base, edited, limits))) {
         Ok(result) => result,
-        Err(_) => Err(ApplyError::Refused("internal error while applying the marks".into())),
+        Err(_) => Err(ApplyError::SelfCheck("internal error while applying the marks".into())),
     }
 }
 
@@ -136,6 +173,18 @@ impl Clock {
         #[cfg(target_arch = "wasm32")]
         Ok(limits)
     }
+
+    /// Every work bound, with the time left as the deadline.
+    fn budget(&self, limits: InspectLimits) -> Result<Budget, ApplyError> {
+        Ok(Budget::new(Limits { deadline: self.left(limits)?.deadline, ..Limits::default() }))
+    }
+}
+
+fn inspection_error(error: InspectError) -> ApplyError {
+    match error {
+        InspectError::TooComplex => ApplyError::TooComplex,
+        other => ApplyError::Inspect(other),
+    }
 }
 
 fn run(base: &[u8], edited: &[u8], limits: InspectLimits) -> Result<Applied, ApplyError> {
@@ -143,32 +192,60 @@ fn run(base: &[u8], edited: &[u8], limits: InspectLimits) -> Result<Applied, App
     if !edited.starts_with(base) {
         return Err(ApplyError::Inspect(InspectError::Edited("the edited file is not an appended update of the base".into())));
     }
-    let before = inspect(base, edited, clock.left(limits)?).map_err(|error| match error {
-        InspectError::TooComplex => ApplyError::TooComplex,
-        other => ApplyError::Inspect(other),
-    })?;
-    if before.marked_areas.is_empty() {
+    let (before, detail) =
+        super::inspect_detailed(base, edited, Limits { deadline: clock.left(limits)?.deadline, ..Limits::default() }).map_err(inspection_error)?;
+    if detail.added_marks.is_empty() {
         return Err(ApplyError::NothingToApply);
     }
     let mut doc = Document::open(Arc::new(edited.to_vec())).map_err(|error| ApplyError::Inspect(InspectError::Edited(error.to_string())))?;
-    let marks = pdfcraft_redact::marks(&doc);
-    let areas: Vec<(u32, [f32; 4])> =
-        marks.iter().flat_map(|mark| mark.rects.iter().map(|rect| (count(mark.page.saturating_add(1)), rect.map(|v| v as f32)))).collect();
+    let added: std::collections::HashSet<ObjRef> = detail.added_marks.iter().copied().collect();
+    let areas: Vec<(u32, [f32; 4])> = pdfcraft_redact::marks(&doc)
+        .iter()
+        .filter(|mark| added.contains(&mark.obj))
+        .flat_map(|mark| mark.rects.iter().map(|rect| (count(mark.page.saturating_add(1)), rect.map(|v| v as f32))))
+        .collect();
     let newest = doc.object_numbers().last().copied().unwrap_or(0);
-    let report =
-        pdfcraft_redact::apply_with(&mut doc, None, pdfcraft_redact::Options { black: true, document_copies: true }).map_err(
-            |error| match error {
-                pdfcraft_redact::RedactError::NothingToApply => ApplyError::NothingToApply,
-                pdfcraft_redact::RedactError::TooComplex => ApplyError::TooComplex,
-                other => ApplyError::Refused(other.to_string()),
-            },
-        )?;
+    let options = pdfcraft_redact::Options {
+        black: true,
+        document_copies: true,
+        deadline: pdfcraft_redact::Deadline::after(clock.left(limits)?.deadline),
+        exact: true,
+    };
+    let report = pdfcraft_redact::apply_only(&mut doc, &detail.added_marks, options).map_err(|error| match error {
+        pdfcraft_redact::RedactError::NothingToApply => ApplyError::NothingToApply,
+        pdfcraft_redact::RedactError::TooComplex => ApplyError::TooComplex,
+        pdfcraft_redact::RedactError::Refused(refusal) => ApplyError::Refused(refusal),
+        pdfcraft_redact::RedactError::Unreadable(_) => ApplyError::Refused(pdfcraft_redact::Refusal::ContentUnreadable),
+        other => ApplyError::SelfCheck(other.to_string()),
+    })?;
+    // Follow-up 9 (R6b-55): what the redaction removed, by who added it. A save's own
+    // annotation the host does not count under marks (not a stamp, not a drawing) cannot be
+    // reported, so the redaction is refused by that reason.
+    let mut removed = RemovedByRedaction::default();
+    for id in &report.removed_annotations {
+        match detail.added_annotations.get(id).map(Vec::as_slice) {
+            None => removed.earlier = removed.earlier.saturating_add(1),
+            Some(b"Stamp") => removed.stamps = removed.stamps.saturating_add(1),
+            Some(b"Ink" | b"Line" | b"Square" | b"Circle" | b"Polygon" | b"PolyLine") => removed.drawings = removed.drawings.saturating_add(1),
+            Some(_) => return Err(ApplyError::Refused(pdfcraft_redact::Refusal::AddedAnnotationUnderMark)),
+        }
+    }
+    let mut fields = FieldsRemovedByRedaction::default();
+    for name in &report.removed_fields {
+        if detail.filled_fields.contains(name) {
+            fields.filled = fields.filled.saturating_add(1);
+        } else {
+            fields.earlier = fields.earlier.saturating_add(1);
+        }
+    }
     clock.left(limits)?;
-    normalise(&mut doc, newest)?;
+    let mut budget = clock.budget(limits)?;
+    let contents = page_content_numbers(&doc, &mut budget)?;
+    normalise(&mut doc, newest, &contents, &mut budget)?;
     let bytes = pdfcraft_cos::write_full(&doc, &SaveOptions { mod_date: None, ..SaveOptions::default() })
-        .map_err(|error| ApplyError::Refused(error.to_string()))?;
+        .map_err(|error| ApplyError::SelfCheck(error.to_string()))?;
     drop(doc);
-    let inspection = inspect(edited, &bytes, clock.left(limits)?).map_err(|error| match error {
+    let mut inspection = inspect(edited, &bytes, clock.left(limits)?).map_err(|error| match error {
         InspectError::TooComplex => ApplyError::TooComplex,
         other => ApplyError::SelfCheck(format!("{other:?}")),
     })?;
@@ -193,27 +270,55 @@ fn run(base: &[u8], edited: &[u8], limits: InspectLimits) -> Result<Applied, App
         metadata_removed: count(report.metadata_removed),
         destinations_renamed: count(report.destinations_renamed),
     };
-    self_check(&inspection, &facts, &before)?;
-    canonical_streams(edited, &bytes)?;
+    let mut budget = clock.budget(limits)?;
+    self_check(&inspection, &facts, &before, &detail, (removed, fields), &mut budget)?;
+    canonical_streams(edited, &bytes, &mut budget)?;
+    inspection.annotations.removed_by_redaction = removed;
+    inspection.form_fields_removed_by_redaction = fields;
     Ok(Applied { bytes, inspection, facts })
+}
+
+/// The numbers of every page's content streams (built once: R6b-55, inspector re-review N6).
+fn page_content_numbers(doc: &Document, budget: &mut Budget) -> Result<std::collections::HashSet<u32>, ApplyError> {
+    let mut numbers = std::collections::HashSet::new();
+    for page in pdfcraft_model::pages(doc) {
+        budget.tick().map_err(|_| ApplyError::TooComplex)?;
+        match page.dict.get(b"Contents").map(|c| (c.clone(), doc.resolve(c))) {
+            Some((Object::Ref(r), resolved)) if !matches!(&*resolved, Object::Array(_)) => {
+                numbers.insert(r.num);
+            }
+            Some((_, resolved)) => {
+                for item in resolved.as_array().map(Vec::as_slice).unwrap_or_default() {
+                    budget.tick().map_err(|_| ApplyError::TooComplex)?;
+                    if let Some(r) = item.as_ref() {
+                        numbers.insert(r.num);
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+    Ok(numbers)
 }
 
 /// The output as the writer must write it: a fresh file identifier (the writer makes one of
 /// its own length), and every content stream the redaction wrote (objects numbered past
 /// `newest`) re-emitted from its operators as the content serializer writes them.
-fn normalise(doc: &mut Document, newest: u32) -> Result<(), ApplyError> {
+fn normalise(doc: &mut Document, newest: u32, contents: &std::collections::HashSet<u32>, budget: &mut Budget) -> Result<(), ApplyError> {
     doc.trailer_mut().remove(b"ID");
-    let mut budget = Budget::new(Limits::default());
     for num in doc.object_numbers().into_iter().filter(|num| *num > newest) {
+        budget.tick().map_err(|_| ApplyError::TooComplex)?;
         let Ok(object) = doc.try_get(num) else { continue };
         let Object::Stream(stream) = &*object else { continue };
-        let content = stream.dict.name(b"Subtype") == Some(b"Form") || stream.dict.int(b"PatternType") == Some(1) || is_page_content(doc, num);
+        let content = stream.dict.name(b"Subtype") == Some(b"Form") || stream.dict.int(b"PatternType") == Some(1) || contents.contains(&num);
         if !content {
             continue;
         }
         let Ok(data) = stream.decoded() else { continue };
-        let canonical = operators::canonical(&data, &mut budget)
-            .map_err(|_| ApplyError::Refused("the redaction wrote content that cannot be read again".into()))?;
+        let canonical = operators::canonical(&data, budget).map_err(|fail| match fail {
+            Fail::TooComplex => ApplyError::TooComplex,
+            _ => ApplyError::SelfCheck("the redaction wrote content that cannot be read again".into()),
+        })?;
         if canonical != data {
             let mut dict: Dict = stream.dict.clone();
             for key in [&b"Length"[..], b"Filter", b"DecodeParms", b"DL"] {
@@ -225,18 +330,22 @@ fn normalise(doc: &mut Document, newest: u32) -> Result<(), ApplyError> {
     Ok(())
 }
 
-/// Whether object `num` is one of a page's content streams.
-fn is_page_content(doc: &Document, num: u32) -> bool {
-    pdfcraft_model::pages(doc).iter().any(|page| match page.dict.get(b"Contents").map(|c| (c.clone(), doc.resolve(c))) {
-        Some((Object::Ref(r), _)) if r.num == num => true,
-        Some((_, resolved)) => resolved.as_array().is_some_and(|items| items.iter().any(|item| item.as_ref().is_some_and(|r| r.num == num))),
-        None => false,
-    })
-}
+/// The slack, in points, within which an applied area matches its mark area, and a filled
+/// band lies within the marks (a render pixel at the comparison's resolution, and its edge).
+const AREA_SLACK: f32 = 1.0;
+const BAND_SLACK: f32 = 1.5;
 
 /// The output's inspection against the edited document: the marks applied, nothing else.
-fn self_check(inspection: &Inspection, facts: &AppliedFacts, before: &Inspection) -> Result<(), ApplyError> {
+fn self_check(
+    inspection: &Inspection,
+    facts: &AppliedFacts,
+    before: &Inspection,
+    detail: &super::Detail,
+    (removed, fields): (RemovedByRedaction, FieldsRemovedByRedaction),
+    budget: &mut Budget,
+) -> Result<(), ApplyError> {
     let refuse = |what: &str| Err(ApplyError::SelfCheck(what.into()));
+    let tick = |budget: &mut Budget| budget.tick().map_err(|_| ApplyError::TooComplex);
     let pages = &inspection.pages;
     if inspection.base_kept {
         return refuse("the output keeps the edited file's bytes");
@@ -258,7 +367,19 @@ fn self_check(inspection: &Inspection, facts: &AppliedFacts, before: &Inspection
     if annotations.removed != 0 || annotations.changed != 0 {
         return refuse("an annotation not under a mark was removed or changed");
     }
-    if annotations.redactions_applied != facts.marks {
+    // R6b-55: the redactor and the inspector removed by the one rule, and the save's own share
+    // is exactly what its inspection counted under its marks.
+    if annotations.removed_by_redaction.total() != removed.total() {
+        return refuse("the annotations removed with the marks are not those the redactor removed");
+    }
+    if inspection.form_fields_removed_by_redaction.total() != fields.total() {
+        return refuse("the form fields removed with the marks are not those the redactor removed");
+    }
+    let under = &before.added_under_marks;
+    if (removed.stamps, removed.drawings, fields.filled) != (under.stamps, under.drawings, under.filled_fields) {
+        return refuse("what the save added under its marks is not what the redaction removed of it");
+    }
+    if facts.marks != count(detail.added_marks.len()) || annotations.redactions_applied != facts.marks {
         return refuse("a mark was not applied over all its areas");
     }
     if inspection.form_fields_changed != 0 {
@@ -280,48 +401,96 @@ fn self_check(inspection: &Inspection, facts: &AppliedFacts, before: &Inspection
     if !inspection.marked_areas.is_empty() {
         return refuse("a mark is left");
     }
-    // P6-35: every mark quadrilateral applied, within a point, and nothing filled beyond them.
-    const SLACK: f32 = 1.0;
-    let near = |a: &[f32; 4], b: &[f32; 4]| a.iter().zip(b).all(|(x, y)| (x - y).abs() <= SLACK);
-    let mut left = inspection.applied_areas.clone();
-    for (page, area) in &facts.areas {
-        let Some(at) = left.iter().position(|(on, applied)| on == page && near(applied, area)) else {
-            return refuse("a mark area was not applied whole");
-        };
-        left.swap_remove(at);
+    // R6b-55 (inspector re-review N8): the marks applied are the update's, area by area, by
+    // value and in order (P6-35).
+    if facts.areas != before.marked_areas {
+        return refuse("the marks read otherwise than the update's inspection");
     }
-    if !left.is_empty() {
-        return refuse("an area was applied that no mark asked for");
+    if inspection.applied_areas.len() != facts.areas.len() {
+        return refuse("a mark area was not applied, or one no mark asked for was");
     }
-    // Every box found filled lies within the marks (a render pixel of slack besides).
-    for (page, area) in &inspection.redaction_areas {
-        let marked: Vec<&[f32; 4]> = facts.areas.iter().filter(|(on, _)| on == page).map(|(_, area)| area).collect();
-        let covered = |x: f32, y: f32| marked.iter().any(|m| x >= m[0] - 1.5 && x <= m[2] + 1.5 && y >= m[1] - 1.5 && y <= m[3] + 1.5);
-        let steps = 40;
-        for i in 0..=steps {
-            for j in 0..=steps {
-                let x = area[0] + (area[2] - area[0]) * i as f32 / steps as f32;
-                let y = area[1] + (area[3] - area[1]) * j as f32 / steps as f32;
-                if !covered(x, y) {
-                    return refuse("an area was filled beyond the marks");
-                }
-            }
+    for ((page, applied), (on, area)) in inspection.applied_areas.iter().zip(&facts.areas) {
+        tick(budget)?;
+        if page != on || !applied.iter().zip(area).all(|(x, y)| (x - y).abs() <= AREA_SLACK) {
+            return refuse("a mark area was not applied whole, or not in the update's order");
         }
     }
-    // The marks of the update are what its own inspection reported.
-    if count(before.marked_areas.len()) != count(facts.areas.len()) {
-        return refuse("the marks read otherwise than the update's inspection");
+    // Every band found filled lies within the marks: in one mark, or (marks that overlap) in
+    // their union, with the marks bucketed by page and every step on the budget (R6b-55,
+    // inspector re-review N6).
+    let mut by_page: std::collections::BTreeMap<u32, Vec<[f32; 4]>> = std::collections::BTreeMap::new();
+    for (page, area) in &facts.areas {
+        by_page.entry(*page).or_default().push(*area);
+    }
+    for marks in by_page.values_mut() {
+        marks.sort_by(|a, b| a[0].total_cmp(&b[0]));
+    }
+    for (page, band) in &inspection.filled_areas {
+        tick(budget)?;
+        let marks = by_page.get(page).map(Vec::as_slice).unwrap_or_default();
+        if !within_marks(band, marks, BAND_SLACK, budget)? {
+            return refuse("an area was filled beyond the marks");
+        }
     }
     Ok(())
 }
 
+/// Whether `band` lies within the union of `marks` (sorted by their left edge), each widened
+/// by `slack`: in one of them (the usual case, found first), or covered by those it meets, slab
+/// by slab.
+fn within_marks(band: &[f32; 4], marks: &[[f32; 4]], slack: f32, budget: &mut Budget) -> Result<bool, ApplyError> {
+    let tick = |budget: &mut Budget| budget.tick().map_err(|_| ApplyError::TooComplex);
+    let widened = |m: &[f32; 4]| [m[0] - slack, m[1] - slack, m[2] + slack, m[3] + slack];
+    // The marks that can meet the band: their left edges up to its right edge.
+    let reach = marks.partition_point(|m| m[0] - slack <= band[2]);
+    let mut meeting: Vec<[f32; 4]> = Vec::new();
+    for mark in marks.iter().take(reach) {
+        tick(budget)?;
+        let m = widened(mark);
+        if m[0] <= band[0] && m[1] <= band[1] && m[2] >= band[2] && m[3] >= band[3] {
+            return Ok(true);
+        }
+        if m[2] > band[0] && m[3] > band[1] && m[1] < band[3] {
+            meeting.push(m);
+        }
+    }
+    // Covered by their union: between each pair of neighbouring x edges, the marks spanning
+    // that slab must cover the band's height.
+    let mut edges: Vec<f32> = vec![band[0], band[2]];
+    edges.extend(meeting.iter().flat_map(|m| [m[0], m[2]]).filter(|x| *x > band[0] && *x < band[2]));
+    edges.sort_by(f32::total_cmp);
+    edges.dedup();
+    for slab in edges.windows(2) {
+        let (left, right) = (slab[0], slab[1]);
+        let mut spans: Vec<(f32, f32)> = Vec::new();
+        for m in &meeting {
+            tick(budget)?;
+            if m[0] <= left && m[2] >= right {
+                spans.push((m[1], m[3]));
+            }
+        }
+        spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut reached = band[1];
+        for (low, high) in spans {
+            tick(budget)?;
+            if low > reached {
+                break;
+            }
+            reached = reached.max(high);
+        }
+        if reached < band[3] {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Every content stream of the output (pages', forms', tiling patterns') that is no content
 /// stream of the edited file is exactly as the content serializer writes it, byte for byte.
-fn canonical_streams(edited: &[u8], output: &[u8]) -> Result<(), ApplyError> {
+fn canonical_streams(edited: &[u8], output: &[u8], budget: &mut Budget) -> Result<(), ApplyError> {
     let refuse = |what: &str| Err(ApplyError::SelfCheck(what.into()));
     let open = |bytes: &[u8]| Document::open(Arc::new(bytes.to_vec())).map_err(|error| ApplyError::SelfCheck(error.to_string()));
     let (edited, output) = (open(edited)?, open(output)?);
-    let mut budget = Budget::new(Limits::default());
     let digests = |doc: &Document, budget: &mut Budget| -> Result<std::collections::HashSet<[u8; 32]>, ApplyError> {
         let mut out = std::collections::HashSet::new();
         for num in doc.object_numbers() {
@@ -335,12 +504,13 @@ fn canonical_streams(edited: &[u8], output: &[u8]) -> Result<(), ApplyError> {
         }
         Ok(out)
     };
-    let known = digests(&edited, &mut budget)?;
+    let known = digests(&edited, budget)?;
+    let contents = page_content_numbers(&output, budget)?;
     for num in output.object_numbers() {
         budget.tick().map_err(|_| ApplyError::TooComplex)?;
         let Ok(object) = output.try_get(num) else { continue };
         let Object::Stream(stream) = &*object else { continue };
-        let content = stream.dict.name(b"Subtype") == Some(b"Form") || stream.dict.int(b"PatternType") == Some(1) || is_page_content(&output, num);
+        let content = stream.dict.name(b"Subtype") == Some(b"Form") || stream.dict.int(b"PatternType") == Some(1) || contents.contains(&num);
         if !content {
             continue;
         }
@@ -348,8 +518,9 @@ fn canonical_streams(edited: &[u8], output: &[u8]) -> Result<(), ApplyError> {
         if known.contains(&sha256(&[&data])) {
             continue;
         }
-        match operators::canonical(&data, &mut budget) {
+        match operators::canonical(&data, budget) {
             Ok(canonical) if canonical == data => {}
+            Err(Fail::TooComplex) => return Err(ApplyError::TooComplex),
             _ => return refuse("a content stream is not as the content serializer writes it"),
         }
     }
