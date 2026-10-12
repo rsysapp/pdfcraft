@@ -784,3 +784,127 @@ fn tiling_patterns_and_soft_masks_under_a_mark_are_refused_by_their_reason() {
     assert_eq!(codes.len(), Refusal::ALL.len());
     assert!(codes.iter().all(|code| ApplyError::CODES.contains(code)));
 }
+
+// ── Audit (follow-up 9, coordinator's scan of images.rs): masks read as a viewer reads them ───
+
+/// `edited` written again with `change` made to the soft mask of its first image that has one.
+fn forge_soft_mask(applied: &[u8], change: impl Fn(&mut pdfcraft_cos::Dict)) -> Vec<u8> {
+    let mut doc = pdfcraft_cos::Document::open(Arc::new(applied.to_vec())).unwrap();
+    let mask = doc
+        .object_numbers()
+        .into_iter()
+        .find_map(|num| match &*doc.try_get(num).ok()? {
+            pdfcraft_cos::Object::Stream(s) if s.dict.name(b"Subtype") == Some(b"Image") => {
+                s.dict.get(b"SMask").and_then(pdfcraft_cos::Object::as_ref)
+            }
+            _ => None,
+        })
+        .unwrap();
+    let pdfcraft_cos::Object::Stream(mut stream) = (*doc.get(mask)).clone() else { panic!("no mask") };
+    change(&mut stream.dict);
+    doc.set(mask, pdfcraft_cos::Object::Stream(stream));
+    pdfcraft_cos::write_full(&doc, &pdfcraft_cos::SaveOptions { mod_date: None, ..Default::default() }).unwrap()
+}
+
+#[test]
+fn a_soft_mask_read_otherwise_than_its_samples_is_not_the_same_mask() {
+    // Audit (images.rs): a cleared image's soft mask is compared sample by sample; a mask whose
+    // dictionary makes a viewer read the same bytes otherwise (inverted by /Decode, another
+    // depth, a /Matte) is no mask redacted in place. A white image on a white page hides the
+    // change from the renders, so only the image comparison can tell.
+    let ramp: Vec<u8> = (0..240 * 40).map(|i| (i % 240) as u8).collect();
+    let white = stream(
+        "/Type /XObject /Subtype /Image /Width 240 /Height 40 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 7 0 R",
+        &vec![255u8; 240 * 40],
+    );
+    let mask = stream("/Type /XObject /Subtype /Image /Width 240 /Height 40 /ColorSpace /DeviceGray /BitsPerComponent 8", &ramp);
+    let base = Spec {
+        res: "/XObject << /Im1 6 0 R >>".into(),
+        extras: vec![white, mask],
+        ..Spec::new(&format!("q 120 0 0 20 0 145 cm /Im1 Do Q\n{LINE}\n{KEEP}"))
+    }
+    .build();
+    let edited = marked(&base, &[BOX]);
+    let applied = apply(&base, &edited).unwrap();
+    for (case, change) in [
+        (
+            "inverted",
+            Box::new(|d: &mut pdfcraft_cos::Dict| {
+                d.set(b"Decode".to_vec(), pdfcraft_cos::Object::Array(vec![pdfcraft_cos::Object::Int(1), pdfcraft_cos::Object::Int(0)]))
+            }) as Box<dyn Fn(&mut pdfcraft_cos::Dict)>,
+        ),
+        ("matte", Box::new(|d: &mut pdfcraft_cos::Dict| d.set(b"Matte".to_vec(), pdfcraft_cos::Object::Array(vec![pdfcraft_cos::Object::Int(1)])))),
+        ("another depth", Box::new(|d: &mut pdfcraft_cos::Dict| d.set(b"BitsPerComponent".to_vec(), pdfcraft_cos::Object::Int(4)))),
+    ] {
+        let forged = forge_soft_mask(&applied.bytes, change);
+        match inspect(&edited, &forged, InspectLimits::default()) {
+            Ok(inspection) => assert!(inspection.content.pages_changed_outside_redactions > 0, "{case}: {inspection:?}"),
+            Err(_) => {}
+        }
+    }
+}
+
+#[test]
+fn a_redacted_image_keeps_no_alternate_copy() {
+    // Audit (images.rs): an image redacted in place may lose its alternates, XMP and private
+    // data, never keep them: an alternate (shown for printing by some viewers) holds the
+    // unredacted picture.
+    let pixels: Vec<u8> = SECRET.bytes().cycle().take(240 * 40).collect();
+    let image = stream(
+        "/Type /XObject /Subtype /Image /Width 240 /Height 40 /ColorSpace /DeviceGray /BitsPerComponent 8 /Alternates [<< /Image 7 0 R >>]",
+        &pixels,
+    );
+    let alternate = stream("/Type /XObject /Subtype /Image /Width 240 /Height 40 /ColorSpace /DeviceGray /BitsPerComponent 8", &pixels);
+    let base = Spec {
+        res: "/XObject << /Im1 6 0 R >>".into(),
+        extras: vec![image, alternate],
+        ..Spec::new(&format!("q 120 0 0 20 0 145 cm /Im1 Do Q\n{LINE}\n{KEEP}"))
+    }
+    .build();
+    let edited = marked(&base, &[BOX]);
+    let applied = apply(&base, &edited).unwrap();
+    let mut doc = pdfcraft_cos::Document::open(Arc::new(applied.bytes.clone())).unwrap();
+    let copy = doc.add(pdfcraft_cos::Object::Stream(pdfcraft_cos::Stream::from_raw(
+        {
+            let mut d = pdfcraft_cos::Dict::new();
+            for (k, v) in [("Type", "XObject"), ("Subtype", "Image"), ("ColorSpace", "DeviceGray")] {
+                d.set(k.as_bytes().to_vec(), pdfcraft_cos::Object::name(v));
+            }
+            d.set(b"Width".to_vec(), pdfcraft_cos::Object::Int(240));
+            d.set(b"Height".to_vec(), pdfcraft_cos::Object::Int(40));
+            d.set(b"BitsPerComponent".to_vec(), pdfcraft_cos::Object::Int(8));
+            d
+        },
+        pixels.clone(),
+    )));
+    let cleared = doc
+        .object_numbers()
+        .into_iter()
+        .find(|num| matches!(&*doc.try_get(*num).unwrap(), pdfcraft_cos::Object::Stream(s) if s.dict.name(b"Subtype") == Some(b"Image") && s.decoded().unwrap() != pixels))
+        .unwrap();
+    let r = pdfcraft_cos::ObjRef::new(cleared, 0);
+    let pdfcraft_cos::Object::Stream(mut stream_object) = (*doc.get(r)).clone() else { panic!() };
+    let mut alternate = pdfcraft_cos::Dict::new();
+    alternate.set(b"Image".to_vec(), pdfcraft_cos::Object::Ref(copy));
+    stream_object.dict.set(b"Alternates".to_vec(), pdfcraft_cos::Object::Array(vec![pdfcraft_cos::Object::Dict(alternate)]));
+    doc.set(r, pdfcraft_cos::Object::Stream(stream_object));
+    let forged = pdfcraft_cos::write_full(&doc, &pdfcraft_cos::SaveOptions { mod_date: None, ..Default::default() }).unwrap();
+    if let Ok(inspection) = inspect(&edited, &forged, InspectLimits::default()) {
+        assert!(inspection.content.pages_changed_outside_redactions > 0, "{inspection:?}");
+    }
+}
+
+#[test]
+fn an_inline_image_holding_ei_in_its_data_is_redacted_beside_or_refused() {
+    // Audit (images.rs): an inline image whose data holds "EI" is read to its length by every
+    // reader here; one beside a mark comes through as it was, or the redaction is refused.
+    let data = b"ab EI cd";
+    let mut content = format!("{LINE}\n{KEEP}\nq 40 0 0 5 120 20 cm BI /W 8 /H 1 /BPC 8 /CS /G ID ").into_bytes();
+    content.extend_from_slice(data);
+    content.extend_from_slice(b"\nEI Q");
+    let base = Spec { content: String::from_utf8(content).unwrap(), ..Spec::default() }.build();
+    if let Ok(applied) = apply(&base, &marked(&base, &[BOX])) {
+        assert!(applied.bytes.windows(data.len()).any(|w| w == data) || !found(&applied.bytes, "ab EI cd").is_empty());
+        assert!(found(&applied.bytes, SECRET).is_empty());
+    }
+}

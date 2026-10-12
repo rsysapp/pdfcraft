@@ -566,8 +566,10 @@ pub(crate) struct ImageInfo {
     pub width: u32,
     pub height: u32,
     /// Follow-up 9 (R6b-54, N6): its soft mask (`/SMask`) and its stencil mask (`/Mask`, an
-    /// image mask), by object; a colour-key `/Mask` is part of `meaning`.
-    pub masks: [Option<ObjRef>; 2],
+    /// image mask), by object, with what the mask's samples mean (its dictionary without its
+    /// filters, decode parameters and length: a mask read otherwise, by its `/Decode`, depth or
+    /// `/Matte`, is another mask whatever its bytes); a colour-key `/Mask` is part of `meaning`.
+    pub masks: [Option<(ObjRef, Digest)>; 2],
     /// Follow-up 9 (R6b-54, N6): its alternates, XMP packet, private and prepress data, which a
     /// redaction may only take away (`None`: it has none).
     pub extras: Option<Digest>,
@@ -2788,7 +2790,20 @@ impl<'d, 'b> Reader<'d, 'b> {
         }
         left_out.extend(IMAGE_EXTRAS);
         let meaning = self.digest_without(dict, &left_out)?;
-        let masks = [dict.get(b"SMask").and_then(Object::as_ref), if stream_mask { dict.get(b"Mask").and_then(Object::as_ref) } else { None }];
+        let mut masks = [None, None];
+        for (slot, key) in masks.iter_mut().zip([&b"SMask"[..], b"Mask"]) {
+            let Some(mask) = dict.get(key).and_then(Object::as_ref) else { continue };
+            if key == b"Mask" && !stream_mask {
+                continue;
+            }
+            let object = self.get(mask)?;
+            // A mask that is no stream is no mask a viewer reads alike: its own meaning only.
+            let meaning = match &*object {
+                Object::Stream(stream) => self.digest_without(&stream.dict, &CODING_KEYS)?,
+                other => sha256(&[b"no mask stream", &self.digest(other)?]),
+            };
+            *slot = Some((mask, meaning));
+        }
         let extras: Dict = dict.iter().filter(|(key, _)| IMAGE_EXTRAS.contains(&key.as_slice())).map(|(k, v)| (k.clone(), v.clone())).collect();
         let extras = if extras.is_empty() { None } else { Some(self.digest(&Object::Dict(extras))?) };
         let info = Arc::new(ImageInfo { obj: r, meaning, width, height, masks, extras });

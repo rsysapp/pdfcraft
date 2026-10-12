@@ -342,7 +342,11 @@ fn replacement(base: &ImageUse, edited: &ImageUse, files: (&Images, &Images), ar
     for (b_mask, e_mask) in b.masks.iter().zip(&e.masks) {
         let compared = match (b_mask, e_mask) {
             (None, None) => Some(Replaced::Same),
-            (Some(b_mask), Some(e_mask)) => samples(files, (b_mask.num, e_mask.num), &base.matrix, areas, budget)?,
+            // Audit (follow-up 9): only a mask meaning what the base's meant compares by its
+            // samples.
+            (Some((b_mask, b_meaning)), Some((e_mask, e_meaning))) if b_meaning == e_meaning => {
+                samples(files, (b_mask.num, e_mask.num), &base.matrix, areas, budget)?
+            }
             _ => None,
         };
         replaced = match (replaced, compared) {
@@ -351,6 +355,11 @@ fn replacement(base: &ImageUse, edited: &ImageUse, files: (&Images, &Images), ar
             (Replaced::Redacted, _) | (_, Some(Replaced::Redacted)) => Replaced::Redacted,
             (Replaced::Same, Some(Replaced::Same)) => Replaced::Same,
         };
+    }
+    // Audit (follow-up 9): an image redacted in place keeps no copy of what it showed: its
+    // alternates (printed by some viewers), XMP, private and prepress data must have gone.
+    if matches!(replaced, Replaced::Redacted) && e.extras.is_some() {
+        return Ok(Replaced::Outside);
     }
     Ok(replaced)
 }
