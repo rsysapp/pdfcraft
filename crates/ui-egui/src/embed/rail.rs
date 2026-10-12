@@ -28,6 +28,24 @@ pub(crate) fn show(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                     view.open_find();
                 }
             }
+            edit_tools(app, ui);
             chrome::page_cluster(app, ui, index, page_count, &labels, true);
         });
+}
+
+/// Embed API 0.2: edit mode's tools, below find, as the permissions allow (`embed::edit`). The
+/// labels are the commands' own, so every interface language already has them.
+fn edit_tools(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
+    let Some(permissions) = app.embed.as_ref().and_then(|embed| embed.edit.as_ref()).map(|edit| edit.permissions) else { return };
+    ui.separator();
+    let mut chosen = None;
+    for id in super::edit::RAIL.iter().filter(|id| super::edit::allows_command(id, &permissions)) {
+        let Some(spec) = pdfcraft_engine::commands::command(id) else { continue };
+        if icons::button(ui, spec.icon, 34.0, false, tl!(spec.label)).clicked() {
+            chosen = Some(*id);
+        }
+    }
+    if let Some(id) = chosen {
+        app.execute(id);
+    }
 }

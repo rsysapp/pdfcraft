@@ -31,8 +31,13 @@ impl PdfCraftApp {
     /// Last-resort guard (AGENTS.md §4): a command that panics is reported and the app, with its
     /// open documents, keeps running. Edits are applied to a copy, so the document is unchanged.
     pub fn execute(&mut self, id: &str) -> bool {
-        // Embed build: view mode runs only its viewing commands (`embed`).
+        // Embed build: edit mode answers saving and comment tools itself (`embed::edit`).
+        if let Some(done) = self.embed_edit_command(id) {
+            return done;
+        }
+        // Embed build: view mode runs only its viewing commands, edit mode also its tools (`embed`).
         if !self.embed_allows(id) {
+            self.embed_command_refused(id);
             return false;
         }
         match pdfcraft_engine::guard(|| self.execute_unguarded(id)) {

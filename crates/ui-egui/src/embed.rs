@@ -5,14 +5,16 @@
 //! View mode shows the document area with the page view's own navigation, zoom and find. Changes
 //! are refused in the engine (`Session::set_view_only`) and in command dispatch, not only hidden.
 
+mod edit;
 mod host_theme;
 mod protocol;
 mod rail;
 pub mod text_match;
 
 pub use protocol::{
-    HostBridge, HostCommand, HostEvent, JumpTarget, MAX_MARKS, MAX_OPEN_BYTES, Mark, OPEN_TOO_LARGE, Theme, open_command, open_too_large,
-    parse_color, parse_jump_target, parse_marks, parse_mount_options, parse_theme,
+    EditAuthor, EditPermissions, EditorMode, HostBridge, HostCommand, HostEvent, JumpTarget, MAX_MARKS, MAX_OPEN_BYTES, Mark, ModeRequest,
+    OPEN_TOO_LARGE, Theme, open_command, open_too_large, parse_color, parse_jump_target, parse_marks, parse_mode_request, parse_mount_options,
+    parse_theme, refusal,
 };
 
 use std::collections::HashSet;
@@ -86,6 +88,24 @@ pub(crate) struct Embed {
     page_marks: Arc<Vec<PageMark>>,
     /// Pages already searched for the current marks.
     searched: HashSet<usize>,
+    /// Embed API 0.2: the edit session while the host page has the document in edit mode.
+    edit: Option<edit::EditSession>,
+    /// The author and date the open document's unsaved changes carry (one of each per save).
+    signer: Option<edit::Signer>,
+    /// The opened file's name, which a save keeps; and whether a document is open: the last open
+    /// succeeded (a refused open leaves nothing to edit).
+    file_name: String,
+    file_open: bool,
+    /// Redaction marks the file had when it opened (the host counts only the ones edit mode adds).
+    base_marks: usize,
+    /// What the host was last told: whether the document differs from what opened, and how many
+    /// areas edit mode marked for redaction.
+    reported_dirty: bool,
+    reported_marks: usize,
+    /// Frames run (`embed_logic`), and the last save answered: (frame, document generation, in
+    /// edit mode). Two requests for the same state in one frame answer once.
+    frame: u64,
+    last_save: Option<(u64, u64, bool)>,
 }
 
 /// A host mark's rectangle on one page, in page view space (points, y down).
@@ -114,6 +134,12 @@ impl Embed {
         self.own_under_press = false;
         self.settle_again = false;
         self.set_marks(Vec::new());
+        // Embed API 0.2: a new document starts clean, with no edit session (W3-4).
+        self.signer = None;
+        self.file_open = false;
+        self.base_marks = 0;
+        self.reported_dirty = false;
+        self.reported_marks = 0;
     }
 
     /// When the editor itself moves the view or replaces the document, a selection the host was
@@ -263,7 +289,11 @@ impl PdfCraftApp {
 
     /// Whether command `command` may run: every command outside view mode, the viewing ones in it.
     pub(crate) fn embed_allows(&self, command: &str) -> bool {
-        self.embed.is_none() || VIEW_COMMANDS.contains(&command)
+        match self.embed.as_ref() {
+            None => true,
+            // Embed API 0.2: edit mode also runs the tools its permissions allow (`edit`).
+            Some(embed) => VIEW_COMMANDS.contains(&command) || embed.edit.as_ref().is_some_and(|edit| edit::allows_command(command, &edit.permissions)),
+        }
     }
 
     /// Run the host's commands (end of `logic`, after the app's own styling and renders).
@@ -271,6 +301,7 @@ impl PdfCraftApp {
         let Some(mut embed) = self.embed.take() else { return };
         embed.bridge.attach(ctx);
         embed.pointer_down = ctx.input(|i| i.pointer.any_down());
+        embed.frame = embed.frame.wrapping_add(1);
         for command in embed.bridge.take_commands() {
             match command {
                 HostCommand::Open { name, bytes } => self.host_open(&mut embed, &name, bytes),
@@ -278,6 +309,11 @@ impl PdfCraftApp {
                 HostCommand::JumpTo(target) => self.host_jump(&mut embed, target),
                 HostCommand::SetMarks(marks) => embed.set_marks(marks),
                 HostCommand::SetTheme(theme) => embed.theme = Some(theme),
+                HostCommand::SetMode(request) => self.host_set_mode(&mut embed, request),
+                // Answered here, before any later command of the frame changes the document or the mode.
+                HostCommand::RequestSave => self.host_save(&mut embed),
+                // Redactions are applied on the host's server, never here (R6b-49).
+                HostCommand::ApplyRedactions => {}
             }
         }
         if let Some(theme) = embed.theme.take() {
@@ -306,7 +342,10 @@ impl PdfCraftApp {
         if self.full_screen {
             self.set_full_screen(ctx, false);
         }
-        self.enforce_view_profile();
+        match embed.edit.as_ref().map(|edit| edit.permissions) {
+            Some(permissions) => self.enforce_edit_profile(permissions),
+            None => self.enforce_view_profile(),
+        }
         self.embed = Some(embed);
     }
 
@@ -333,6 +372,10 @@ impl PdfCraftApp {
     #[doc(hidden)]
     pub fn host_mark_rects(&self) -> Vec<(String, egui::Rect)> {
         let (Some(embed), Some(view)) = (self.embed.as_ref(), self.active.and_then(|i| self.views.get(i))) else { return Vec::new() };
+        // Host marks describe the stored version; they are hidden while it is edited.
+        if embed.edit.is_some() {
+            return Vec::new();
+        }
         embed.page_marks.iter().filter_map(|m| view.page_xform(m.page).map(|xf| (m.id.clone(), xf.view_rect(m.rect)))).collect()
     }
 
@@ -435,6 +478,12 @@ impl PdfCraftApp {
             Ok(()) if self.password_prompt.take().is_some() => HostEvent::OpenFailed { message: PASSWORD_MESSAGE.into() },
             Ok(()) => HostEvent::Opened { pages: self.active_ids().and_then(|(_, id)| self.session.get(id)).map_or(0, |d| d.info.pages.len()) },
         };
+        // Embed API 0.2: edit mode needs a document that opened ("Modes").
+        if matches!(event, HostEvent::Opened { .. }) {
+            embed.file_open = true;
+            embed.file_name = name.to_string();
+            embed.base_marks = self.active_document().map_or(0, pdfcraft_engine::Document::redaction_marks);
+        }
         embed.bridge.emit(event);
     }
 
@@ -442,12 +491,26 @@ impl PdfCraftApp {
     /// answers, and nothing else changes (the open document, its marks, a waiting jump and a
     /// reported selection all stay), as in the Word editor.
     fn host_open_refused(&mut self, embed: &mut Embed, message: &str) {
+        // Embed API 0.2: an open refused before reading the file is an open like any other: edit
+        // mode ends first, and with the last open failed nothing is left to edit ("Modes"). The
+        // document stays on screen, as in view mode.
+        if embed.edit.is_some() {
+            self.leave_edit(embed);
+            embed.bridge.emit(HostEvent::ModeChanged { mode: EditorMode::View });
+        }
+        embed.file_open = false;
         embed.bridge.emit(HostEvent::OpenFailed { message: message.into() });
     }
 
     /// Close the open document for the host's next one (`selectionCleared` and a waiting jump's
     /// `jumpNotFound` go first).
     fn close_for_host_open(&mut self, embed: &mut Embed) {
+        // Embed API 0.2: a document always opens in view mode; the host hears so first when it
+        // was editing ("Opening in edit mode").
+        if embed.edit.is_some() {
+            self.leave_edit(embed);
+            embed.bridge.emit(HostEvent::ModeChanged { mode: EditorMode::View });
+        }
         while !self.views.is_empty() {
             self.close_tab(0);
         }
@@ -482,6 +545,10 @@ fn mark_may_lie_on(mark: &Mark, page: usize) -> bool {
 
 /// The host marks for the page view to paint (none outside the embed build).
 pub(crate) fn page_marks(embed: Option<&Embed>) -> Arc<Vec<PageMark>> {
+    // Host marks describe the stored version; they are hidden while it is edited.
+    if embed.is_some_and(|embed| embed.edit.is_some()) {
+        return Arc::default();
+    }
     embed.map(|e| e.page_marks.clone()).unwrap_or_default()
 }
 
@@ -547,6 +614,15 @@ fn collect_events(app: &mut PdfCraftApp, ctx: &egui::Context) {
     if embed.last_page != Some(view.current) {
         embed.last_page = Some(view.current);
         embed.bridge.emit(HostEvent::PageChanged { page: view.current + 1 });
+    }
+    // Selecting is part of editing: no selection events in edit mode (embed API 0.2). The settled
+    // selection is kept current, so leaving edit mode reports nothing for it until it changes.
+    if embed.edit.is_some() {
+        embed.last_selection = view.selection_span();
+        embed.own_selection = false;
+        embed.settle_again = false;
+        edit::frame_events(app, ctx);
+        return;
     }
     // A selection settles when no button is down: drags report on release, keys at once.
     let now = view.selection_span();

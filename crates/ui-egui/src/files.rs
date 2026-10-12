@@ -310,9 +310,14 @@ impl PdfCraftApp {
 
     /// Use picked files (also the entry point for tests and automation).
     pub fn use_files(&mut self, purpose: FilePurpose, files: Vec<(String, Vec<u8>)>) {
-        // Embed build: view mode takes no files (`embed`).
+        // Embed build: view mode takes no files (`embed`); edit mode only PDF files to insert as
+        // pages, as its permissions allow (`embed::edit`).
         if self.embed.is_some() {
-            return;
+            if !(purpose == FilePurpose::InsertPages && self.embed_allows_picker()) {
+                return;
+            }
+            let pdfs: Vec<(String, Vec<u8>)> = files.into_iter().filter(|(_, bytes)| bytes.starts_with(b"%PDF-")).collect();
+            return self.insert_files(pdfs);
         }
         match purpose {
             FilePurpose::Combine => self.stage_combine(files),

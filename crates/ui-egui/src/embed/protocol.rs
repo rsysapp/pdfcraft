@@ -114,6 +114,11 @@ pub enum HostCommand {
     JumpTo(JumpTarget),
     SetMarks(Vec<Mark>),
     SetTheme(Theme),
+    /// Embed API 0.2: view or edit mode.
+    SetMode(ModeRequest),
+    RequestSave,
+    /// Kept for API stability; nothing is ever applied in the browser (R6b-49).
+    ApplyRedactions,
 }
 
 /// What the page view tells the host; serialised as the API's `EditorEvent`.
@@ -144,6 +149,37 @@ pub enum HostEvent {
     JumpNotFound {
         target: JumpTarget,
     },
+    ModeChanged {
+        mode: EditorMode,
+    },
+    DirtyChanged {
+        dirty: bool,
+    },
+    /// `bytes` is set on the JavaScript object by the embed crate, outside JSON.
+    SaveRequested {
+        #[serde(rename = "fileName")]
+        file_name: String,
+        #[serde(skip)]
+        bytes: Vec<u8>,
+    },
+    SaveFailed {
+        message: String,
+    },
+    CommentRequested {
+        text: String,
+        #[serde(rename = "copyText")]
+        copy_text: String,
+        page: Option<usize>,
+        x: f32,
+        y: f32,
+    },
+    RedactionsPending {
+        marks: usize,
+    },
+    /// An action edit mode refused, by a stable code the host words itself.
+    EditRefused {
+        code: &'static str,
+    },
 }
 
 impl HostEvent {
@@ -151,6 +187,129 @@ impl HostEvent {
     pub fn to_json(&self) -> Result<String, String> {
         serde_json::to_string(self).map_err(|e| e.to_string())
     }
+}
+
+/// The codes `editRefused` carries that this editor sends (embed API 0.2).
+pub mod refusal {
+    /// A tool or command the permissions or edit mode do not offer.
+    pub const COMMAND_NOT_ALLOWED: &str = "command_not_allowed";
+    /// A `setMode` that would mix two authors or two dates in one save.
+    pub const INVALID_EDIT_SESSION: &str = "invalid_edit_session";
+    /// A command this editor does not know.
+    pub const UNKNOWN_COMMAND: &str = "unknown_command";
+    /// An allowed change the engine could not make (a page that does not exist, …).
+    pub const COMMAND_FAILED: &str = "command_failed";
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EditorMode {
+    View,
+    Edit,
+}
+
+/// `setMode`'s request (embed API 0.2).
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[serde(tag = "mode", rename_all = "lowercase")]
+pub enum ModeRequest {
+    View,
+    Edit {
+        author: EditAuthor,
+        #[serde(rename = "revisionDate")]
+        revision_date: String,
+        permissions: EditPermissions,
+    },
+}
+
+/// The person editing. Fields of `author` this editor does not read are ignored (embed API 0.2).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+pub struct EditAuthor {
+    pub id: String,
+    pub name: String,
+}
+
+/// Which tools edit mode offers; this editor ignores `accept_reject_changes`. An unknown
+/// permission is refused, never ignored: a restriction the editor cannot read must not become a
+/// tool it offers (Ruling W5-2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EditPermissions {
+    pub accept_reject_changes: bool,
+    pub organize_pages: bool,
+    pub fill_forms: bool,
+    pub redact: bool,
+    pub stamps: bool,
+    pub drawing: bool,
+}
+
+/// `YYYY-MM-DDTHH:MM:SS`, an optional fraction, `Z`.
+fn is_utc_timestamp(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let digits = |range: std::ops::Range<usize>| bytes.get(range).is_some_and(|part| part.iter().all(u8::is_ascii_digit));
+    let at = |index: usize, expected: u8| bytes.get(index) == Some(&expected);
+    let head = digits(0..4)
+        && at(4, b'-')
+        && digits(5..7)
+        && at(7, b'-')
+        && digits(8..10)
+        && at(10, b'T')
+        && digits(11..13)
+        && at(13, b':')
+        && digits(14..16)
+        && at(16, b':')
+        && digits(17..19);
+    let tail = match bytes.get(19..) {
+        Some([b'Z']) => true,
+        Some([b'.', rest @ ..]) => rest.split_last().is_some_and(|(last, fraction)| *last == b'Z' && !fraction.is_empty() && fraction.iter().all(u8::is_ascii_digit)),
+        _ => false,
+    };
+    head && tail
+}
+
+/// Seconds since the Unix epoch of a timestamp `is_utc_timestamp` accepts (the fraction dropped),
+/// or `None` for a date or time that does not exist on the calendar (2026-02-31, 25:00).
+pub(crate) fn unix_seconds(text: &str) -> Option<i64> {
+    if !is_utc_timestamp(text) {
+        return None;
+    }
+    let number = |range: std::ops::Range<usize>| text.get(range)?.parse::<i64>().ok();
+    let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
+    let (hour, minute, second) = (number(11..13)?, number(14..16)?, number(17..19)?);
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if !(1..=days_in_month).contains(&day) || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    // Days from the civil date (Howard Hinnant's algorithm; `pdfcraft_cos::pdf_date` runs it the
+    // other way).
+    let shifted_year = if month <= 2 { year - 1 } else { year };
+    let era = shifted_year.div_euclid(400);
+    let year_of_era = shifted_year - era * 400;
+    let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+/// `ModeRequest` from the host's JSON: an author name of 1 to 255 characters and an ISO 8601 UTC
+/// `revisionDate` that exists on the calendar.
+pub fn parse_mode_request(json: &str) -> Result<ModeRequest, String> {
+    let request: ModeRequest = serde_json::from_str(json).map_err(|e| format!("setMode: {e}"))?;
+    if let ModeRequest::Edit { author, revision_date, .. } = &request {
+        if author.name.trim().is_empty() || author.name.chars().count() > 255 {
+            return Err("setMode: author.name must be 1 to 255 characters".into());
+        }
+        if unix_seconds(revision_date).is_none() {
+            return Err("setMode: revisionDate must be an ISO 8601 UTC timestamp".into());
+        }
+    }
+    Ok(request)
 }
 
 /// The two queues between a host page and the running app, shared by both sides. A poisoned lock

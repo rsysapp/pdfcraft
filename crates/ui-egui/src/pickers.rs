@@ -150,7 +150,11 @@ impl PdfCraftApp {
             _ => None,
         };
         let ask = if multiple { Ask::Files(dialog) } else { Ask::File(dialog) };
-        self.ask(ask, target, move |app, paths| match pick_for {
+        // Embed build: edit mode's one picker, pages to insert, as its permissions allow (`embed::edit`).
+        if self.embed.is_some() && !(matches!(pick_for, PickFor::Files(crate::files::FilePurpose::InsertPages)) && self.embed_allows_picker()) {
+            return;
+        }
+        self.ask_unguarded(ask, target, move |app, paths| match pick_for {
             PickFor::Open => paths.iter().for_each(|p| app.open_path(&p.to_string_lossy())),
             PickFor::Files(purpose) => app.use_paths(purpose, &paths),
         });
@@ -168,10 +172,14 @@ impl PdfCraftApp {
     /// `pick_override` answers instead of a native panel (tests and automation); the answer
     /// still arrives on a later frame, like a real pick.
     pub(crate) fn ask(&mut self, ask: Ask, target: Option<DocId>, then: impl FnOnce(&mut PdfCraftApp, Vec<PathBuf>) + Send + 'static) -> bool {
-        // Embed build: no file pickers in view mode (`embed`).
+        // Embed build: no file pickers in view mode (`embed`); edit mode's one goes through `pick`.
         if self.embed.is_some() {
             return false;
         }
+        self.ask_unguarded(ask, target, then)
+    }
+
+    fn ask_unguarded(&mut self, ask: Ask, target: Option<DocId>, then: impl FnOnce(&mut PdfCraftApp, Vec<PathBuf>) + Send + 'static) -> bool {
         if self.pickers.showing.swap(true, Ordering::SeqCst) {
             self.notify_tr("Another file dialog is still open. Finish with it first.");
             return false;

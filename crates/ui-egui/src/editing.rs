@@ -29,7 +29,12 @@ pub enum SaveTarget {
 
 impl PdfCraftApp {
     /// Apply an edit to the active document. Returns `true` on success; failures are shown.
-    pub fn apply_edit(&mut self, edit: Edit) -> bool {
+    pub fn apply_edit(&mut self, mut edit: Edit) -> bool {
+        // Embed build: edit mode applies only what the host's permissions allow, in the host's
+        // author's name (`embed::edit`).
+        if !self.embed_edit_prepare(&mut edit) {
+            return false;
+        }
         let Some((i, id)) = self.active_ids() else { return false };
         let label = edit.label();
         match self.session.apply(id, edit.clone()) {
@@ -69,6 +74,8 @@ impl PdfCraftApp {
                 true
             }
             Err(e) => {
+                // Embed build: the host words a refusal itself (embed API 0.2, `editRefused`).
+                self.embed_edit_failed();
                 self.notify_fmt("{label} failed: {e}", &[("label", &crate::i18n::action_label(&label)), ("e", &e.to_string())]);
                 false
             }
