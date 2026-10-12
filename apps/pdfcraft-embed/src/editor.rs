@@ -80,6 +80,28 @@ impl EmbeddedEditor {
         Ok(())
     }
 
+    /// Switches the open document to view or edit mode (embed API 0.2); answered by `modeChanged`.
+    #[wasm_bindgen(js_name = setMode)]
+    pub fn set_mode(&self, #[wasm_bindgen(unchecked_param_type = "ModeRequest")] request: JsValue) -> Result<(), JsValue> {
+        let request = embed::parse_mode_request(&json_of(&request)?).map_err(|e| type_error(&e))?;
+        self.send(HostCommand::SetMode(request));
+        Ok(())
+    }
+
+    /// Serialises the document as an incremental update of the opened bytes; answered by
+    /// `saveRequested` or `saveFailed`.
+    #[wasm_bindgen(js_name = requestSave)]
+    pub fn request_save(&self) {
+        self.send(HostCommand::RequestSave);
+    }
+
+    /// Kept for API stability: redactions are only marked here and applied by the host's server
+    /// (R6b-49), so this does nothing.
+    #[wasm_bindgen(js_name = applyRedactions)]
+    pub fn apply_redactions(&self) {
+        self.send(HostCommand::ApplyRedactions);
+    }
+
     /// One listener; a second call replaces the first. Events are delivered after the frame that
     /// produced them.
     #[wasm_bindgen(js_name = setListener)]

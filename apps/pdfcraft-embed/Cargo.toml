@@ -2,7 +2,7 @@
 name = "pdfcraft-embed"
 description = "The embed build: PdfCraft's page view as a WebAssembly module a host page mounts on its own canvas"
 # Released on its own (tags embed-v<version>), so not the workspace version.
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 publish = false

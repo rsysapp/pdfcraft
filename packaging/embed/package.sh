@@ -134,6 +134,13 @@ for want in \
   'setTheme(theme: Theme): void;' \
   'setListener(listener: (event: EditorEvent) => void): void;' \
   'destroy(): void;' \
+  'setMode(request: ModeRequest): void;' \
+  'requestSave(): void;' \
+  'applyRedactions(): void;' \
+  'export interface EditorAuthor' \
+  'export interface EditorPermissions' \
+  'export type ModeRequest' \
+  'export type EditRefusalCode' \
   'export interface MountOptions' \
   'export interface Theme' \
   'export type JumpTarget' \

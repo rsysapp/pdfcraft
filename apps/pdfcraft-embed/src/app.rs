@@ -6,6 +6,7 @@ use std::rc::Rc;
 use pdfcraft_ui_egui::PdfCraftApp;
 use pdfcraft_ui_egui::embed::{HostBridge, HostEvent};
 use wasm_bindgen::JsValue;
+use wasm_bindgen::prelude::wasm_bindgen;
 
 /// The host's listener, shared with `EmbeddedEditor`.
 pub(crate) type Listener = Rc<RefCell<Option<js_sys::Function>>>;
@@ -52,14 +53,19 @@ async fn deliver(listener: Listener, events: Vec<HostEvent>) {
     for event in events {
         // Cloned out of the cell before the call: the listener may call setListener.
         let Some(listener) = listener.try_borrow().ok().and_then(|l| l.clone()) else { return };
-        let value = match event.to_json().map(|json| js_sys::JSON::parse(&json)) {
-            Ok(Ok(value)) => value,
-            Ok(Err(e)) => {
-                web_sys::console::error_1(&e);
-                continue;
+        // A save that cannot be handed over is answered `saveFailed`: a save never goes unanswered
+        // (Ruling W5-1).
+        let value = match event_value(&event) {
+            Ok(value) => value,
+            Err(error) if matches!(event, HostEvent::SaveRequested { .. }) => {
+                web_sys::console::error_1(&JsValue::from(error));
+                match event_value(&HostEvent::SaveFailed { message: "The document could not be handed over.".into() }) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                }
             }
-            Err(e) => {
-                web_sys::console::error_1(&JsValue::from(e));
+            Err(error) => {
+                web_sys::console::error_1(&JsValue::from(error));
                 continue;
             }
         };
@@ -67,4 +73,34 @@ async fn deliver(listener: Listener, events: Vec<HostEvent>) {
             web_sys::console::error_1(&e);
         }
     }
+}
+
+/// The event as the object the host's listener receives. A save's bytes travel as a `Uint8Array`
+/// the host owns (a copy outside the module's memory), not as JSON numbers. Allocating the array
+/// goes through a `catch` import, so a page that cannot allocate it answers `Err`, not a trap.
+fn event_value(event: &HostEvent) -> Result<JsValue, String> {
+    let json = event.to_json()?;
+    let value = js_sys::JSON::parse(&json).map_err(|error| format!("an event could not be read back: {error:?}"))?;
+    if let HostEvent::SaveRequested { bytes, .. } = event {
+        let length = u32::try_from(bytes.len()).map_err(|_| format!("a save of {} bytes is too large to hand over", bytes.len()))?;
+        let array: js_sys::Uint8Array =
+            OwnedBytes::new(length).map(Into::into).map_err(|error| format!("{length} bytes could not be allocated: {error:?}"))?;
+        // Same length by construction, so `copy_from`'s length check holds.
+        array.copy_from(bytes);
+        js_sys::Reflect::set(&value, &JsValue::from_str("bytes"), &array)
+            .map_err(|error| format!("a save's bytes could not be attached: {error:?}"))?;
+    }
+    Ok(value)
+}
+
+#[wasm_bindgen]
+extern "C" {
+    /// A `Uint8Array` made by [`OwnedBytes::new`].
+    #[wasm_bindgen(extends = js_sys::Uint8Array, js_name = Uint8Array)]
+    type OwnedBytes;
+
+    /// `new Uint8Array(length)`, answering what it throws (a `RangeError` when the page cannot
+    /// allocate it). js-sys's own constructors do not catch.
+    #[wasm_bindgen(catch, constructor, js_class = "Uint8Array")]
+    fn new(length: u32) -> Result<OwnedBytes, JsValue>;
 }

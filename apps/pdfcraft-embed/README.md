@@ -236,3 +236,44 @@ script fails if a logo asset key (`bytes://artcraft-`) is in the module. Build `
 with `-p pdfcraft-embed` alone: building it together with the apps (`--workspace`, or
 `-p pdfcraft-web`) unifies the `brand` feature back on. `NOTICE` in the zip says the build is
 based on PdfCraft by the ArtCraft team.
+
+## Edit mode (API 0.2)
+
+Release 0.2.0 adds `setMode`, `requestSave` and `applyRedactions`, and the events `modeChanged`,
+`dirtyChanged`, `saveRequested`, `saveFailed`, `commentRequested`, `redactionsPending` and
+`editRefused`, as the embed API's "Edit mode" describes them. The editor is still mounted in view
+mode.
+
+- `setMode({ mode: 'edit', author, revisionDate, permissions })` applies on the next frame and
+  answers `modeChanged` with the mode in force: `view` when no document is open, the last open
+  failed, or the file is encrypted. A malformed request (an unknown mode, an author name blank or
+  over 255 characters, a `revisionDate` that is not ISO 8601 UTC or not a calendar date, a missing,
+  non-boolean or unknown permission) throws a `TypeError` and queues nothing.
+- One author and one date per save: while the document differs from what was opened, a `setMode`
+  with another author or `revisionDate` answers `editRefused` (`invalid_edit_session`) and
+  `modeChanged` with the mode in force. Every annotation edit mode makes carries `author.name` (`/T`)
+  and `revisionDate` (`/M`); a save writes no document information (`/Info`, `/ModDate`).
+- The rail offers undo, redo and the tools the permissions allow: `organizePages` (rotate, delete,
+  organise and move, insert a blank page, insert the pages of a PDF file), `fillForms` (typing in
+  fields), `redact` (marking areas and text), `stamps`, `drawing` (ink, lines, arrows, rectangles,
+  ovals, eraser). Only annotations made in this edit session can be moved, resized or deleted.
+  Anything else (signing, protection, splitting, extracting, printing, saving as, comments in the
+  file) is refused, and the host hears `editRefused` with `command_not_allowed` (`unknown_command`
+  for an id the editor does not know, `command_failed` for an edit the engine could not make).
+  Display and navigation commands are refused silently.
+- The comment tools (note, text box, highlight, underline, strike-out, squiggly, …) write nothing:
+  with text selected they send `commentRequested` (the fields of `selection`), without, nothing.
+  No `selection` or `selectionCleared` is sent in edit mode; entering it clears a reported one first.
+- `requestSave()` (and Ctrl/Cmd+S in edit mode) answers `saveRequested` with an incremental update
+  appended to the opened bytes and the opened file name, at the point of the request; two requests
+  for the same state in one frame answer once. In view mode it answers `saveFailed`. A save whose
+  bytes cannot be handed over answers `saveFailed`. Saving never clears dirty; `dirtyChanged` turns
+  `false` again when undo brings the document back to what was opened, and resets on `opened`.
+- Redactions are only marked (R6b-49): a mark is a redaction annotation with a plain black fill and
+  no overlay text, grown to cover every glyph it reaches into whole, saved in the appended update
+  for the host's server to apply. `redactionsPending { marks }` reports the number of areas marked
+  in this editing whenever it changes (0 when none are left). `applyRedactions()` does nothing.
+- Deleting, moving and inserting pages keeps destinations given by page number, named
+  destinations and page labels with their pages; a named destination to a deleted page is removed.
+- Host marks are hidden while editing and shown again in view mode. Every `open` starts in view
+  mode; when the editor was editing, `modeChanged` with `view` comes first.
