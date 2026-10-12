@@ -8,6 +8,7 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
 use pdfcraft_cos::{Dict, Document, ObjRef, Object, SaveOptions, Stream};
