@@ -1561,3 +1561,44 @@ fn a_bookmark_title_read_as_a_viewer_reads_it_is_matched() {
     let applied = apply(&base, &marked(&base, &[BOX])).unwrap();
     assert_eq!(applied.facts.bookmarks_cleared, 1, "{:?}", applied.facts);
 }
+
+#[test]
+fn the_text_standing_for_what_was_removed_still_goes() {
+    // Audit (follow-up 9, coverage): what follow-up 8 cleared beside the copies (a span's
+    // /ActualText, /Alt and /E; a structure element's /Alt, /ActualText and /T; a figure's /Alt)
+    // goes still, through `apply_marks` (re-review probes `span-actualtext`, `struct-element`,
+    // `figure-alt`).
+    let span = Spec::new(&format!("/Span << /ActualText (SECRETWORD) /Alt (SECRETWORD) /E (SECRETWORD) >> BDC {LINE} EMC\n{KEEP}")).build();
+    let tagged = |content: &str, element: &str, extra: Vec<Vec<u8>>, res: &str| {
+        let mut extras = vec![
+            b"<< /Type /StructTreeRoot /K 7 0 R /ParentTree 8 0 R >>".to_vec(),
+            format!("<< /P 6 0 R /Pg 3 0 R /K 0 {element} >>").into_bytes(),
+            b"<< /Nums [0 [7 0 R]] >>".to_vec(),
+        ];
+        extras.extend(extra);
+        Spec {
+            cat: "/StructTreeRoot 6 0 R /MarkInfo << /Marked true >>".into(),
+            page: "/StructParents 0".into(),
+            res: res.into(),
+            extras,
+            ..Spec::new(content)
+        }
+        .build()
+    };
+    let element = tagged(
+        &format!("/P << /MCID 0 >> BDC {LINE} EMC\n{KEEP}"),
+        "/S /P /Alt (SECRETWORD) /ActualText (SECRETWORD) /T (SECRETWORD)",
+        Vec::new(),
+        "",
+    );
+    let figure = tagged(
+        &format!("/Figure << /MCID 0 >> BDC q 90 0 0 20 18 145 cm /Im1 Do Q EMC\n{KEEP}"),
+        "/S /Figure /Alt (SECRETWORD)",
+        vec![stream("/Type /XObject /Subtype /Image /Width 4 /Height 4 /ColorSpace /DeviceGray /BitsPerComponent 8", &[100u8; 16])],
+        "/XObject << /Im1 9 0 R >>",
+    );
+    for (case, base) in [("span", span), ("element", element), ("figure", figure)] {
+        let applied = apply(&base, &marked(&base, &[BOX])).unwrap_or_else(|error| panic!("{case}: {error:?}"));
+        assert!(found(&applied.bytes, SECRET).is_empty(), "{case}: {:?}", found(&applied.bytes, SECRET));
+    }
+}
