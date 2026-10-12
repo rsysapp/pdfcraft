@@ -325,28 +325,29 @@ impl<'a> Scope<'a> {
 /// numbers (and name) it takes.
 fn drifts(o: &[u8], operands: &[Object], nothing_saved: bool, in_text: bool) -> bool {
     let numbers = |count: usize| operands.len() == count && operands.iter().all(|operand| operand.as_f64().is_some());
-    match o {
-        b"Q" => nothing_saved,
-        b"cm" => !numbers(6),
-        b"Td" | b"TD" => !in_text || !numbers(2),
-        b"Tm" => !in_text || !numbers(6),
-        b"T*" => !in_text || !operands.is_empty(),
-        b"Tc" | b"Tw" | b"Tz" | b"TL" | b"Ts" | b"Tr" => !numbers(1),
+    let fits = match o {
+        b"Q" => !nothing_saved,
+        b"cm" => numbers(6),
+        b"Td" | b"TD" => in_text && numbers(2),
+        b"Tm" => in_text && numbers(6),
+        b"T*" => in_text && operands.is_empty(),
+        b"Tc" | b"Tw" | b"Tz" | b"TL" | b"Ts" | b"Tr" => numbers(1),
         b"Tf" => {
-            !(operands.len() == 2
+            operands.len() == 2
                 && operands.first().is_some_and(|name| name.as_name().is_some())
-                && operands.get(1).is_some_and(|size| size.as_f64().is_some()))
+                && operands.get(1).is_some_and(|size| size.as_f64().is_some())
         }
-        b"Tj" | b"'" => !in_text || !(operands.len() == 1 && operands.first().is_some_and(|text| text.as_string().is_some())),
+        b"Tj" | b"'" => in_text && operands.len() == 1 && operands.first().is_some_and(|text| text.as_string().is_some()),
         b"\"" => {
-            !in_text
-                || !(operands.len() == 3
-                    && operands.iter().take(2).all(|n| n.as_f64().is_some())
-                    && operands.get(2).is_some_and(|text| text.as_string().is_some()))
+            in_text
+                && operands.len() == 3
+                && operands.iter().take(2).all(|n| n.as_f64().is_some())
+                && operands.get(2).is_some_and(|text| text.as_string().is_some())
         }
-        b"TJ" => !in_text || !(operands.len() == 1 && operands.first().is_some_and(|items| items.as_array().is_some())),
-        _ => false,
-    }
+        b"TJ" => in_text && operands.len() == 1 && operands.first().is_some_and(|items| items.as_array().is_some()),
+        _ => true,
+    };
+    !fits
 }
 
 /// Embed build: whether the redactor cannot place a font's glyphs: a composite font written
