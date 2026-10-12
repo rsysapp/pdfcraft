@@ -158,3 +158,122 @@ fn every_operand_a_brought_stream_holds_is_what_its_operator_takes() {
     );
     assert!(!passes(&base, &forged), "text in a cell the rewrite brings");
 }
+
+#[test]
+fn numbers_and_names_a_brought_stream_holds_are_the_base_s_or_the_redactor_s() {
+    // Follow-up 8 audit (operators, covert channel): numbers carry data too. An operator a
+    // rewrite brings is one the base's content had, operands and all, or one the redactor
+    // writes, with numbers as it writes them.
+    let base = page(&format!("{LINE}\n{KEEP}"), "", &[]);
+    for (case, content) in [
+        ("a line width of many digits", format!("0.83697982877 w\n{BLACK}\n{KEEP}")),
+        ("a dash array of many numbers", format!("[83 69 67 82 69 84 87 79 82 68] 0 d\n{BLACK}\n{KEEP}")),
+        ("a box of many digits", format!("0 g 16.8369798287 144 96 22 re f\n{KEEP}")),
+        ("displacements in a row", format!("{BLACK}\nBT /F1 12 Tf 20 250 Td [(Keep) -83 -69 -67 -82] TJ ET")),
+        ("a long run of path points", format!("{BLACK}\n{KEEP}\n{}", (0..64).map(|i| format!("{i} {i} l ")).collect::<String>())),
+    ] {
+        assert!(!passes(&base, &page(&content, "", &[])), "{case}");
+    }
+}
+
+// ── P6-33: marks, overlays and what a redaction removes ─────────────────────────────────────
+
+fn session_marks(base: &[u8], marks: Vec<crate::Shape>, apply: bool) -> Vec<u8> {
+    let mut session = crate::Session::new().with_clock(|| 1_700_000_000);
+    session.set_keep_document_information(true);
+    let id = session.open("base.pdf", None, std::sync::Arc::new(base.to_vec()), None).unwrap();
+    for shape in marks {
+        let style = crate::Style::default_for(&shape);
+        session
+            .apply(id, crate::Edit::AddAnnotation(crate::NewAnnotation { page: 0, style, shape, contents: String::new(), author: "Sari".into() }))
+            .unwrap();
+    }
+    if apply {
+        session.apply(id, crate::Edit::ApplyRedactions { pages: None }).unwrap();
+    }
+    session.save_bytes(id).unwrap().as_ref().clone()
+}
+
+fn mark(rect: [f64; 4], overlay: &str) -> crate::Shape {
+    crate::Shape::Redact { quads: vec![crate::rect_quad(rect)], overlay: overlay.into(), look: Default::default() }
+}
+
+#[test]
+fn an_update_reports_every_area_its_marks_mark_and_those_with_overlays() {
+    // P6-33: the host checks each redaction area against the marks, and refuses marks that ask
+    // for an overlay (the redactor fills every area black and ignores them).
+    let base = page(&format!("{LINE}\n{KEEP}"), "", &[]);
+    let marked = session_marks(&base, vec![mark([16.0, 144.0, 112.0, 166.0], ""), mark([16.0, 240.0, 60.0, 262.0], "Withheld")], false);
+    let inspection = inspect(&base, &marked, InspectLimits::default()).unwrap();
+    assert!(inspection.base_kept);
+    assert_eq!(inspection.marked_areas, vec![(1, [16.0, 144.0, 112.0, 166.0]), (1, [16.0, 240.0, 60.0, 262.0])], "{inspection:?}");
+    assert_eq!(inspection.marks_with_overlay, 1, "{inspection:?}");
+    // A fill colour other than black, or repetition, is an overlay entry too.
+    let red = "<< /Type /Annot /Subtype /Redact /Rect [16 144 112 166] /IC [1 0 0] >>";
+    let with_red = page(&format!("{LINE}\n{KEEP}"), "", &[]).replace_annotations(red);
+    assert_eq!(inspect(&base, &with_red, InspectLimits::default()).map(|found| found.marks_with_overlay), Ok(1));
+}
+
+trait WithAnnotations {
+    fn replace_annotations(self, annotation: &str) -> Vec<u8>;
+}
+
+impl WithAnnotations for Vec<u8> {
+    /// This one-page file with `annotation` (object 5) on its page, appended as an update.
+    fn replace_annotations(self, annotation: &str) -> Vec<u8> {
+        let page = format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 {HELVETICA} >> >> /Annots [5 0 R] >>");
+        let at = self.windows(9).rposition(|w| w == b"startxref").unwrap();
+        let prev: usize = std::str::from_utf8(&self[at + 9..]).unwrap().split_whitespace().next().unwrap().parse().unwrap();
+        let mut out = self.clone();
+        let mut rows = Vec::new();
+        for (num, body) in [(3u32, page.as_str()), (5, annotation)] {
+            rows.push((num, out.len()));
+            out.extend_from_slice(format!("{num} 0 obj\n{body}\nendobj\n").as_bytes());
+        }
+        let xref = out.len();
+        out.extend_from_slice(b"xref\n0 1\n0000000000 65535 f \n");
+        for (num, offset) in rows {
+            out.extend_from_slice(format!("{num} 1\n{offset:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(format!("trailer\n<< /Size 6 /Root 1 0 R /Prev {prev} >>\nstartxref\n{xref}\n%%EOF\n").as_bytes());
+        out
+    }
+}
+
+#[test]
+fn what_a_redaction_removes_under_a_mark_is_reported_apart() {
+    // P6-33: annotations and form fields the redactor removes under a mark are counted as such,
+    // never as annotations removed or form fields changed.
+    let note = "<< /Type /Annot /Subtype /FreeText /Rect [20 148 100 162] /Contents (SECRETWORD) /DA (/Helv 12 Tf 0 g) >>";
+    let base = page(&format!("{LINE}\n{KEEP}"), "", &[]).replace_annotations(note);
+    let redacted = session_marks(&base, vec![mark([16.0, 144.0, 112.0, 166.0], "")], true);
+    let inspection = inspect(&base, &redacted, InspectLimits::default()).unwrap();
+    assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{inspection:?}");
+    assert_eq!((inspection.annotations.removed, inspection.annotations.removed_by_redaction), (0, 1), "{inspection:?}");
+    // A form field whose widget lies under the mark.
+    let field = page(&format!("{LINE}\n{KEEP}"), "", &[]);
+    let with_field = {
+        let widget = "<< /Type /Annot /Subtype /Widget /FT /Tx /T (name) /V (SECRETWORD) /Rect [20 146 100 162] /P 3 0 R /F 4 >>";
+        let page_body = format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 {HELVETICA} >> >> /Annots [5 0 R] >>");
+        let catalog = "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [5 0 R] >> >>";
+        let at = field.windows(9).rposition(|w| w == b"startxref").unwrap();
+        let prev: usize = std::str::from_utf8(&field[at + 9..]).unwrap().split_whitespace().next().unwrap().parse().unwrap();
+        let mut out = field.clone();
+        let mut rows = Vec::new();
+        for (num, body) in [(1u32, catalog), (3, page_body.as_str()), (5, widget)] {
+            rows.push((num, out.len()));
+            out.extend_from_slice(format!("{num} 0 obj\n{body}\nendobj\n").as_bytes());
+        }
+        let xref = out.len();
+        out.extend_from_slice(b"xref\n0 1\n0000000000 65535 f \n");
+        for (num, offset) in rows {
+            out.extend_from_slice(format!("{num} 1\n{offset:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(format!("trailer\n<< /Size 6 /Root 1 0 R /Prev {prev} >>\nstartxref\n{xref}\n%%EOF\n").as_bytes());
+        out
+    };
+    let redacted = session_marks(&with_field, vec![mark([16.0, 144.0, 112.0, 166.0], "")], true);
+    let inspection = inspect(&with_field, &redacted, InspectLimits::default()).unwrap();
+    assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{inspection:?}");
+    assert_eq!((inspection.form_fields_changed, inspection.form_fields_removed_by_redaction), (0, 1), "{inspection:?}");
+}

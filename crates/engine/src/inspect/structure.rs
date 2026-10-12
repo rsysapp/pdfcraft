@@ -253,6 +253,9 @@ pub(crate) struct Annot {
     /// that destination. It is left out of `digest` and `bare`, and compared on its own: it may
     /// change only by following its page (R6b-32).
     pub link: Option<Destination>,
+    /// Follow-up 8 (P6-33): a `Redact` mark carrying overlay entries (see
+    /// [`super::Inspection::marks_with_overlay`]).
+    pub overlay: bool,
 }
 
 /// What one page is, as far as the comparison goes.
@@ -649,6 +652,9 @@ pub(crate) struct Structure {
     /// Follow-up 8 (R6b-51, C1): the content streams read and their marked content, gathered
     /// for the base of a rewrite (see [`ContentRule::Gather`]).
     pub content_base: ContentBase,
+    /// Follow-up 8 (P6-33): each terminal field's widgets that are on a page: (page index, its
+    /// `/Rect` normalised).
+    pub field_places: BTreeMap<String, Vec<WidgetPlace>>,
 }
 
 /// The fingerprint pages are matched by: content, resources, images and text.
@@ -928,6 +934,9 @@ pub(crate) fn unit_square(m: &Matrix) -> [f64; 4] {
     if [x0, y0, x1, y1].iter().all(|v| v.is_finite()) { [x0, y0, x1, y1] } else { [f64::NAN; 4] }
 }
 
+/// Follow-up 8 (P6-33): where a widget is: its page's index and its `/Rect` normalised.
+pub(crate) type WidgetPlace = (usize, Option<[f64; 4]>);
+
 /// The names the editor gives the standard fonts it adds (its stamps and overlays).
 const EDITOR_FONTS: [&[u8]; 3] = [b"PCHelv", b"PCTimes", b"PCCour"];
 
@@ -1112,6 +1121,8 @@ struct Reader<'d, 'b> {
     content_base: ContentBase,
     /// Whether the content stream last checked shows text (see `operators::Brought`).
     shows_text: bool,
+    /// Each terminal field's widgets (see [`Structure::field_places`]).
+    field_widgets: BTreeMap<String, Vec<ObjRef>>,
 }
 
 /// Follow-up 8 (R6b-51, C1): the base's content streams, by their decoded data's digest, and
@@ -1120,8 +1131,8 @@ struct Reader<'d, 'b> {
 pub(crate) struct ContentBase {
     pub streams: HashSet<Digest>,
     pub marked: HashSet<Digest>,
-    /// The operators written otherwise than the redactor writes them (see `operators::gather`).
-    pub odd: HashSet<Digest>,
+    /// Every operator, with its operands (see `operators::gather`).
+    pub operators: HashSet<Digest>,
     /// The inline images' data.
     pub inline: HashSet<Digest>,
 }
@@ -2847,7 +2858,17 @@ impl<'d, 'b> Reader<'d, 'b> {
             let widget = subtype == b"Widget" && id.is_some_and(|id| widgets.contains(&id));
             let silent_popup = subtype == b"Popup" && !dict.contains(b"AP");
             let areas = if subtype == b"Redact" { self.marked_areas(&dict)? } else { Vec::new() };
-            annots.push(Annot { id, subtype, digest, tracked: !widget && !silent_popup, areas, bare, rect, link });
+            // Follow-up 8 (P6-33): a mark asking for more than the black fill the redactor
+            // gives every area: overlay text, a form for its look, repetition, another colour.
+            let overlay = subtype == b"Redact" && {
+                let black = match dict.get(b"IC").map(|fill| self.resolve(fill)).transpose()?.as_deref() {
+                    None => true,
+                    Some(Object::Array(parts)) => parts.iter().all(|part| part.as_f64() == Some(0.0)) && matches!(parts.len(), 1 | 3),
+                    Some(_) => false,
+                };
+                !black || dict.contains(b"OverlayText") || dict.contains(b"RO") || dict.contains(b"Repeat")
+            };
+            annots.push(Annot { id, subtype, digest, tracked: !widget && !silent_popup, areas, bare, rect, link, overlay });
         }
         Ok((annots, in_array))
     }
@@ -3379,6 +3400,17 @@ impl<'d, 'b> Reader<'d, 'b> {
         let mut path = ancestors.to_vec();
         path.push(own);
         if children.is_empty() {
+            // Follow-up 8 (P6-33): its widgets, where a redaction may have taken it away.
+            let mut own_widgets: Vec<ObjRef> = Vec::new();
+            if dict.name(b"Subtype") == Some(b"Widget") {
+                own_widgets.push(*r);
+            }
+            for kid in self.array_of(dict.get(b"Kids"), "/Kids")? {
+                if let Object::Ref(kid_ref) = kid {
+                    own_widgets.push(kid_ref);
+                }
+            }
+            self.field_widgets.entry(name.clone()).or_default().extend(own_widgets);
             let flat: Vec<u8> = path.iter().flatten().copied().collect();
             let digest = sha256(&[&flat, &widget_digests]);
             let combined = match fields.get(&name) {
@@ -4309,6 +4341,7 @@ impl Known {
             content_rule: ContentRule::None,
             content_base: ContentBase::default(),
             shows_text: false,
+            field_widgets: BTreeMap::new(),
         }
     }
 
@@ -4474,6 +4507,7 @@ pub(crate) fn read(
         content_rule,
         content_base: ContentBase::default(),
         shows_text: false,
+        field_widgets: BTreeMap::new(),
     };
     let Some(root) = doc.root() else { return Err(read_error("the trailer's /Root is not a reference")) };
     let catalog = reader.get(root)?.as_dict().cloned().ok_or_else(|| read_error("the catalog is not a dictionary"))?;
@@ -4523,6 +4557,19 @@ pub(crate) fn read(
         reader.budget.time()?;
         pages.push(reader.page(node, &widgets, &mut annotation_ids, &page_index)?);
     }
+    // Follow-up 8 (P6-33): where each field's widgets are (page and rectangle).
+    let mut widget_places: HashMap<ObjRef, WidgetPlace> = HashMap::new();
+    for (index, page) in pages.iter().enumerate() {
+        for annot in &page.annots {
+            if let Some(id) = annot.id {
+                widget_places.insert(id, (index, annot.rect));
+            }
+        }
+    }
+    let field_places: BTreeMap<String, Vec<WidgetPlace>> = std::mem::take(&mut reader.field_widgets)
+        .into_iter()
+        .map(|(name, widgets)| (name, widgets.iter().filter_map(|widget| widget_places.get(widget).copied()).collect()))
+        .collect();
     let known = Known {
         checked: reader.checked,
         facts: reader.facts,
@@ -4562,6 +4609,7 @@ pub(crate) fn read(
             labels_past_the_end,
             label_values,
             content_base: std::mem::take(&mut reader.content_base),
+            field_places,
         },
         known,
     ))

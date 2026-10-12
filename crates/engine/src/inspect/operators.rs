@@ -120,8 +120,8 @@ fn whole(operator: &[u8], operands: &[Object]) -> Digest {
 }
 
 /// What a base's content stream holds that a rewrite may bring again: its marked-content
-/// operators (see [`marked`]), and the operators written otherwise than the redactor writes
-/// them (an unknown one, odd operands), each whole. Read leniently: the base is read as it is.
+/// operators (see [`marked`]), its inline images' data, and every operator, whole (with its
+/// operands). Read leniently: the base is read as it is.
 pub(crate) fn gather(data: &[u8], base: &mut ContentBase, budget: &mut Budget) -> Result<(), Fail> {
     walk(data, budget, false, &mut |operator, operands| {
         if matches!(operator, b"BMC" | b"BDC" | b"MP" | b"DP") {
@@ -133,9 +133,7 @@ pub(crate) fn gather(data: &[u8], base: &mut ContentBase, budget: &mut Budget) -
             }
             return Ok(());
         }
-        if shape(operator).is_none_or(|shape| !fits(shape, operands)) {
-            base.odd.insert(whole(operator, operands));
-        }
+        base.operators.insert(whole(operator, operands));
         Ok(())
     })
 }
@@ -197,7 +195,25 @@ pub(crate) fn check(data: &[u8], base: &ContentBase, budget: &mut Budget) -> Res
         return Ok(Brought::default());
     }
     let mut brought = Brought::default();
+    // Where in the redactor's clip (see [`CLIP`]) or box (`re`, then `f`) the operators are.
+    let mut clip: Option<usize> = None;
+    let mut boxed = false;
     walk(data, budget, true, &mut |operator, operands| {
+        // Inside the redactor's clip, or after its box's `re`: exactly what comes next there.
+        if let Some(at) = clip {
+            if CLIP.get(at) != Some(&operator) || !shape(operator).is_some_and(|shape| fits(shape, operands)) || !plain_numbers(operands) {
+                return Err(refused("path operators the redactor does not write"));
+            }
+            clip = (at + 1 < CLIP.len()).then_some(at + 1);
+            return Ok(());
+        }
+        if boxed {
+            boxed = false;
+            if operator != b"f" || !operands.is_empty() {
+                return Err(refused("a box the redactor does not write"));
+            }
+            return Ok(());
+        }
         if operator == b"BI" {
             // An inline image: one of the base's, its dictionary holding nothing but how to
             // read it.
@@ -213,20 +229,93 @@ pub(crate) fn check(data: &[u8], base: &ContentBase, budget: &mut Budget) -> Res
             return Ok(());
         }
         brought.shows_text |= matches!(operator, b"Tj" | b"TJ" | b"'" | b"\"");
-        let fitting = shape(operator).filter(|shape| fits(*shape, operands));
-        if fitting.is_none() && !base.odd.contains(&whole(operator, operands)) {
+        // Marked content: as the base had it (its text may only be taken away, compared span by
+        // span elsewhere).
+        if matches!(operator, b"BMC" | b"BDC" | b"MP" | b"DP") {
+            if !shape(operator).is_some_and(|shape| fits(shape, operands)) || !base.marked.contains(&marked(operator, operands)) {
+                return Err(refused(format!("marked content (`{}`) the base's content did not have", String::from_utf8_lossy(operator))));
+            }
+            return Ok(());
+        }
+        // An operator the base's content had, operands and all.
+        if base.operators.contains(&whole(operator, operands)) {
+            return Ok(());
+        }
+        // Else one the redactor writes (follow-up 8 audit, operators): its own kinds, exactly
+        // their operands, numbers as it writes them (to four places), a `TJ` never holding two
+        // numbers in a row (it adds up displacements), `Do` naming its own copies. Nothing
+        // else can carry data in numbers or names.
+        if !REDACTOR_WRITES.contains(&operator) {
             return Err(match shape(operator) {
                 None => refused(format!("the operator `{}`", String::from_utf8_lossy(operator))),
-                Some(_) => refused(format!("operands `{}` does not take", String::from_utf8_lossy(operator))),
+                Some(_) => refused(format!(
+                    "`{}`, which the redactor does not write, with operands the base's content did not have",
+                    String::from_utf8_lossy(operator)
+                )),
             });
         }
-        if matches!(operator, b"BMC" | b"BDC" | b"MP" | b"DP") && !base.marked.contains(&marked(operator, operands)) {
-            return Err(refused(format!("marked content (`{}`) the base's content did not have", String::from_utf8_lossy(operator))));
+        if !shape(operator).is_some_and(|shape| fits(shape, operands)) {
+            return Err(refused(format!("operands `{}` does not take", String::from_utf8_lossy(operator))));
+        }
+        let numbers_plain = plain_numbers(operands);
+        // A path the redactor writes: its clip (a quadrilateral around, one inside, even-odd,
+        // per mark), or a box; never a path point of its own elsewhere.
+        match operator {
+            b"m" => {
+                if !numbers_plain || !shape(operator).is_some_and(|shape| fits(shape, operands)) {
+                    return Err(refused("path operators the redactor does not write"));
+                }
+                clip = Some(1);
+                return Ok(());
+            }
+            b"l" | b"h" | b"W*" => return Err(refused("path operators the redactor does not write")),
+            b"re" => boxed = true,
+            _ => {}
+        }
+        let displacements_apart = match operands.first() {
+            Some(Object::Array(items)) if operator == b"TJ" => !items.windows(2).any(|pair| number(&pair[0]) && number(&pair[1])),
+            _ => true,
+        };
+        let own_copy = operator != b"Do"
+            || operands.first().and_then(Object::as_name).is_some_and(|name| {
+                name.strip_prefix(b"PCRedacted")
+                    .is_some_and(|digits| !digits.is_empty() && digits.len() <= 9 && digits.iter().all(u8::is_ascii_digit))
+            });
+        if !(numbers_plain && displacements_apart && own_copy) {
+            return Err(refused(format!("operands of `{}` the redactor does not write", String::from_utf8_lossy(operator))));
         }
         Ok(())
     })?;
+    if clip.is_some() || boxed {
+        return Err(refused("a path the redactor does not finish"));
+    }
     Ok(brought)
 }
+
+/// The clip the redactor writes around each mark (`pdfcraft_redact`'s `clip_out`).
+const CLIP: [&[u8]; 12] = [b"m", b"l", b"l", b"l", b"h", b"m", b"l", b"l", b"l", b"h", b"W*", b"n"];
+
+/// Whether every number among `operands` (and in their arrays) is written as the redactor
+/// writes numbers: to four places.
+fn plain_numbers(operands: &[Object]) -> bool {
+    let four_places = |value: &Object| match value {
+        Object::Real(real) => {
+            let scaled = real * 10_000.0;
+            real.is_finite() && (scaled - scaled.round()).abs() < 1e-6
+        }
+        _ => true,
+    };
+    operands.iter().all(|operand| match operand {
+        Object::Array(items) => items.iter().all(four_places),
+        other => four_places(other),
+    })
+}
+
+/// The operators the redactor writes of its own (`pdfcraft_redact`): the state around what it
+/// clips (`q`, `Q`), the clip that leaves the marks out (`m`, `l`, `h`, `W*`, `n`), the boxes
+/// (`g`, `rg`, `re`, `f`), what it keeps of a line of text (`TJ`, and `Tw`, `Tc`, `T*` for `'`
+/// and `"`), and its copies of forms and images (`Do`).
+const REDACTOR_WRITES: [&[u8]; 16] = [b"q", b"Q", b"m", b"l", b"h", b"W*", b"n", b"g", b"rg", b"re", b"f", b"TJ", b"Tw", b"Tc", b"T*", b"Do"];
 
 /// What [`walk`] calls with each operator and its operands.
 type Each<'a> = dyn FnMut(&[u8], &[Object]) -> Result<(), Fail> + 'a;

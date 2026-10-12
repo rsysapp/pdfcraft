@@ -505,7 +505,7 @@ fn glyphs_without_text_are_named_by_their_font_and_glyph() {
     assert_eq!(inspection.content.pages_changed_outside_redactions, 1);
     // The last glyph redacted under a box (each glyph is 12 pt wide): removed there, and nothing
     // else changed.
-    let redacted = glyphs_without_text_drawing("5 0 R", "BT /F2 12 Tf 20 150 Td <0024004F0053004B> Tj ET 0 g 67 140 30 30 re f");
+    let redacted = glyphs_without_text_drawing("5 0 R", "BT /F2 12 Tf 20 150 Td [<0024004F0053004B>] TJ ET 0 g 67 140 30 30 re f");
     let inspection = run(&named, &redacted).unwrap();
     assert_eq!(inspection.text, TextChanges { pages_with_text_removed: 1, pages_with_text_added: 0 }, "{inspection:?}");
     assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{inspection:?}");
@@ -812,8 +812,12 @@ fn may_not_terminate(cover: Option<&str>) -> Vec<u8> {
     let content = match cover {
         None => text_line(20.0, 150.0, "Buyer may not terminate"),
         Some(paint) => {
-            let box_ = format!("{paint} {} 146 {} 16 re f 0 g\n", not_at - 0.5, width_of("not") + 1.0);
-            format!("{}{}{box_}", text_line(20.0, 150.0, "Buyer may "), text_line(after_not, 150.0, " terminate"))
+            // As the redactor writes it (follow-up 8: a rewrite is the server's redaction): the
+            // line kept with the removed advance as a displacement, numbers to four places.
+            let _ = after_not;
+            let box_ = format!("{paint} {:.4} 146 {:.4} 16 re f 0 g\n", not_at - 0.5, width_of("not") + 1.0);
+            let advance = width_of("not") * 1000.0 / 12.0;
+            format!("BT /F1 12 Tf 20 150 Td [(Buyer may ) -{advance:.4} ( terminate)] TJ ET\n{box_}")
         }
     };
     pages_pdf(&[page(&content)], &[])
@@ -1145,14 +1149,15 @@ fn a_repeated_character_removed_outside_the_box_is_not_taken_for_the_one_inside(
     // but the glyph that went is the second, outside the box.
     let base = scan_with_hidden_text(&shown_at(20.0, "1001"), "");
     let third = 20.0 + width_of("10");
-    let boxed = format!("0 g {} 146 {} 16 re f\n", third - 0.5, width_of("0") + 1.0);
+    let boxed = format!("0 g {:.4} 146 {:.4} 16 re f\n", third - 0.5, width_of("0") + 1.0);
     let wrong = format!("{}{}", shown_at(20.0, "1"), shown_at(third, "01"));
     let inspection = run(&base, &scan_with_hidden_text(&wrong, &boxed)).unwrap();
     assert_eq!(inspection.text, TextChanges { pages_with_text_removed: 1, pages_with_text_added: 0 });
     assert_eq!(inspection.content.pages_changed_outside_redactions, 1);
     assert!(inspection.redaction_areas.is_empty(), "{:?}", inspection.redaction_areas);
     // The boxed glyph itself left out: a redaction there.
-    let right = format!("{}{}", shown_at(20.0, "10"), shown_at(20.0 + width_of("100"), "1"));
+    // As the redactor writes it: the line kept, the removed glyph's advance a displacement.
+    let right = format!("1 0 0 1 20 150 Tm [(10) -{:.4} (1)] TJ ", width_of("0") * 1000.0 / 12.0);
     let inspection = run(&base, &scan_with_hidden_text(&right, &boxed)).unwrap();
     assert_eq!(inspection.content.pages_changed_outside_redactions, 0);
     assert_eq!(inspection.redaction_areas.len(), 1);

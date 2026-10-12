@@ -241,7 +241,7 @@ fn a_changed_page_pairs_with_the_base_page_it_shares_most_with() {
 fn numbered(redacted: usize) -> impl Fn(usize) -> String {
     move |i| {
         if i == redacted {
-            "BT /F1 24 Tf 20 150 Td (Pag) Tj ET\n0 g 63 140 37 35 re f".to_string()
+            "BT /F1 24 Tf 20 150 Td [(Pag)] TJ ET\n0 g 63 140 37 35 re f".to_string()
         } else {
             format!("BT /F1 24 Tf 20 150 Td (Page {}) Tj ET", i + 1)
         }
