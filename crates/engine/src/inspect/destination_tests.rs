@@ -926,3 +926,34 @@ fn labels_readers_could_read_differently_are_compared_whole() {
         refused(run(&base, &relabelled(&base, labels, Some(&[14, 10, 11, 12, 13]))));
     }
 }
+
+#[test]
+fn a_page_number_with_any_view_where_a_destination_stands_is_refused_once_pages_move() {
+    // Re-review M4: PDFium takes a number first in a destination for a page index whatever
+    // follows; `[2]` or `[2 /Unknown]` compared by digest went unnoticed after a delete.
+    for target in ["[2]", "[2 /Unknown]", "[2.0 /Unknown 1]"] {
+        for (case, catalog, extra) in [
+            ("an opening action", format!("/OpenAction {target}"), None),
+            ("a chained action", format!("/OpenAction << /S /URI /URI (https://example.com/terms) /Next << /S /GoTo /D {target} >> >>"), None),
+            ("a name with other entries", "/Dests 44 0 R".to_string(), Some((44, format!("<< /p3 << /D {target} /Note (a third page) >> >>")))),
+        ] {
+            let extra: Vec<(u32, String)> = extra.into_iter().collect();
+            let base = pages(4, &catalog, false, |_| String::new(), &extra);
+            assert!(run(&base, &base).is_ok(), "{case} {target}");
+            let result = run(&base, &session(&base, vec![Edit::DeletePages { pages: vec![0] }]));
+            assert!(matches!(&result, Err(InspectError::Edited(message)) if message.contains("by number")), "{case} {target}: {result:?}");
+        }
+    }
+    // A link's dashed border (`/BS << /D [3 2] >>`) is no destination.
+    let base = pages(
+        4,
+        "",
+        false,
+        |i| if i == 1 { "/Annots [43 0 R]".to_string() } else { String::new() },
+        &[(
+            43,
+            "<< /Type /Annot /Subtype /Link /Rect [20 20 120 40] /BS << /W 1 /D [3 2] >> /A << /S /URI /URI (https://example.com) >> >>".to_string(),
+        )],
+    );
+    assert!(run(&base, &session(&base, vec![Edit::DeletePages { pages: vec![0] }])).is_ok());
+}

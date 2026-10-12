@@ -371,8 +371,9 @@ pub struct StructureRemovals {
     /// parent's), and text added, changed or moved to another marked-content span (the spans
     /// taken in drawing order) counts the page in `content.pages_changed_outside_redactions`.
     pub tagged_text: u32,
-    /// The document's XMP metadata packet (the catalog's `/Metadata`) taken away: 0 or 1. A
-    /// page's or form's own XMP packet is not compared (no viewer shows it).
+    /// XMP metadata packets taken away: the document's (the catalog's `/Metadata`), and each
+    /// page's present in both files (R6b-51, M1). A form's or image's own XMP packet is not
+    /// compared (no viewer shows it).
     pub metadata: u32,
     /// Pages present in both files whose actions (`/AA`: what runs when the page opens or
     /// closes) were taken away.
@@ -380,6 +381,11 @@ pub struct StructureRemovals {
     /// Pages present in both files whose thumbnail image (`/Thumb`, which shows the page as it
     /// was) was taken away.
     pub thumbnails: u32,
+    /// Pages present in both files that lost another entry no viewer draws (R6b-51, M1): an
+    /// application's private data (`/PieceInfo`, `/LastModified`), the tags' link
+    /// (`/StructParents`), or navigation and presentation entries (`/ID`, `/PZ`, `/Tabs`, `/B`,
+    /// `/Dur`, `/Trans`, `/PresSteps`).
+    pub page_entries: u32,
 }
 
 /// Why a comparison has no answer. The host refuses the edited file on every one of them.
@@ -470,6 +476,10 @@ pub(crate) struct Limits {
     /// the base pages' features, candidate pairs, page renders reduced to blocks), estimated
     /// from above, in bytes.
     pub pairing_bytes: usize,
+    /// Follow-up 8 (R6b-51, I3): the small units of work (an object listed, a token scanned, an
+    /// entry compared: every [`Budget::tick`]) both files may take together. This bounds every
+    /// loop on every target, wasm32 included, where no clock is read.
+    pub steps: u64,
 }
 
 impl Default for Limits {
@@ -493,6 +503,7 @@ impl Default for Limits {
             compared: 1 << 30,
             pairing: 1 << 25,
             pairing_bytes: 64 << 20,
+            steps: 1 << 28,
         }
     }
 }
@@ -541,6 +552,8 @@ pub(crate) struct Budget {
     /// The pairing's working memory held now (see [`Limits::pairing_bytes`]).
     pairing_held: usize,
     ticks: u32,
+    /// Follow-up 8 (R6b-51, I3): see [`Limits::steps`].
+    steps_left: u64,
     pub limits: Limits,
 }
 
@@ -561,6 +574,7 @@ impl Budget {
             pairing_left: limits.pairing,
             pairing_held: 0,
             ticks: 0,
+            steps_left: limits.steps,
             limits,
         }
     }
@@ -574,8 +588,10 @@ impl Budget {
         Ok(())
     }
 
-    /// A small unit of work: the deadline is checked every 1,024 of them.
+    /// A small unit of work: counted against [`Limits::steps`] on every target, and the deadline
+    /// is checked every 1,024 of them.
     pub fn tick(&mut self) -> Result<(), Fail> {
+        self.steps_left = self.steps_left.checked_sub(1).ok_or(Fail::TooComplex)?;
         self.ticks = self.ticks.wrapping_add(1);
         if self.ticks.is_multiple_of(1_024) { self.time() } else { Ok(()) }
     }
@@ -701,8 +717,10 @@ fn compare(base: &[u8], edited: &[u8], limits: Limits) -> Result<Inspection, Ins
     if before.structure.name_tree_keys != after.structure.name_tree_keys {
         return Err(InspectError::Edited("an entry of the named destinations' tree changed, which this comparison does not report".into()));
     }
-    // Follow-up 8 (R6b-51, M5): page tree nodes' own entries, which no viewer draws.
-    if before.structure.page_tree_entries != after.structure.page_tree_entries {
+    // Follow-up 8 (R6b-51, M5): page tree nodes' own entries, which no viewer draws, and
+    // attributes no page takes, are compared nowhere else: each must be one the base's tree
+    // holds (taken away is allowed: page operations move inherited attributes to the pages).
+    if !sorted_subset(&after.structure.page_tree_entries.untaken, &before.structure.page_tree_entries.all) {
         return Err(InspectError::Edited("an entry of a page tree node changed, which this comparison does not report".into()));
     }
     // The structure tree: an appended update leaves it as it was; a rewrite may only take text
@@ -784,6 +802,12 @@ fn compare(base: &[u8], edited: &[u8], limits: Limits) -> Result<Inspection, Ins
         return Err(InspectError::Edited(message));
     }
     Ok(inspection)
+}
+
+/// Whether every item of `part` (sorted) is in `whole` (sorted), as many times as it is in `part`.
+fn sorted_subset<T: Ord>(part: &[T], whole: &[T]) -> bool {
+    let mut rest = whole.iter();
+    part.iter().all(|item| rest.any(|candidate| candidate == item))
 }
 
 /// Whether each page present in both files kept its label (see [`PageLabelChanges`]), and how
@@ -1106,10 +1130,20 @@ fn check_rewrite_reachable(doc: &Document, sections: &[structure::Section], know
     for num in doc.object_numbers() {
         budget.tick()?;
         if let Some(pdfcraft_cos::XrefEntry::InFile { offset, .. }) = doc.xref_entry(num) {
+            // Follow-up 8 (R6b-51, I3): each listed object is charged, and a row naming another
+            // object's place is refused before anything is loaded (`pdfcraft_cos` would search
+            // the whole file for the number, once per such row).
+            budget.object()?;
             let offset = usize::try_from(offset).map_err(|_| Fail::Read(format!("object {num} lies past the file")))?;
+            if layout::object_header(doc.bytes().as_slice(), offset) != Some(num) {
+                return Err(Fail::Read(format!("the rewrite lists object {num} where no object {num} starts")));
+            }
             let found = doc.try_get(num).map_err(|_| Fail::Read(format!("the rewrite holds object {num}, which cannot be read")))?;
             let stream_length = match &*found {
-                pdfcraft_cos::Object::Stream(stream) => Some(stream.raw.len()),
+                pdfcraft_cos::Object::Stream(stream) => {
+                    budget.hashed(stream.raw.len())?;
+                    Some(stream.raw.len())
+                }
                 _ => None,
             };
             listed.push(layout::ListedObject { offset, stream_length });
@@ -1853,6 +1887,8 @@ fn compare_pages(
                         taken.tagged_text = taken.tagged_text.saturating_add(count(removed.text));
                         taken.actions = taken.actions.saturating_add(u32::from(removed.actions));
                         taken.thumbnails = taken.thumbnails.saturating_add(u32::from(removed.thumbnail));
+                        taken.metadata = taken.metadata.saturating_add(u32::from(removed.metadata));
+                        taken.page_entries = taken.page_entries.saturating_add(u32::from(removed.entries));
                     }
                     None => outside = true,
                 }

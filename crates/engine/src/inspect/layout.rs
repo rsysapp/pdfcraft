@@ -74,6 +74,30 @@ fn skip_literal(data: &[u8], pos: usize) -> Result<usize, Fail> {
     Err(refused(format!("a string at byte {pos} that does not end")))
 }
 
+/// Follow-up 8 (R6b-51, I3): the number of the object whose header (`N G obj`, after
+/// whitespace) starts at `offset`, read without loading anything: `None` when none does.
+pub(crate) fn object_header(data: &[u8], offset: usize) -> Option<u32> {
+    let mut pos = offset;
+    let mut number = None;
+    for expected in [None, None, Some(&b"obj"[..])] {
+        pos = data.get(pos..).map_or(pos, |rest| pos.saturating_add(rest.iter().take_while(|byte| whitespace(**byte)).count()));
+        let word = token(data, pos);
+        let fits = match expected {
+            None => !word.is_empty() && word.len() <= 10 && word.iter().all(u8::is_ascii_digit),
+            Some(keyword) => word == keyword,
+        };
+        if !fits {
+            return None;
+        }
+        if number.is_none() {
+            number = std::str::from_utf8(word).ok().and_then(|digits| digits.parse::<u32>().ok());
+            number?;
+        }
+        pos = pos.saturating_add(word.len());
+    }
+    number
+}
+
 /// The end (past `endobj`) of the object whose header starts at `listed.offset`.
 fn object_end(data: &[u8], listed: &ListedObject, budget: &mut Budget) -> Result<usize, Fail> {
     let start = listed.offset;

@@ -1018,7 +1018,7 @@ fn every_removal_a_rewrite_makes_is_reported() {
     const ELEMENT: &str = "/Alt (A signature)";
     let base = removable(false, CATALOG, PAGE, SPAN, ELEMENT);
     assert_eq!(inspect(&base, &base, InspectLimits::default()).unwrap().structure_removed, StructureRemovals::default());
-    let removals = |tagged_text, metadata, actions, thumbnails| StructureRemovals { tagged_text, metadata, actions, thumbnails };
+    let removals = |tagged_text, metadata, actions, thumbnails| StructureRemovals { tagged_text, metadata, actions, thumbnails, page_entries: 0 };
     // (case, catalog, page, span, element, what is reported)
     for (case, catalog, page, span, element, expected) in [
         ("nothing taken away", CATALOG, PAGE, SPAN, ELEMENT, removals(0, 0, 0, 0)),
@@ -2095,11 +2095,12 @@ fn a_page_tree_node_s_own_entries_are_compared() {
         ("added in an update", update),
         ("added in a rewrite", two_under_one("2 0 R", "/Extra (kept) /Secret (SECRET X)")),
         ("changed in a rewrite", two_under_one("2 0 R", "/Extra (SECRET X)")),
-        ("removed in a rewrite", two_under_one("2 0 R", "")),
     ] {
         let message = refused_against(&base, &edited);
         assert!(message.contains("page tree node"), "{case}: {message}");
     }
+    // Taken away, it holds nothing.
+    assert!(inspect(&base, &two_under_one("2 0 R", ""), InspectLimits::default()).is_ok());
 }
 
 /// Two tagged pages: element 7 (`/Pg` `pg7`) holds page 1's "Alpha" (MCID 0), element 8 page
@@ -2139,4 +2140,143 @@ fn marked_content_stays_on_its_page() {
     let moved = session.save_bytes(id).unwrap();
     let inspection = inspect(&base, &moved, InspectLimits::default()).unwrap();
     assert_eq!(inspection.pages.moved, 1, "{inspection:?}");
+}
+
+#[test]
+fn a_node_s_inherited_attributes_no_page_takes_are_compared_too() {
+    // Follow-up 8 audit: node entries left out as "inherited" were compared only through the
+    // pages; where every page has its own, an update could write anything under them, unseen.
+    let base = two_under_one("2 0 R", "");
+    let own =
+        |node_extra: &str| format!("<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 200 300] /Rotate 0 {RESOURCES} {node_extra} >>");
+    // Page 4 has its own box and rotation; page 3 inherits them: give page 3 its own too, so no
+    // page takes the node's, then hide text in the node's box.
+    let pages_own = b"<< /Type /Page /Parent 2 0 R /Contents 5 0 R /MediaBox [0 0 200 300] /Rotate 0 >>".as_slice();
+    let base = update_section(&base, &[(3, pages_own)], Some(last_section(&base)), "");
+    assert!(inspect(&base, &base, InspectLimits::default()).is_ok());
+    let hidden = own("").replace("/MediaBox [0 0 200 300]", "/MediaBox [(SECRET X)]");
+    let edited = update_section(&base, &[(2, hidden.as_bytes())], Some(last_section(&base)), "");
+    let message = refused_against(&base, &edited);
+    assert!(message.contains("page tree node"), "{message}");
+}
+
+/// Two tagged pages as [`tagged_pages`], with a figure (element 5, `/Pg` `pg`) that has no
+/// marked content of its own, only its alternate text.
+fn tagged_figure(pg: &str) -> Vec<u8> {
+    let base = tagged_pages("3 0 R");
+    let figure = format!("<< /S /Figure /P 6 0 R /Pg {pg} /Alt (A chart of Alpha) >>");
+    let root = b"<< /Type /StructTreeRoot /K [7 0 R 8 0 R 5 0 R] /ParentTree << /Nums [0 [7 0 R] 1 [8 0 R]] >> >>".as_slice();
+    update_section(&base, &[(6, root), (5, figure.as_bytes())], Some(last_section(&base)), "")
+}
+
+#[test]
+fn an_element_s_page_is_compared_even_without_marked_content() {
+    // Follow-up 8 audit: only marked-content kids carried their page; an element's own /Pg
+    // (a figure with alternate text, an object reference's) could name another page.
+    let base = tagged_figure("3 0 R");
+    assert!(inspect(&base, &base, InspectLimits::default()).is_ok());
+    let figure = b"<< /S /Figure /P 6 0 R /Pg 4 0 R /Alt (A chart of Alpha) >>".as_slice();
+    let edited = update_section(&base, &[(5, figure)], Some(last_section(&base)), "");
+    let message = refused_against(&base, &edited);
+    assert!(message.contains("/Pg"), "{message}");
+}
+
+#[test]
+fn every_page_entry_a_rewrite_takes_away_is_reported() {
+    // Re-review M1: a page's XMP packet, private data and navigation entries went silently.
+    let xmp = stream("/Type /Metadata /Subtype /XML", b"<x:xmpmeta>SECRET X</x:xmpmeta>");
+    let base = laid_out("/Metadata 5 0 R /PieceInfo << /App << /Private (SECRET X) >> >> /Tabs /S", "", X, &xmp);
+    let inspection = inspect(&base, &laid_out("", "", X_BOX, b""), InspectLimits::default()).unwrap();
+    assert_eq!(inspection.content.pages_changed_outside_redactions, 0, "{inspection:?}");
+    assert_eq!((inspection.structure_removed.metadata, inspection.structure_removed.page_entries), (1, 1), "{inspection:?}");
+    let kept = laid_out("/Metadata 5 0 R /PieceInfo << /App << /Private (SECRET X) >> >> /Tabs /S", "", X_BOX, &xmp);
+    let inspection = inspect(&base, &kept, InspectLimits::default()).unwrap();
+    assert_eq!((inspection.structure_removed.metadata, inspection.structure_removed.page_entries), (0, 0), "{inspection:?}");
+}
+
+#[test]
+fn rows_naming_another_object_s_place_are_refused_before_anything_is_loaded() {
+    // Re-review I3: rows listing small objects at a large stream's offset made the reader copy
+    // that stream and search the whole file once per row: 8,000 rows over 2 MB took 57 s.
+    let base = laid_out("", "", X, b"");
+    let mut b = Builder::new();
+    head(&mut b);
+    b.object(3, format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R {RESOURCES} >>").as_bytes());
+    b.object(4, &stream("", &[text("Alpha"), b"\n".to_vec(), X_BOX.as_bytes().to_vec()].concat()));
+    let big = b.object(5, &stream("", &vec![b'A'; 2_000_000]));
+    for num in 6..8_006u32 {
+        b.object(num, b"null");
+    }
+    let mut rows = b.offsets.clone();
+    for num in 6..8_006u32 {
+        rows.insert(num, big);
+    }
+    let edited = b.finish(8_006, &rows, "");
+    let started = std::time::Instant::now();
+    let message = refused_against(&base, &edited);
+    assert!(message.contains("where no object 6 starts"), "{message}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+    // Each listed object is charged: past the objects bound, too complex.
+    let many = {
+        let mut b = Builder::new();
+        head(&mut b);
+        b.object(3, format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R {RESOURCES} >>").as_bytes());
+        b.object(4, &stream("", &[text("Alpha"), b"\n".to_vec(), X_BOX.as_bytes().to_vec()].concat()));
+        for num in 5..2_005u32 {
+            b.object(num, b"null");
+        }
+        let rows = b.offsets.clone();
+        b.finish(2_005, &rows, "")
+    };
+    assert_eq!(inspect_with(&base, &many, Limits { objects: 1_000, ..Limits::default() }), Err(InspectError::TooComplex));
+}
+
+#[test]
+fn the_work_bound_holds_without_a_clock() {
+    // Re-review I3: the deadline was read every 1,024 ticks and never on wasm32. Every tick is
+    // now counted on every target.
+    let base = laid_out("", "", X, b"");
+    let edited = laid_out("", "", X_BOX, b"");
+    assert!(inspect_with(&base, &edited, Limits { deadline: std::time::Duration::from_secs(3_600), ..Limits::default() }).is_ok());
+    let starved = Limits { deadline: std::time::Duration::from_secs(3_600), steps: 200, ..Limits::default() };
+    assert_eq!(inspect_with(&base, &edited, starved), Err(InspectError::TooComplex));
+}
+
+#[test]
+fn an_unreadable_object_in_an_object_stream_the_walk_reaches_is_refused() {
+    // Re-review M2: the walk's refusal of an object it cannot read was pinned only for objects
+    // in the file, which the listing refuses first; in an object stream only the walk reads it.
+    let base = hiding(false, &Hiding::default());
+    let edited = {
+        let mut b = Builder::new();
+        b.object(1, b"<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 5 0 R /MarkInfo << /Marked true >> >>");
+        b.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 300] >>");
+        b.object(3, format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R {RESOURCES} /StructParents 0 >>").as_bytes());
+        let content = format!("/P << /MCID 0 >> BDC\n{}\nEMC\n0 g 146 14 16 18 re f", String::from_utf8(text("Alpha")).unwrap());
+        b.object(4, &stream("", content.as_bytes()));
+        b.object(5, b"<< /Type /StructTreeRoot /K 6 0 R /ParentTree << /Nums [0 [6 0 R]] >> >>");
+        b.object(6, b"<< /S /P /P 5 0 R /Pg 3 0 R /K 0 /Obj 7 0 R >>");
+        // Object 7, in object stream 8, at an offset past its data.
+        b.object(8, &stream("/Type /ObjStm /N 1 /First 6", b"7 400 << /Hidden (SECRET X) >>"));
+        let at = b.out.len();
+        let row = |kind: u8, field: usize, extra: u16| {
+            let mut out = vec![kind];
+            out.extend_from_slice(&u32::try_from(field).unwrap().to_be_bytes());
+            out.extend_from_slice(&extra.to_be_bytes());
+            out
+        };
+        let mut entries = row(0, 0, 65535);
+        for num in 1..9u32 {
+            entries.extend(match num {
+                7 => row(2, 8, 0),
+                _ => row(1, b.offsets[&num], 0),
+            });
+        }
+        entries.extend(row(1, at, 0));
+        b.object(9, &stream("/Type /XRef /Size 10 /W [1 4 2] /Root 1 0 R", &entries));
+        b.out.extend_from_slice(format!("startxref\n{at}\n%%EOF\n").as_bytes());
+        b.out
+    };
+    let message = refused_against(&base, &edited);
+    assert!(message.contains("object 7, which cannot be read"), "{message}");
 }

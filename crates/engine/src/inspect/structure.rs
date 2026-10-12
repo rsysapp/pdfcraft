@@ -618,10 +618,9 @@ pub(crate) struct Structure {
     pub page_labels: PageLabels,
     /// The catalog's `/PageLabels` entry's digest (`None`: there is none).
     pub page_labels_digest: Option<Digest>,
-    /// Follow-up 8 (R6b-51, M5): the page tree nodes' entries but their kids, count, parent,
-    /// type and the attributes pages inherit (compared through the pages), by key and value,
-    /// sorted: no viewer draws them and no fact reports them, so they may not change.
-    pub page_tree_entries: Vec<(Vec<u8>, Digest)>,
+    /// Follow-up 8 (R6b-51, M5): the page tree nodes' entries but their kids, count, parent and
+    /// type (see [`NodeEntries`]). Those no page takes are compared nowhere else.
+    pub page_tree_entries: NodeEntries,
 }
 
 /// The fingerprint pages are matched by: content, resources, images and text.
@@ -683,6 +682,11 @@ pub(crate) struct StructLinks {
     /// Each object reference (`/Type /OBJR`): the element it belongs to and the object it
     /// names (an annotation), in the tree's order (follow-up 7 audit, item 10).
     pub objects: Vec<(u32, ObjRef)>,
+    /// Follow-up 8 (R6b-51, I2): each element's page (its `/Pg`, else the nearest ancestor's),
+    /// in the tree's order, and each object reference's (its own `/Pg`, else its element's),
+    /// in the order of [`StructLinks::objects`].
+    pub element_pages: Vec<Option<ObjRef>>,
+    pub object_pages: Vec<Option<ObjRef>>,
 }
 
 /// One marked-content kid of the structure tree (R6b-47).
@@ -711,8 +715,8 @@ pub(crate) fn tags_kept(base: &StructFacts, edited: &StructFacts) -> Option<usiz
     kept.then(|| base.text.len().saturating_sub(edited.text.len()))
 }
 
-/// Follow-up 8 (R6b-51, I2): whether every marked-content kid of the edited structure tree is on
-/// the page its base kid was on, followed through the pages' pairing (`pairs`: base page, edited
+/// Follow-up 8 (R6b-51, I2): whether every element, object reference and marked-content kid of
+/// the edited structure tree is on the page its base counterpart was on (each kid's below), followed through the pages' pairing (`pairs`: base page, edited
 /// page), and in the same form (the same object in an appended update, which keeps numbers; a
 /// form or none alike in a rewrite). A kid's page is its own `/Pg`, else its element's or the
 /// nearest ancestor's: moved, the tree gives assistive technology and copying another page's
@@ -740,6 +744,30 @@ pub(crate) fn marked_pages_followed(
         let form = if base_kept { base.form == edited.form } else { base.form.is_some() == edited.form.is_some() };
         page && form
     };
+    // Every element, by its place (the shapes are the same in both files), and every object
+    // reference, aligned as the tags are.
+    let on_page = |base: Option<ObjRef>, edited: Option<ObjRef>| {
+        follows(&MarkedKid { element: 0, page: base, form: None, mcid: 0 }, &MarkedKid { element: 0, page: edited, form: None, mcid: 0 })
+    };
+    let (base_links, edited_links) = (&before.structure_links, &after.structure_links);
+    if base_links.element_pages.len() != edited_links.element_pages.len() {
+        return Ok(false);
+    }
+    for (base, edited) in base_links.element_pages.iter().zip(&edited_links.element_pages) {
+        budget.tick()?;
+        if !on_page(*base, *edited) {
+            return Ok(false);
+        }
+    }
+    let base_objects: Vec<((u32, Digest), Option<ObjRef>)> =
+        before.structure_tree.objects.iter().copied().zip(base_links.object_pages.iter().copied()).collect();
+    let mut rest = base_objects.iter();
+    for (object, page) in after.structure_tree.objects.iter().zip(&edited_links.object_pages) {
+        budget.tick()?;
+        if !rest.by_ref().any(|(candidate, base_page)| candidate == object && on_page(*base_page, *page)) {
+            return Ok(false);
+        }
+    }
     let mut rest = before.structure_links.kids.iter();
     for kid in &after.structure_links.kids {
         budget.tick()?;
@@ -863,8 +891,17 @@ pub(crate) fn unit_square(m: &Matrix) -> [f64; 4] {
     if [x0, y0, x1, y1].iter().all(|v| v.is_finite()) { [x0, y0, x1, y1] } else { [f64::NAN; 4] }
 }
 
-/// Follow-up 8 (R6b-51, M5): page tree nodes' own entries, by key and value digest.
-type NodeEntries = Vec<(Vec<u8>, Digest)>;
+/// The attributes a page inherits from the page tree (ISO 32000-2 §7.7.3.4).
+const INHERITED: [&[u8]; 4] = [b"Resources", b"MediaBox", b"CropBox", b"Rotate"];
+
+/// Follow-up 8 (R6b-51, M5): page tree nodes' entries, each by its key and value digest,
+/// sorted: those no page takes from its node (its own entries, and inheritable attributes no
+/// page under the node takes), and all of them.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct NodeEntries {
+    pub untaken: Vec<(Vec<u8>, Digest)>,
+    pub all: Vec<(Vec<u8>, Digest)>,
+}
 
 /// A leaf of the page tree with what it inherits.
 struct PageNode {
@@ -1458,6 +1495,36 @@ impl<'d, 'b> Reader<'d, 'b> {
         };
         let mut entries: Vec<(&Vec<u8>, &Object)> = d.iter().filter(|(key, value)| !back_reference(key, value)).collect();
         entries.sort_by(|a, b| a.0.cmp(b.0));
+        // Follow-up 8 (R6b-51, M4): PDFium takes a number first in a destination for a page
+        // index whatever view follows (`[2]`, `[2 /Unknown]`): any such array where a
+        // destination stands (a go-to action's or a destination dictionary's `/D`, any `/Dest`,
+        // the opening action) gives its page by number.
+        if !self.agreeing {
+            // A border style's `/D` is a dash array (`[3 2]`), not a destination.
+            let border = d.contains(b"W") || matches!(d.name(b"Type"), Some(b"Border" | b"ExtGState"));
+            let go_to = d.name(b"S") == Some(b"GoTo") || (!d.contains(b"S") && !border);
+            for (key, value) in &entries {
+                let destination = match key.as_slice() {
+                    b"D" => go_to,
+                    b"Dest" | b"OpenAction" => true,
+                    _ => false,
+                };
+                if !destination {
+                    continue;
+                }
+                let resolved = match value {
+                    Object::Ref(r) => Some(self.get(*r)?),
+                    _ => None,
+                };
+                let items = match (value, resolved.as_deref()) {
+                    (Object::Array(items), _) | (_, Some(Object::Array(items))) => Some(items),
+                    _ => None,
+                };
+                if items.is_some_and(|items| matches!(items.first(), Some(Object::Int(_) | Object::Real(_)))) {
+                    self.numbered = true;
+                }
+            }
+        }
         out.push(b'<');
         out.extend_from_slice(&(entries.len() as u64).to_le_bytes());
         let mut lowest = usize::MAX;
@@ -1483,27 +1550,34 @@ impl<'d, 'b> Reader<'d, 'b> {
             return Err(read_error("the page tree's root names a /Parent, through which viewers inherit attributes"));
         }
         let mut pages = Vec::new();
-        let mut entries = Vec::new();
+        let mut entries = NodeEntries::default();
         let mut nodes = BTreeSet::from([tree]);
         let mut seen = BTreeSet::new();
         let inherited = PageNode { obj: tree, dict: Dict::new(), resources: Vec::new(), media: None, crop: None, rotate: None };
         self.walk(tree, &dict, &inherited, 0, &mut nodes, &mut seen, &mut pages, &mut entries)?;
-        entries.sort_unstable();
+        entries.untaken.sort_unstable();
+        entries.all.sort_unstable();
         Ok((pages, entries))
     }
 
     /// Follow-up 8 (R6b-51, M5): a page tree node's entries other than its kids, count, parent,
-    /// type and the attributes its pages inherit (each node's, by its key and value), which no
-    /// viewer draws but any tool reading the file finds.
-    fn node_entries(&mut self, node: &Dict, entries: &mut Vec<(Vec<u8>, Digest)>) -> Result<(), Fail> {
-        const NODE_KEYS: [&[u8]; 8] = [b"Type", b"Kids", b"Count", b"Parent", b"Resources", b"MediaBox", b"CropBox", b"Rotate"];
+    /// type and the attributes its pages take from it (each by its key and value): what no
+    /// viewer draws but any tool reading the file finds. An attribute pages inherit is compared
+    /// through the pages that take it; one no page takes (every page under the node has its
+    /// own, or a nearer node gives it) is compared here (follow-up 8 audit). `taken`: the
+    /// inheritable attributes some page under the node takes from it or above.
+    fn node_entries(&mut self, node: &Dict, taken: &[&[u8]], entries: &mut NodeEntries) -> Result<(), Fail> {
+        const NODE_KEYS: [&[u8]; 4] = [b"Type", b"Kids", b"Count", b"Parent"];
         for (key, value) in node.iter() {
             self.budget.tick()?;
             if NODE_KEYS.contains(&key.as_slice()) {
                 continue;
             }
             let digest = self.digest(value)?;
-            entries.push((key.clone(), digest));
+            if !taken.contains(&key.as_slice()) {
+                entries.untaken.push((key.clone(), digest));
+            }
+            entries.all.push((key.clone(), digest));
         }
         Ok(())
     }
@@ -1532,14 +1606,24 @@ impl<'d, 'b> Reader<'d, 'b> {
         nodes: &mut BTreeSet<ObjRef>,
         seen: &mut BTreeSet<ObjRef>,
         pages: &mut Vec<PageNode>,
-        entries: &mut Vec<(Vec<u8>, Digest)>,
-    ) -> Result<(), Fail> {
+        entries: &mut NodeEntries,
+    ) -> Result<Vec<&'static [u8]>, Fail> {
         if depth > MAX_TREE_DEPTH {
             return Err(read_error("the page tree is too deep"));
         }
         let before = pages.len();
         let here = with_inherited(node, inherited);
-        self.node_entries(node, entries)?;
+        // The inheritable attributes some page under this node takes from it or above: a page's
+        // boxes and rotation where it has none of its own, its resources always (a page draws
+        // with its ancestors' resources too, see [`PageFacts::resources`]).
+        let mut taking: Vec<&'static [u8]> = Vec::new();
+        let mut take = |keys: Vec<&'static [u8]>| {
+            for key in keys {
+                if !taking.contains(&key) {
+                    taking.push(key);
+                }
+            }
+        };
         let Some(kids) = node.get(b"Kids") else { return Err(read_error("a page tree node has no /Kids")) };
         let kids = self.array_of(Some(kids), "/Kids")?;
         for kid in kids {
@@ -1563,8 +1647,9 @@ impl<'d, 'b> Reader<'d, 'b> {
                 if !nodes.insert(r) {
                     return Err(read_error("the page tree loops"));
                 }
-                self.walk(r, &dict, &here, depth.saturating_add(1), nodes, seen, pages, entries)?;
+                take(self.walk(r, &dict, &here, depth.saturating_add(1), nodes, seen, pages, entries)?);
             } else {
+                take(INHERITED.iter().copied().filter(|key| *key == b"Resources".as_slice() || !dict.contains(key)).collect());
                 if !seen.insert(r) {
                     return Err(read_error(format!("page {r} appears twice in the page tree")));
                 }
@@ -1577,7 +1662,10 @@ impl<'d, 'b> Reader<'d, 'b> {
                 pages.push(page);
             }
         }
-        self.check_count(node, pages.len().saturating_sub(before))
+        self.check_count(node, pages.len().saturating_sub(before))?;
+        self.node_entries(node, &taking, entries)?;
+        // What this node's ancestors give its pages: what they take that it does not give.
+        Ok(taking.into_iter().filter(|key| *key == b"Resources".as_slice() || !node.contains(key)).collect())
     }
 
     // ── content ─────────────────────────────────────────────────────────────────────────────
@@ -2608,6 +2696,10 @@ impl<'d, 'b> Reader<'d, 'b> {
                     let (digest, _) = self.digest_ref(*target)?;
                     facts.objects.push((owner, digest));
                     links.objects.push((owner, *target));
+                    links.object_pages.push(match reference.get(b"Pg") {
+                        Some(Object::Ref(own)) => Some(*own),
+                        _ => page,
+                    });
                     parts.push(b'o');
                     parts.extend_from_slice(&owner.to_le_bytes());
                     parts.extend_from_slice(&digest);
@@ -2623,6 +2715,7 @@ impl<'d, 'b> Reader<'d, 'b> {
                         Some(Object::Ref(own)) => Some(*own),
                         _ => page,
                     };
+                    links.element_pages.push(page);
                     // Its text, whatever the value is (a reader may show a value that is not a
                     // string; a value of another kind is still compared).
                     for (key_index, key) in (0u8..).zip(STRUCT_TEXT_KEYS) {
@@ -4137,6 +4230,13 @@ pub(crate) fn read(
         if CATALOG_REPORTED.contains(&key.as_slice()) {
             continue;
         }
+        // Follow-up 8 (R6b-51, M4): the opening action given as a destination, whatever view.
+        if key.as_slice() == b"OpenAction"
+            && let Object::Array(items) = &*reader.resolve(value)?
+            && matches!(items.first(), Some(Object::Int(_) | Object::Real(_)))
+        {
+            reader.numbered = true;
+        }
         // `/Names` but for its `/Dests` tree, compared name by name.
         let digest = match (key.as_slice(), &*reader.resolve(value)?) {
             (b"Names", Object::Dict(names)) => reader.digest_without(names, &[b"Dests"])?,
@@ -4200,6 +4300,11 @@ pub(crate) struct PageRemovals {
     pub actions: bool,
     /// Its thumbnail (`/Thumb`).
     pub thumbnail: bool,
+    /// Follow-up 8 (R6b-51, M1): its XMP packet (`/Metadata`).
+    pub metadata: bool,
+    /// Follow-up 8 (R6b-51, M1): any other entry no viewer draws ([`PAGE_IGNORED`] but `/Type`
+    /// and `/Metadata`: an application's data, the tags' link, navigation and presentation).
+    pub entries: bool,
 }
 
 /// In a rewrite, what was taken away from a page's property-list text and its own entries
@@ -4215,7 +4320,8 @@ pub(crate) fn page_removals(base: &PageFacts, edited: &PageFacts) -> Option<Page
         return None;
     }
     let gone = |key: &[u8]| base.entries.contains_key(key) && !edited.entries.contains_key(key);
-    Some(PageRemovals { text, actions: gone(b"AA"), thumbnail: gone(b"Thumb") })
+    let entries = PAGE_IGNORED.iter().any(|key| !matches!(*key, b"Type" | b"Metadata") && gone(key));
+    Some(PageRemovals { text, actions: gone(b"AA"), thumbnail: gone(b"Thumb"), metadata: gone(b"Metadata"), entries })
 }
 
 /// The structure tree's marked-content kids by where their content is: the form XObject that
