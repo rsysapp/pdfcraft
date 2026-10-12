@@ -668,6 +668,8 @@ fn apply_chosen(doc: &mut Document, chosen_by: &dyn Fn(&Mark) -> bool, options: 
         // Embed build (R6b-50): the page's thumbnail shows it as it was; its private data and
         // XMP may hold what was removed.
         let had_thumbnail = doc.get(page.obj).as_dict().is_some_and(|d| d.contains(b"Thumb"));
+        let had_metadata = doc.get(page.obj).as_dict().is_some_and(|d| d.contains(b"Metadata"));
+        report.metadata_removed += usize::from(had_metadata);
         doc.update_dict(page.obj, |d| {
             for key in [&b"Thumb"[..], b"PieceInfo", b"LastModified", b"Metadata"] {
                 d.remove(key);

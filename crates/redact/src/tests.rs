@@ -986,8 +986,9 @@ fn copies_of_the_removed_words_elsewhere_in_the_document_are_cleared() {
     mark(&mut doc, 0, &[OVER_SECRET], "");
     let report = apply_with(&mut doc, None, Options { black: true, document_copies: true, ..Options::default() }).unwrap();
     assert!(!holds(&doc, b"SECRET"));
-    assert!(holds(&doc, b"Public title") && holds(&doc, b"[Redacted]") && holds(&doc, b"Other"));
-    assert_eq!((report.bookmarks_cleared, report.information_cleared, report.metadata_removed, report.destinations_renamed), (1, 1, 1, 1));
+    // R6b-56: the document information goes whole (but its producer and creation date).
+    assert!(!holds(&doc, b"Public title") && holds(&doc, b"[Redacted]") && holds(&doc, b"Other"));
+    assert_eq!((report.bookmarks_cleared, report.information_cleared, report.metadata_removed, report.destinations_renamed), (1, 2, 1, 1));
     // The bookmark and the link still go where the name went.
     let catalog = doc.get(doc.root().unwrap()).as_dict().cloned().unwrap();
     let dests = catalog.get(b"Dests").and_then(|d| doc.resolve(d).as_dict().cloned()).unwrap();

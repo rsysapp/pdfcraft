@@ -1147,7 +1147,7 @@ fn copies_of_short_names_kerned_words_and_accented_words_are_cleared() {
         let base = with_copies(line, title, author);
         let applied = apply(&base, &marked(&base, &wide)).unwrap_or_else(|error| panic!("{case}: {error:?}"));
         assert!(found(&applied.bytes, gone).is_empty(), "{case}: {:?}", found(&applied.bytes, gone));
-        assert_eq!((applied.facts.bookmarks_cleared, applied.facts.information_cleared), (1, 1), "{case}: {:?}", applied.facts);
+        assert!(applied.facts.bookmarks_cleared == 1 && applied.facts.info_cleared, "{case}: {:?}", applied.facts);
     }
     // A function word alone clears no unrelated title, nor do two letters.
     for (line, title) in [("BT /F1 12 Tf 20 150 Td (the) Tj ET", "Other terms"), ("BT /F1 12 Tf 20 150 Td (AB) Tj ET", "AB Holdings")] {
@@ -1456,4 +1456,89 @@ fn a_mark_the_update_writes_in_place_is_refused() {
         "[8 0 R << /Type /Annot /Subtype /Redact /Rect [140 10 170 40] /QuadPoints [140 40 170 40 140 10 170 10] /IC [0 0 0] >>]",
     )]);
     assert!(matches!(inspect(&base, &edited, InspectLimits::default()), Err(InspectError::Edited(_))));
+}
+
+// ── R6b-56: document information and XMP go whole; the copies left to match, read alike ───────
+
+#[test]
+fn any_redaction_takes_the_document_information_and_every_xmp_packet() {
+    // R6b-56: whenever a redaction is applied, every /Info value but /Producer and
+    // /CreationDate goes, and every XMP packet, wherever it is, without matching.
+    let xmp = |n: u32| stream("/Type /Metadata /Subtype /XML", format!("<x:xmpmeta>packet {n}</x:xmpmeta>").as_bytes());
+    let base = Spec {
+        trailer: "/Info 6 0 R".into(),
+        cat: "/Metadata 7 0 R".into(),
+        page: "/Metadata 8 0 R".into(),
+        res: "/XObject << /Im1 9 0 R /Fm1 11 0 R >>".into(),
+        extras: vec![
+            b"<< /Title (Contract) /Author (Someone) /Producer (gen) /CreationDate (D:20200101) /Custom (kept?) >>".to_vec(),
+            xmp(1),
+            xmp(2),
+            stream("/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Metadata 10 0 R", &[7]),
+            xmp(3),
+            stream("/Type /XObject /Subtype /Form /BBox [0 0 200 300] /Metadata 12 0 R", b"0 g 150 20 10 10 re f"),
+            xmp(4),
+        ],
+        ..Spec::new(&format!("{LINE}\nq 10 0 0 10 150 40 cm /Im1 Do Q\n/Fm1 Do\n{KEEP}"))
+    }
+    .build();
+    let applied = apply(&base, &marked(&base, &[BOX])).unwrap();
+    assert!(found(&applied.bytes, "xmpmeta").is_empty(), "{:?}", found(&applied.bytes, "xmpmeta"));
+    assert!(found(&applied.bytes, "Contract").is_empty() && found(&applied.bytes, "Someone").is_empty() && found(&applied.bytes, "kept?").is_empty());
+    assert!(!found(&applied.bytes, "D:20200101").is_empty() && !found(&applied.bytes, "Producer").is_empty());
+    assert!(applied.facts.info_cleared, "{:?}", applied.facts);
+    assert_eq!(applied.facts.metadata_removed, 4, "{:?}", applied.facts);
+}
+
+#[test]
+fn a_copy_that_cannot_be_decoded_refuses_the_redaction() {
+    // R6b-56: a string where copies are matched that cannot be decoded by its own encoding (an
+    // odd UTF-16 length, an unpaired surrogate, bad UTF-8 after its mark, a PDFDocEncoding byte
+    // no character has) is never skipped, nor guessed at: refused.
+    for title in ["<FEFF0053004500>", "<FEFFD8000041>", "<EFBBBFFF41>", "<41 9F 42>"] {
+        let base = Spec {
+            cat: "/Outlines 6 0 R".into(),
+            extras: vec![
+                b"<< /Type /Outlines /First 7 0 R /Last 7 0 R /Count 1 >>".to_vec(),
+                format!("<< /Title {title} /Parent 6 0 R /Dest [3 0 R /Fit] >>").into_bytes(),
+            ],
+            ..Spec::new(&format!("{LINE}\n{KEEP}"))
+        }
+        .build();
+        assert_eq!(apply(&base, &marked(&base, &[BOX])).map(|_| ()), Err(ApplyError::Refused(Refusal::CopyNotClearable)), "{title}");
+    }
+}
+
+#[test]
+fn an_annotation_s_text_is_matched_whatever_entries_it_has() {
+    // R6b-56 (scan item): an annotation without /Type or /Contents whose author (/T) holds the
+    // removed word, outside the marks, is cleared.
+    let base = Spec {
+        page: "/Annots [6 0 R]".into(),
+        extras: vec![b"<< /Subtype /Text /Rect [150 10 170 30] /T (SECRETWORD) >>".to_vec()],
+        ..Spec::new(&format!("{LINE}\n{KEEP}"))
+    }
+    .build();
+    let applied = apply(&base, &marked(&base, &[BOX])).unwrap();
+    assert!(found(&applied.bytes, SECRET).is_empty(), "{:?}", found(&applied.bytes, SECRET));
+}
+
+#[test]
+fn xmp_on_an_appearance_goes_too_and_the_output_keeps_none() {
+    // R6b-56: an annotation's appearance's XMP packet goes like any other (the inspector takes
+    // it away as the server's rewrite does), and the server's output keeps none anywhere. (A
+    // font naming XMP is a key the comparison does not know: such a page is refused already.)
+    let base = Spec {
+        page: "/Annots [6 0 R]".into(),
+        extras: vec![
+            b"<< /Type /Annot /Subtype /Stamp /Rect [150 10 190 30] /AP << /N 7 0 R >> >>".to_vec(),
+            stream("/Type /XObject /Subtype /Form /BBox [0 0 40 20] /Metadata 8 0 R", b"0 0 1 rg 0 0 40 20 re f"),
+            stream("/Type /Metadata /Subtype /XML", b"<x:xmpmeta>appearance</x:xmpmeta>"),
+        ],
+        ..Spec::new(&format!("{LINE}\n{KEEP}"))
+    }
+    .build();
+    let applied = apply(&base, &marked(&base, &[BOX])).unwrap();
+    assert!(found(&applied.bytes, "xmpmeta").is_empty());
+    assert_eq!(applied.facts.metadata_removed, 1, "{:?}", applied.facts);
 }

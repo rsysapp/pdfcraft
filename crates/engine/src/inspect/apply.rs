@@ -65,6 +65,9 @@ pub struct AppliedFacts {
     /// whose `/Contents`, `/RC` or `/T` held a removed word, cleared; optional-content groups
     /// whose name held one, renamed "[Redacted]"; page-label prefixes holding one, removed.
     pub xfa_removed: u32,
+    /// R6b-56: the document information was cleared (every value but `/Producer` and
+    /// `/CreationDate` removed; how many in `information_cleared`).
+    pub info_cleared: bool,
     pub annotation_texts_cleared: u32,
     pub layer_names_cleared: u32,
     pub label_prefixes_cleared: u32,
@@ -283,6 +286,7 @@ fn run(base: &[u8], edited: &[u8], limits: InspectLimits) -> Result<Applied, App
         destinations_renamed: count(report.destinations_renamed),
         overhang: report.overhang as f32,
         xfa_removed: count(report.xfa_removed),
+        info_cleared: report.information_cleared > 0,
         annotation_texts_cleared: count(report.annotation_texts_cleared),
         layer_names_cleared: count(report.layer_names_cleared),
         label_prefixes_cleared: count(report.label_prefixes_cleared),
@@ -357,6 +361,18 @@ pub(crate) fn left_under_marks(output: &[u8], areas: &[(u32, [f32; 4])], overhan
     let mut by_page: std::collections::BTreeMap<u32, Vec<[f64; 4]>> = std::collections::BTreeMap::new();
     for (page, area) in areas {
         by_page.entry(*page).or_default().push(area.map(f64::from));
+    }
+    // R6b-56: no XMP packet is kept anywhere.
+    for num in doc.object_numbers() {
+        let Ok(object) = doc.try_get(num) else { continue };
+        let keeps = match &*object {
+            Object::Dict(d) => d.contains(b"Metadata"),
+            Object::Stream(s) => s.dict.contains(b"Metadata"),
+            _ => false,
+        };
+        if keeps {
+            return Err(ApplyError::SelfCheck(format!("object {num} of the output keeps an XMP packet")));
+        }
     }
     // Audit (follow-up 9): the stream the reading below leaves out as the redactor's boxes
     // (`/PCMark /Redaction`) holds nothing but its boxes: black, filled, each within the marks of

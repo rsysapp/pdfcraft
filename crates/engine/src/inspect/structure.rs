@@ -1691,8 +1691,11 @@ impl<'d, 'b> Reader<'d, 'b> {
         let name_key = b"Name".to_vec();
         let ocg_place = (self.names_apart && d.name(b"Type") == Some(b"OCG"))
             .then(|| self.stack.last().and_then(|r| self.ocg_index.get(r)).map_or(Object::Null, |place| Object::Int(*place as i64)));
+        // R6b-56: in a rewrite, XMP packets are taken away wherever they are (the rewrite may
+        // keep none: checked apart), so no digest holds them.
+        let xmp = |key: &[u8]| self.names_apart && key == b"Metadata";
         let mut entries: Vec<(&Vec<u8>, &Object)> =
-            d.iter().filter(|(key, value)| !(back_reference(key, value) || ocg_place.is_some() && key.as_slice() == b"Name")).collect();
+            d.iter().filter(|(key, value)| !(back_reference(key, value) || ocg_place.is_some() && key.as_slice() == b"Name" || xmp(key))).collect();
         if let Some(place) = &ocg_place {
             entries.push((&name_key, place));
         }

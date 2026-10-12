@@ -1,24 +1,30 @@
-//! Embed build (R6b-50, R6b-52, R6b-54 N3, N4, N5, N7, N8): copies of the removed words
+//! Embed build (R6b-50, R6b-52, R6b-54 N3, N4, N5, N7, N8, R6b-56): copies of the removed words
 //! elsewhere in the document, cleared when a host applies marks.
 //!
-//! **What counts as a copy (R6b-52).** The removed text is read as an extractor reads it (words
-//! apart where their glyphs are apart, phrases apart where a kept glyph lies between), folded on
-//! both sides (NFKC, diacritics taken off, lower case). A copy holds a removed word when it holds
-//! one of the removed tokens (three letters or digits or more, a short function word excepted),
-//! as a word of its own or, five characters or more, anywhere; or when it holds a removed phrase
-//! (two words or more) whole. Glyphs removed without readable text (a font giving no Unicode)
-//! cannot be matched: where the document holds copies they could be in (bookmarks, document
-//! information values, XMP), the redaction is refused ([`Refusal::UnreadableMarkedText`]).
+//! **Taken whole, without matching (R6b-56).** Whenever any redaction is applied, every
+//! document information value but `/Producer` and `/CreationDate` goes, every XMP packet
+//! (`/Metadata`, wherever it is) goes, and the form's XFA (`/XFA`, `/NeedsRendering`, which keeps
+//! the fields' values apart from them) goes.
 //!
-//! **What is cleared.** Bookmark titles read "[Redacted]"; document information values go; the
-//! catalog's XMP packet goes, and every other XMP packet holding a removed word; annotations'
-//! `/Contents`, `/RC` and `/T` holding one go; optional-content groups' names holding one read
-//! "[Redacted]"; page-label prefixes holding one go; any applied redaction removes the form's
-//! XFA (`/XFA`, `/NeedsRendering`), which keeps the fields' values apart from them; named
-//! destinations whose name holds one are renamed to opaque names, matched by their bytes (a name
-//! or a string, literal or hex alike), with every destination naming them (in links, bookmarks,
-//! the opening action, additional actions and chained actions), and the named destinations'
-//! tree written again in order with its limits.
+//! **Matched (R6b-52, R6b-56).** Bookmark titles, annotations' `/Contents` (and its rich-text
+//! form `/RC`) and `/T` outside the marks, optional-content groups' names, page-label prefixes
+//! and destination names. One normalisation ([`normalise`]) reads the removed text and every
+//! candidate alike: decoded by the string's own encoding ([`decode_text`]), then NFKC, then
+//! format characters taken out, then case and diacritics folded. A copy holds a removed word
+//! when it holds one of the removed tokens (three letters or digits or more, a short function
+//! word excepted), as a word of its own (or a part of one where letters meet digits), four
+//! characters or more inside a word, five or more across words; or a removed phrase (two words
+//! or more) whole. A candidate that cannot be decoded refuses the redaction
+//! ([`Refusal::CopyNotClearable`]); so do removed glyphs without readable text where any of these
+//! places holds text ([`Refusal::UnreadableMarkedText`]), and a bookmark's or the opening
+//! action's URI or JavaScript holding a removed word (it cannot be cleared without changing what
+//! the action does).
+//!
+//! **What clearing does.** Bookmark titles read "[Redacted]"; annotations' text entries holding
+//! one go; groups' names read "[Redacted]"; prefixes go; named destinations are renamed to opaque
+//! names, matched by their bytes (a name or a string, literal or hex alike), with every
+//! destination naming them (in links, bookmarks, the opening action, additional actions and
+//! chained actions), and the named destinations' tree written again in order.
 
 use std::collections::{HashMap, HashSet};
 
@@ -29,6 +35,9 @@ use crate::{RUN_END, RedactError, Refusal, Report, interp};
 
 /// What replaces a cleared title or name.
 pub(crate) const REDACTED: &str = "[Redacted]";
+
+/// The document information entries a redaction keeps (R6b-56).
+const INFO_KEPT: [&[u8]; 2] = [b"Producer", b"CreationDate"];
 
 /// Function words of three letters (English and Indonesian) never matched on their own: they
 /// are in too many unrelated titles. (Shorter words are never matched on their own anyway.)
@@ -42,22 +51,76 @@ const STOP_WORDS: [&str; 46] = [
 /// lower case; capitalised, a name, matched like any token.
 const NAME_LIKE: [&str; 3] = ["dan", "ada", "may"];
 
-/// Audit (follow-up 9): characters a viewer does not show, which must not split a word: the soft
-/// hyphen, zero-width spaces and joiners, directional marks, the word joiner and its kin, the
-/// byte-order mark.
+/// Characters a viewer does not show, which must not split a word: the soft hyphen, zero-width
+/// spaces and joiners, directional marks, the word joiner and its kin, the byte-order mark.
 fn invisible(c: char) -> bool {
     matches!(c, '\u{ad}' | '\u{34f}' | '\u{180e}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206f}' | '\u{feff}')
 }
 
-/// `text` folded for matching: what is not shown taken out, NFKC (full-width forms, ligatures,
-/// no-break spaces), diacritics taken off, lower case.
-pub(crate) fn fold(text: &str) -> String {
-    let shown: String = text.chars().filter(|c| !invisible(*c)).collect();
-    let compatible: String = shown.nfkc().collect();
-    compatible.nfd().filter(|c| !unicode_normalization::char::is_combining_mark(*c) && !invisible(*c)).flat_map(char::to_lowercase).collect()
+/// R6b-56: a PDF text string decoded by its own encoding (UTF-16BE or UTF-8 after their marks,
+/// else PDFDocEncoding), its language marks (U+001B, a code, U+001B, which viewers do not show)
+/// taken out. `None` when it cannot be: an odd UTF-16 length or an unpaired surrogate, bad
+/// UTF-8, or a byte PDFDocEncoding gives no character (0x7F, 0x9F, 0xAD).
+pub(crate) fn decode_text(bytes: &[u8]) -> Option<String> {
+    let text = if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        if rest.len() % 2 != 0 {
+            return None;
+        }
+        let units = rest.as_chunks::<2>().0.iter().map(|pair| u16::from_be_bytes(*pair));
+        char::decode_utf16(units).collect::<Result<String, _>>().ok()?
+    } else if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        String::from_utf8(rest.to_vec()).ok()?
+    } else {
+        if bytes.iter().any(|byte| matches!(byte, 0x7F | 0x9F | 0xAD)) {
+            return None;
+        }
+        PdfString::literal(bytes.to_vec()).to_text()
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut inside = false;
+    for c in text.chars() {
+        if c == '\u{1b}' {
+            inside = !inside;
+        } else if !inside {
+            out.push(c);
+        }
+    }
+    if inside {
+        return None;
+    }
+    Some(out)
 }
 
-/// The words of folded text: its runs of letters and digits.
+/// A name's bytes as text (destination names): UTF-8 when they are, else as a text string.
+fn decode_name(bytes: &[u8]) -> Option<String> {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Some(text.to_string()),
+        Err(_) => decode_text(bytes),
+    }
+}
+
+/// Case and diacritics folded (after NFKC): decomposed, marks and what is not shown taken out,
+/// lower case, ß as ss.
+fn fold_case(text: &str) -> String {
+    text.nfd()
+        .filter(|c| !unicode_normalization::char::is_combining_mark(*c) && !invisible(*c))
+        .flat_map(char::to_lowercase)
+        .flat_map(|c| if c == 'ß' { vec!['s', 's'] } else { vec![c] })
+        .collect()
+}
+
+/// NFKC, format characters out: before folding.
+fn prepared(text: &str) -> String {
+    text.nfkc().filter(|c| !invisible(*c)).collect()
+}
+
+/// R6b-56: the one normalisation of removed text and candidates alike (on decoded text): NFKC,
+/// then format characters out, then case and diacritics folded.
+pub(crate) fn normalise(text: &str) -> String {
+    fold_case(&prepared(text))
+}
+
+/// The words of normalised text: its runs of letters and digits.
 fn words(folded: &str) -> Vec<&str> {
     folded.split(|c: char| !c.is_alphanumeric()).filter(|word| !word.is_empty()).collect()
 }
@@ -82,9 +145,9 @@ fn pieces(word: &str) -> Vec<&str> {
 /// What the redaction removed, for matching copies.
 #[derive(Debug, Default)]
 pub(crate) struct Removed {
-    /// Folded tokens of three characters or more, but the stop words.
+    /// Normalised tokens of three characters or more, but the stop words.
     tokens: Vec<String>,
-    /// Folded phrases of two words or more, their words joined by one space.
+    /// Normalised phrases of two words or more, their words joined by one space.
     phrases: Vec<String>,
     /// A removed glyph had no readable text.
     pub unreadable: bool,
@@ -101,11 +164,11 @@ impl Removed {
             }
         };
         for run in text.split(RUN_END) {
-            let shown: String = run.chars().filter(|c| !invisible(*c)).collect();
+            let run = prepared(run);
             let mut run_pieces: Vec<String> = Vec::new();
-            for raw in shown.split(|c: char| !c.is_alphanumeric()).filter(|word| !word.is_empty()) {
+            for raw in run.split(|c: char| !c.is_alphanumeric()).filter(|word| !word.is_empty()) {
                 let capitalised = raw.chars().next().is_some_and(char::is_uppercase);
-                let folded = fold(raw);
+                let folded = fold_case(raw);
                 for word in words(&folded) {
                     add(&mut removed, word, capitalised);
                     let split = pieces(word);
@@ -131,9 +194,9 @@ impl Removed {
         self.tokens.is_empty() && self.phrases.is_empty()
     }
 
-    /// Whether `copy` holds a removed word (see the module documentation).
+    /// Whether decoded text `copy` holds a removed word (see the module documentation).
     pub fn held_in(&self, copy: &str) -> bool {
-        let folded = fold(copy);
+        let folded = normalise(copy);
         let copy_words = words(&folded);
         let copy_pieces: Vec<&str> = copy_words.iter().flat_map(|word| pieces(word)).collect();
         let joined = format!(" {} ", copy_pieces.join(" "));
@@ -148,96 +211,26 @@ impl Removed {
                 || (length >= 5 && compact.contains(token.as_str()))
         }) || self.phrases.iter().any(|phrase| joined.contains(&format!(" {phrase} ")))
     }
-
-    /// Whether bytes `copy` (a name, or a packet's data) hold one, read every way it could be
-    /// meant: as a PDF text string (UTF-16BE or UTF-8 with its mark, else PDFDocEncoding), as
-    /// UTF-8, as UTF-16 little-endian with its mark; XML character references and entities read
-    /// (an XMP packet's `&#83;`).
-    fn held_in_bytes(&self, copy: &[u8]) -> bool {
-        let mut readings = vec![PdfString::literal(copy.to_vec()).to_text(), String::from_utf8_lossy(copy).into_owned()];
-        if let Some(rest) = copy.strip_prefix(&[0xFF, 0xFE]) {
-            let units: Vec<u16> = rest.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
-            readings.push(String::from_utf16_lossy(&units));
-        }
-        let unescaped: Vec<String> = readings.iter().map(|text| xml_unescaped(text)).collect();
-        readings.extend(unescaped);
-        readings.iter().any(|text| self.held_in(&without_language_marks(text)))
-    }
-
-    /// Whether a text string `copy` holds one. Audit (follow-up 9): one that does not decode
-    /// cleanly (a character no encoding gives) counts as holding one, so it is cleared rather
-    /// than kept unread.
-    fn held_in_text(&self, copy: &str) -> bool {
-        copy.contains('\u{fffd}') || self.held_in(&without_language_marks(copy))
-    }
 }
 
-/// A text string without its language marks (ISO 32000-2 §7.9.2.2: U+001B, a language code,
-/// U+001B), which viewers do not show: a mark inside a word must not split it.
-fn without_language_marks(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut inside = false;
-    for c in text.chars() {
-        if c == '\u{1b}' {
-            inside = !inside;
-        } else if !inside {
-            out.push(c);
-        }
-    }
-    out
-}
-
-/// XML character references and the five entities read (`&#83;`, `&#x53;`, `&amp;`, …).
-fn xml_unescaped(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(at) = rest.find('&') {
-        out.push_str(&rest[..at]);
-        let tail = &rest[at..];
-        let entity_end = tail.find(';').filter(|end| *end <= 12);
-        let decoded = entity_end.and_then(|end| {
-            let entity = &tail[1..end];
-            match entity {
-                "amp" => Some('&'),
-                "lt" => Some('<'),
-                "gt" => Some('>'),
-                "quot" => Some('"'),
-                "apos" => Some('\''),
-                _ => entity
-                    .strip_prefix("#x")
-                    .or_else(|| entity.strip_prefix("#X"))
-                    .and_then(|hex| u32::from_str_radix(hex, 16).ok())
-                    .or_else(|| entity.strip_prefix('#').and_then(|digits| digits.parse::<u32>().ok()))
-                    .and_then(char::from_u32),
-            }
-        });
-        match (decoded, entity_end) {
-            (Some(c), Some(end)) => {
-                out.push(c);
-                rest = &tail[end + 1..];
-            }
-            _ => {
-                out.push('&');
-                rest = &tail[1..];
-            }
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
-/// A copy's text: a string's (as a PDF text string), or a name's bytes read as one.
-fn text_of(doc: &Document, o: &Object) -> Option<String> {
+/// A candidate's text (R6b-56): a string decoded by its own encoding, a name's bytes as text;
+/// `None` for anything else. A string or name that cannot be decoded refuses.
+fn copy_text(doc: &Document, o: &Object) -> Result<Option<String>, RedactError> {
+    let undecodable = RedactError::Refused(Refusal::CopyNotClearable);
     match &*doc.resolve(o) {
-        Object::String(s) => Some(s.to_text()),
-        Object::Name(n) => Some(PdfString::literal(n.clone()).to_text()),
-        _ => None,
+        Object::String(s) => decode_text(&s.bytes).map(Some).ok_or(undecodable),
+        Object::Name(n) => decode_name(n).map(Some).ok_or(undecodable),
+        _ => Ok(None),
     }
 }
 
-/// Audit (follow-up 9): whether an action (a bookmark's, the opening one), or any action it
-/// chains, holds a removed word anywhere (a URI, a file name, JavaScript as a string or a
-/// stream): such a copy cannot be cleared without changing what the action does.
+/// Whether candidate `o` (see [`copy_text`]) holds a removed word.
+fn holds(doc: &Document, o: &Object, removed: &Removed) -> Result<bool, RedactError> {
+    Ok(copy_text(doc, o)?.is_some_and(|text| removed.held_in(&text)))
+}
+
+/// Whether an action (a bookmark's, the opening one), or any action it chains, holds a removed
+/// word anywhere (a URI, a file name, JavaScript as a string or a stream).
 fn action_holds(doc: &Document, action: &Object, removed: &Removed, work: &interp::Work, depth: usize) -> Result<bool, RedactError> {
     if depth > 32 {
         return Err(RedactError::TooComplex);
@@ -253,12 +246,11 @@ fn action_holds(doc: &Document, action: &Object, removed: &Removed, work: &inter
         return Ok(false);
     }
     Ok(match &*doc.resolve(action) {
-        Object::String(s) => removed.held_in_text(&s.to_text()) || removed.held_in_bytes(&s.bytes),
-        Object::Name(n) => removed.held_in_bytes(n),
+        Object::String(_) | Object::Name(_) => holds(doc, action, removed)?,
         Object::Stream(stream) => {
             let data = stream.decoded().map_err(|_| RedactError::Refused(Refusal::CopyNotClearable))?;
             work.charge(data.len() / 64);
-            removed.held_in_bytes(&data)
+            removed.held_in(&decode_text(&data).ok_or(RedactError::Refused(Refusal::CopyNotClearable))?)
         }
         Object::Array(items) => {
             let mut held = false;
@@ -282,28 +274,59 @@ fn action_holds(doc: &Document, action: &Object, removed: &Removed, work: &inter
     })
 }
 
+/// Every annotation listed on a page, by object.
+fn page_annotations(doc: &Document, work: &interp::Work) -> Vec<ObjRef> {
+    let mut out = Vec::new();
+    for page in pdfcraft_model::pages(doc) {
+        for annot in crate::annots_of(doc, &page.dict) {
+            work.charge(1);
+            out.extend(annot.as_ref());
+        }
+    }
+    out
+}
+
 /// Clear the copies of what was removed (see the module documentation), counting each in
 /// `report`.
 pub(crate) fn clear(doc: &mut Document, removed: &Removed, report: &mut Report, work: &interp::Work) -> Result<(), RedactError> {
     let spent = |work: &interp::Work| if work.spent() { Err(RedactError::TooComplex) } else { Ok(()) };
     let Some(root) = doc.root() else { return Ok(()) };
     let mut catalog = doc.get(root).as_dict().cloned().unwrap_or_default();
-    let info = doc.trailer().get(b"Info").and_then(Object::as_ref);
-    // Unreadable removed text cannot be looked for where copies could be.
-    if removed.unreadable {
-        let bookmarks = catalog.get(b"Outlines").and_then(|o| doc.resolve(o).as_dict().and_then(|d| d.get(b"First").cloned())).is_some();
-        let information =
-            info.and_then(|r| doc.get(r).as_dict().cloned()).is_some_and(|d| d.iter().any(|(_, v)| doc.resolve(v).as_string().is_some()));
-        if bookmarks || information || catalog.contains(b"Metadata") {
-            return Err(RedactError::Refused(Refusal::UnreadableMarkedText));
+    // R6b-56: the document information, but its producer and creation date, whole.
+    if let Some(info) = doc.trailer().get(b"Info").and_then(Object::as_ref)
+        && let Some(dict) = doc.get(info).as_dict().cloned()
+    {
+        let doomed: Vec<Vec<u8>> = dict.iter().map(|(key, _)| key.clone()).filter(|key| !INFO_KEPT.contains(&key.as_slice())).collect();
+        if !doomed.is_empty() {
+            doc.update_dict(info, |d| {
+                for key in &doomed {
+                    d.remove(key);
+                }
+            })?;
+            report.information_cleared += doomed.len();
         }
     }
-    // The catalog's XMP packet, always; any applied redaction, the form's XFA.
-    let mut catalog_changed = false;
-    if catalog.remove(b"Metadata").is_some() {
-        report.metadata_removed += 1;
-        catalog_changed = true;
+    // R6b-56: every XMP packet, wherever it is.
+    for num in doc.object_numbers() {
+        work.charge(1);
+        spent(work)?;
+        let r = ObjRef::new(num, 0);
+        let Ok(object) = doc.try_get(num) else { continue };
+        let has = match &*object {
+            Object::Dict(d) => d.contains(b"Metadata"),
+            Object::Stream(s) => s.dict.contains(b"Metadata"),
+            _ => false,
+        };
+        if has {
+            doc.update_dict(r, |d| {
+                d.remove(b"Metadata");
+            })?;
+            report.metadata_removed += 1;
+        }
     }
+    catalog = doc.get(root).as_dict().cloned().unwrap_or(catalog);
+    // The form's XFA.
+    let mut catalog_changed = false;
     if catalog.remove(b"NeedsRendering").is_some() {
         catalog_changed = true;
         report.xfa_removed = 1;
@@ -324,24 +347,40 @@ pub(crate) fn clear(doc: &mut Document, removed: &Removed, report: &mut Report, 
     if catalog_changed {
         doc.set(root, Object::Dict(catalog.clone()));
     }
+    let annotations = page_annotations(doc, work);
+    let groups: Vec<ObjRef> = catalog
+        .get(b"OCProperties")
+        .and_then(|p| doc.resolve(p).as_dict().cloned())
+        .and_then(|p| p.get(b"OCGs").and_then(|g| doc.resolve(g).as_array().cloned()))
+        .map(|items| items.iter().filter_map(Object::as_ref).collect())
+        .unwrap_or_default();
+    // Removed glyphs without readable text cannot be looked for where copies are matched.
+    if removed.unreadable {
+        let bookmarks = catalog.get(b"Outlines").and_then(|o| doc.resolve(o).as_dict().and_then(|d| d.get(b"First").cloned())).is_some();
+        let texts =
+            annotations.iter().any(|r| doc.get(*r).as_dict().is_some_and(|d| [&b"Contents"[..], b"RC", b"T"].iter().any(|key| d.contains(key))));
+        let names = !groups.is_empty() || catalog.contains(b"PageLabels") || catalog.contains(b"Dests") || catalog.contains(b"Names");
+        if bookmarks || texts || names {
+            return Err(RedactError::Refused(Refusal::UnreadableMarkedText));
+        }
+    }
     if removed.is_empty() {
         return Ok(());
     }
-    // Audit (follow-up 9): the opening action holding a removed word cannot be cleared.
+    // The opening action holding a removed word cannot be cleared.
     if let Some(action) = catalog.get(b"OpenAction").filter(|action| !matches!(&*doc.resolve(action), Object::Array(_)))
         && action_holds(doc, action, removed, work, 0)?
     {
         return Err(RedactError::Refused(Refusal::CopyNotClearable));
     }
-    // Bookmarks: depth first, bounded.
+    // Bookmarks: depth first, bounded; a walk past its bound, or an entry that is no
+    // dictionary, refuses (never skipped).
     let mut todo: Vec<Object> =
         catalog.get(b"Outlines").and_then(|o| doc.resolve(o).as_dict().and_then(|d| d.get(b"First").cloned())).into_iter().collect();
     let mut seen: HashSet<ObjRef> = HashSet::new();
     while let Some(entry) = todo.pop() {
         work.charge(8);
         spent(work)?;
-        // Audit (follow-up 9): a walk past its bound, or an entry that is no dictionary, is never
-        // skipped: the redaction is refused.
         let Some(r) = entry.as_ref() else { return Err(RedactError::Refused(Refusal::CopyNotClearable)) };
         if !seen.insert(r) {
             continue;
@@ -350,79 +389,53 @@ pub(crate) fn clear(doc: &mut Document, removed: &Removed, report: &mut Report, 
             return Err(RedactError::TooComplex);
         }
         let Some(item) = doc.get(r).as_dict().cloned() else { return Err(RedactError::Refused(Refusal::CopyNotClearable)) };
-        // Audit (follow-up 9): a bookmark's action holding a removed word cannot be cleared.
         if let Some(action) = item.get(b"A")
             && action_holds(doc, action, removed, work, 0)?
         {
             return Err(RedactError::Refused(Refusal::CopyNotClearable));
         }
-        if item.get(b"Title").and_then(|t| text_of(doc, t)).is_some_and(|title| removed.held_in_text(&title)) {
+        if let Some(title) = item.get(b"Title")
+            && holds(doc, title, removed)?
+        {
             doc.update_dict(r, |d| d.set(b"Title".to_vec(), Object::String(PdfString::text(REDACTED))))?;
             report.bookmarks_cleared += 1;
         }
         todo.extend(item.get(b"Next").cloned());
         todo.extend(item.get(b"First").cloned());
     }
-    // The document information.
-    if let Some(info) = info
-        && let Some(dict) = doc.get(info).as_dict().cloned()
-    {
-        let doomed: Vec<Vec<u8>> = dict
-            .iter()
-            .filter(|(_, value)| text_of(doc, value).is_some_and(|text| removed.held_in_text(&text)))
-            .map(|(key, _)| key.clone())
-            .collect();
+    // Annotations' text, outside the marks (those under them are gone), whatever entries they
+    // have otherwise.
+    for r in annotations {
+        work.charge(4);
+        spent(work)?;
+        let Some(dict) = doc.get(r).as_dict().cloned() else { continue };
+        if dict.name(b"Subtype") == Some(b"Widget") {
+            continue;
+        }
+        let mut doomed: Vec<&[u8]> = Vec::new();
+        for key in [&b"Contents"[..], b"RC", b"T"] {
+            if let Some(value) = dict.get(key)
+                && holds(doc, value, removed)?
+            {
+                doomed.push(key);
+            }
+        }
         if !doomed.is_empty() {
-            doc.update_dict(info, |d| {
+            doc.update_dict(r, |d| {
                 for key in &doomed {
                     d.remove(key);
                 }
             })?;
-            report.information_cleared += doomed.len();
+            report.annotation_texts_cleared += 1;
         }
     }
-    // Every object: XMP packets, annotations' text, layers' names holding a removed word.
-    for num in doc.object_numbers() {
+    // Optional-content groups' names.
+    for r in groups {
         work.charge(4);
-        spent(work)?;
-        let r = ObjRef::new(num, 0);
-        let Ok(object) = doc.try_get(num) else { continue };
-        let dict = match &*object {
-            Object::Dict(d) => d.clone(),
-            Object::Stream(s) => s.dict.clone(),
-            _ => continue,
-        };
-        // XMP: the packet's own text.
-        if let Some(Object::Ref(metadata)) = dict.get(b"Metadata")
-            && let Object::Stream(packet) = &*doc.get(*metadata)
+        let Some(dict) = doc.get(r).as_dict().cloned() else { continue };
+        if let Some(name) = dict.get(b"Name")
+            && holds(doc, name, removed)?
         {
-            // Audit (follow-up 9): a packet that does not decode is removed, never kept unread.
-            let data = packet.decoded_strict_counted(64 << 20).ok().map(|(data, _)| data);
-            work.charge(data.as_ref().map_or(0, Vec::len) / 64);
-            if data.is_none_or(|data| removed.held_in_bytes(&data)) {
-                doc.update_dict(r, |d| {
-                    d.remove(b"Metadata");
-                })?;
-                report.metadata_removed += 1;
-            }
-        }
-        // An annotation's text (its contents, rich text, author).
-        if dict.name(b"Type") == Some(b"Annot") || (dict.contains(b"Subtype") && dict.contains(b"Rect") && dict.contains(b"Contents")) {
-            let doomed: Vec<&[u8]> = [&b"Contents"[..], b"RC", b"T"]
-                .into_iter()
-                .filter(|key| dict.get(key).and_then(|v| text_of(doc, v)).is_some_and(|text| removed.held_in_text(&text)))
-                .collect();
-            if !doomed.is_empty() && dict.name(b"Subtype") != Some(b"Widget") {
-                doc.update_dict(r, |d| {
-                    for key in &doomed {
-                        d.remove(key);
-                    }
-                })?;
-                report.annotation_texts_cleared += 1;
-            }
-        }
-        // An optional-content group's name.
-        if dict.name(b"Type") == Some(b"OCG") && dict.get(b"Name").and_then(|v| text_of(doc, v)).is_some_and(|name| removed.held_in_text(&name)) {
             doc.update_dict(r, |d| d.set(b"Name".to_vec(), Object::String(PdfString::text(REDACTED))))?;
             report.layer_names_cleared += 1;
         }
@@ -457,7 +470,9 @@ fn clear_label_prefixes(
             let Some(label) = pair.get_mut(1) else { continue };
             let target = label.as_ref();
             let Some(mut entry) = doc.resolve(label).as_dict().cloned() else { continue };
-            if entry.get(b"P").and_then(|p| text_of(doc, p)).is_some_and(|prefix| removed.held_in_text(&prefix)) {
+            if let Some(prefix) = entry.get(b"P")
+                && holds(doc, prefix, removed)?
+            {
                 entry.remove(b"P");
                 report.label_prefixes_cleared += 1;
                 match target {
@@ -529,7 +544,12 @@ fn rename_destinations(doc: &mut Document, removed: &Removed, report: &mut Repor
         }
     };
     if let Some(dict) = dests.as_mut() {
-        let doomed: Vec<Vec<u8>> = dict.iter().map(|(key, _)| key.clone()).filter(|key| removed.held_in_bytes(key)).collect();
+        let mut doomed: Vec<Vec<u8>> = Vec::new();
+        for (key, _) in dict.iter() {
+            if removed.held_in(&decode_name(key).ok_or(RedactError::Refused(Refusal::CopyNotClearable))?) {
+                doomed.push(key.clone());
+            }
+        }
         for old in doomed {
             let new = renames.get(&old).cloned().unwrap_or_else(|| fresh(&mut existing));
             if let Some(value) = dict.remove(&old) {
@@ -540,7 +560,7 @@ fn rename_destinations(doc: &mut Document, removed: &Removed, report: &mut Repor
     }
     let mut tree_changed = false;
     for (key, _) in &mut tree {
-        if removed.held_in_bytes(key) {
+        if removed.held_in(&decode_text(key).ok_or(RedactError::Refused(Refusal::CopyNotClearable))?) {
             let new = renames.get(key).cloned().unwrap_or_else(|| fresh(&mut existing));
             renames.insert(key.clone(), new.clone());
             *key = new;
@@ -712,6 +732,9 @@ mod tests {
         ("Jos\u{e9}", "JOSE", true),
         ("Jose", "Jos\u{e9}", true),
         ("Jos\u{65}\u{301}", "Jos\u{e9}", true),
+        ("\u{3231}Andi", "Andi", true),
+        ("Andi\u{b2}", "Andi2", true),
+        ("Pro\u{fb01}t", "Profit", true),
         // Names that are also function words, as names.
         ("Dan", "Meeting with Dan", true),
         ("Ada", "Ada Lovelace notes", true),
@@ -730,6 +753,29 @@ mod tests {
         // Letter-spaced, it is the word still.
         ("Wijaya", "Wija ya", true),
     ];
+
+    /// (text, as normalised): decoded text, NFKC, format characters out, folded (R6b-56).
+    const NORMALISED: &[(&str, &str)] = &[
+        ("Andi", "andi"),
+        ("ANDI", "andi"),
+        ("Jos\u{e9}", "jose"),
+        ("Jos\u{65}\u{301}", "jose"),
+        ("\u{ff21}\u{ff4e}\u{ff44}\u{ff49}", "andi"),
+        ("Pro\u{fb01}t", "profit"),
+        ("An\u{ad}di", "andi"),
+        ("An\u{200b}di", "andi"),
+        ("\u{3231}Andi", "(株)andi"),
+        ("Andi\u{b2}", "andi2"),
+        ("Andi\u{a0}Wijaya", "andi wijaya"),
+        ("\u{1e9e}", "ss"),
+    ];
+
+    #[test]
+    fn one_normalisation_is_pinned() {
+        for (text, normal) in NORMALISED {
+            assert_eq!(normalise(text), *normal, "{text:?}");
+        }
+    }
 
     #[test]
     fn the_matcher_is_pinned() {
