@@ -17,5 +17,8 @@ pdfcraft-forms = { workspace = true }
 pdfcraft-edit = { workspace = true }
 pdfcraft-annot = { workspace = true }
 thiserror = { workspace = true }
+# Embed build (R6b-52): removed words matched NFKC- and diacritic-folded (already in the
+# workspace through pdfcraft-ui-egui).
+unicode-normalization = "0.1"
 
 [dev-dependencies]

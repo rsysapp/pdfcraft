@@ -287,6 +287,8 @@ pub(crate) struct Scope<'a> {
     /// Embed build (R6b-54, N6): the boxes (user space) of the image pixels cleared: every pixel
     /// a region reaches is cleared whole, so these may reach past the regions.
     pub cleared: Vec<[f64; 4]>,
+    /// Embed build (R6b-52, N5): where the last glyph removed ended, and its em.
+    last_removed: Option<((f64, f64), f64)>,
 }
 
 impl<'a> Scope<'a> {
@@ -306,6 +308,34 @@ impl<'a> Scope<'a> {
             work: Work::new(MAX_WORK, None),
             exact: false,
             cleared: Vec::new(),
+            last_removed: None,
+        }
+    }
+
+    /// Embed build (R6b-52, N5): the removed glyphs of one show, into the removed text as an
+    /// extractor reads it: a word break (a space) where a glyph starts away from where the last
+    /// removed one ended (a `TJ` gap, a move to another place or line), and a phrase's end where
+    /// a kept glyph lies between.
+    fn note_removed(&mut self, shown: Vec<Shown>) {
+        for glyph in shown {
+            match glyph {
+                Shown::Removed { text, from, to, em } => {
+                    if let Some((end, last_em)) = self.last_removed
+                        && (from.0 - end.0).hypot(from.1 - end.1) > WORD_GAP * em.max(last_em)
+                        && !self.removed_text.ends_with([' ', crate::RUN_END])
+                    {
+                        self.removed_text.push(' ');
+                    }
+                    self.removed_text.push_str(&text);
+                    self.last_removed = Some((to, em));
+                }
+                Shown::Kept => {
+                    if !self.removed_text.is_empty() && !self.removed_text.ends_with(crate::RUN_END) {
+                        self.removed_text.push(crate::RUN_END);
+                    }
+                    self.last_removed = None;
+                }
+            }
         }
     }
 
@@ -470,6 +500,9 @@ fn fresh_name(scope: &mut Scope<'_>, xobjects: &Dict) -> Vec<u8> {
     }
 }
 
+/// Embed build (R6b-52, N5): the gap, in ems, past which two removed glyphs are two words.
+const WORD_GAP: f64 = 0.15;
+
 /// Embed build (R6b-54, N1): how far inside a region a path's point must lie to count as under
 /// it once applied (the pieces end on its edges, written to four places in their own space).
 const VERTEX_SLACK: f64 = 0.01;
@@ -626,6 +659,20 @@ struct Glyph {
     hit: bool,
     /// Embed build (R6b-50): its code, for the text removed.
     code: u32,
+    /// Embed build (R6b-52, N5): where it starts and where the next one would (user space),
+    /// and the height of an em there: words are told apart by where glyphs are, as an
+    /// extractor tells them.
+    from: (f64, f64),
+    to: (f64, f64),
+    em: f64,
+}
+
+/// Embed build (R6b-52, N5): one glyph shown, for the text the redaction removed.
+pub(crate) enum Shown {
+    /// Removed: its text (U+FFFD when the font gives none), where it starts and ends, an em.
+    Removed { text: String, from: (f64, f64), to: (f64, f64), em: f64 },
+    /// Kept: what was removed before it and what is removed after it are not one phrase.
+    Kept,
 }
 
 /// Process a scope's content streams (state flows from one stream to the next).
@@ -868,8 +915,8 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
                         b"TJ" => op.operands.first().and_then(Object::as_array).cloned().unwrap_or_default(),
                         _ => op.operands.last().cloned().into_iter().collect(),
                     };
-                    let mut removed_text = String::new();
-                    let (new_items, removed) = show(scope, &gs, &mut tm, &items, &mut drift, &mut removed_text);
+                    let mut shown: Vec<Shown> = Vec::new();
+                    let (new_items, removed) = show(scope, &gs, &mut tm, &items, &mut drift, &mut shown);
                     // Embed build: unplaceable glyphs are never removed: near a region, the
                     // redaction is refused (R6b-54: by its reason), and verification counts them.
                     if gs.unplaceable && scope.mode == Mode::Apply {
@@ -890,8 +937,7 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
                     }
                     changed = true;
                     scope.report.glyphs += removed;
-                    scope.removed_text.push_str(&removed_text);
-                    scope.removed_text.push(crate::RUN_END);
+                    scope.note_removed(shown);
                     // Embed build (R6b-50): text filled with a tiling pattern shows its cell.
                     if let Some(name) = gs.patterns[0].clone() {
                         let all = scope
@@ -1078,7 +1124,7 @@ fn silence_empty_fonts(pieces: &mut [(Vec<Op>, bool)]) {
 /// Lay out a shown string (or `TJ` array) glyph by glyph, advancing `tm`. Returns the `TJ`
 /// items with the glyphs under a region replaced by displacements, and how many were removed.
 /// `drift` (Embed build): how many codes of unplaceable text this line showed so far.
-fn show(scope: &Scope<'_>, gs: &Gs, tm: &mut Matrix, items: &[Object], drift: &mut f64, removed_text: &mut String) -> (Vec<Object>, usize) {
+fn show(scope: &Scope<'_>, gs: &Gs, tm: &mut Matrix, items: &[Object], drift: &mut f64, shown: &mut Vec<Shown>) -> (Vec<Object>, usize) {
     let f = &gs.font;
     let size = gs.size;
     let mut out: Vec<Object> = Vec::new();
@@ -1121,6 +1167,8 @@ fn show(scope: &Scope<'_>, gs: &Gs, tm: &mut Matrix, items: &[Object], drift: &m
                     let b = trm.bbox([0.0, f.descent, w0, f.ascent]);
                     let origin = trm.apply(0.0, 0.0);
                     let advance = w0 * size + spacing;
+                    let (up_x, up_y) = trm.apply(0.0, 1.0);
+                    let em = (up_x - origin.0).hypot(up_y - origin.1);
                     let hit = match scope.hidden_text {
                         // Invisible (Tr 3) and clip-only (Tr 7) text, or text wholly off the page.
                         Some(page) => {
@@ -1129,18 +1177,19 @@ fn show(scope: &Scope<'_>, gs: &Gs, tm: &mut Matrix, items: &[Object], drift: &m
                         }
                         None => scope.glyph_hit(b, origin),
                     };
-                    glyphs.push(Glyph { bytes: pos..pos + len, advance, hit, code });
                     *tm = Matrix::translate(advance * gs.scale, 0.0).then(tm);
+                    let to = Matrix([size * gs.scale, 0.0, 0.0, size, 0.0, gs.rise]).then(tm).then(&gs.ctm).apply(0.0, 0.0);
+                    glyphs.push(Glyph { bytes: pos..pos + len, advance, hit, code, from: origin, to, em });
                     pos += len;
                 }
                 let mut run: Vec<u8> = Vec::new();
                 for g in &glyphs {
-                    // Embed build (R6b-50): the removed glyphs' text, runs apart.
-                    if g.hit {
-                        removed_text.push_str(f.text_of(g.code).unwrap_or("\u{fffd}"));
-                    } else if !removed_text.ends_with(crate::RUN_END) && !removed_text.is_empty() {
-                        removed_text.push(crate::RUN_END);
-                    }
+                    // Embed build (R6b-50, R6b-52): the removed glyphs' text, where they are.
+                    shown.push(if g.hit {
+                        Shown::Removed { text: f.text_of(g.code).unwrap_or("\u{fffd}").to_string(), from: g.from, to: g.to, em: g.em }
+                    } else {
+                        Shown::Kept
+                    });
                     if g.hit {
                         removed += 1;
                         if !run.is_empty() {

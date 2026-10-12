@@ -179,6 +179,24 @@ pub struct Inspection {
     /// added and the fields it filled, those under its own marks by the one under-mark rule
     /// (the host's `addedUnderMarks`).
     pub added_under_marks: AddedUnderMarks,
+    /// Follow-up 9 (R6b-54, N4, N8), rewrites: copies of removed words a redaction cleared that
+    /// no other fact reports.
+    pub copies_cleared: CopiesCleared,
+}
+
+/// Follow-up 9 (R6b-54, N4, N8): what a rewrite took away that held copies of removed words (see
+/// [`Inspection::copies_cleared`]); anything else changed there fails the inspection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CopiesCleared {
+    /// The form's XFA (`/XFA`, and the catalog's `/NeedsRendering`) taken away (0 or 1).
+    pub xfa: u32,
+    /// Annotations (on pages present in both files) that lost text (`/Contents`, `/RC`, `/T`)
+    /// and nothing else.
+    pub annotation_texts: u32,
+    /// Optional-content groups whose name now reads "[Redacted]".
+    pub layer_names: u32,
+    /// Pages whose label lost its prefix and nothing else.
+    pub label_prefixes: u32,
 }
 
 /// Follow-up 9 (R6b-55): what an update adds under its own marks (see
@@ -894,7 +912,8 @@ fn compare(base: &[u8], edited: &[u8], limits: Limits) -> Result<(Inspection, De
             "a destination gives its page by number where this comparison cannot follow it (an action, a named destination with other entries, …), and pages were deleted, moved or inserted".into(),
         ));
     }
-    inspection.labels = labels_followed(&before.structure, &after.structure, &pairs, renumbered)?;
+    (inspection.labels, inspection.copies_cleared.label_prefixes) =
+        labels_followed(&before.structure, &after.structure, &pairs, renumbered, base_kept)?;
     // Follow-up 8 (R6b-51, I1): labels no page shows hold only what the base's labels held.
     if !sorted_subset(&after.structure.labels_past_the_end, &before.structure.label_values) {
         return Err(InspectError::Edited("the page labels name a range past the last page that the base did not have".into()));
@@ -909,6 +928,21 @@ fn compare(base: &[u8], edited: &[u8], limits: Limits) -> Result<(Inspection, De
     inspection.destinations.renamed = count(renamed);
     // The document's layer configuration decides what every page shows.
     let layers_changed = before.structure.layers != after.structure.layers;
+    // Follow-up 9 (R6b-54, N8): in a rewrite, layers' names compared apart: one may only come to
+    // read "[Redacted]".
+    if !base_kept {
+        let (was, is) = (&before.structure.layer_names, &after.structure.layer_names);
+        if was.len() != is.len() {
+            return Err(InspectError::Edited("the optional-content groups changed, which this comparison does not report".into()));
+        }
+        for (was, is) in was.iter().zip(is) {
+            match (was, is) {
+                (a, b) if a == b => {}
+                (Some(_), Some((_, true))) => inspection.copies_cleared.layer_names = inspection.copies_cleared.layer_names.saturating_add(1),
+                _ => return Err(InspectError::Edited("an optional-content group's name changed, which this comparison does not report".into())),
+            }
+        }
+    }
     // The order of each page's annotations (which is on top, the tab order) may not change.
     for &(old, new) in &pairs {
         let (Some(b), Some(e)) = (before.structure.pages.get(old), after.structure.pages.get(new)) else {
@@ -926,6 +960,7 @@ fn compare(base: &[u8], edited: &[u8], limits: Limits) -> Result<(Inspection, De
     inspection.filled_areas.sort_by(|(page_a, a), (page_b, b)| page_a.cmp(page_b).then(b[3].total_cmp(&a[3])).then(a[0].total_cmp(&b[0])));
     let annotations = compare_annotations(&before, &after, &pairs, base_kept, &outside_pages, &mut budget, &mut rasters)?;
     (inspection.annotations, inspection.destinations.links, inspection.applied_areas) = (annotations.changes, annotations.links, annotations.applied);
+    inspection.copies_cleared.annotation_texts = annotations.texts_cleared;
     // Follow-up 8 (P6-33), follow-up 9 (R6b-55): the marks the edited file added (a base's own
     // unapplied mark is its annotation, never counted), each with a usable area and an object
     // of its own, every area in page order, then the marks' order; those with overlays; and
@@ -998,7 +1033,17 @@ fn compare(base: &[u8], edited: &[u8], limits: Limits) -> Result<(Inspection, De
         fields_under_areas(&before.structure, &after.structure, &pairs, &outside_pages, &annotations.applied_exact)
     };
     inspection.form_fields_removed_by_redaction = FieldsRemovedByRedaction { filled: 0, earlier: count(redacted.len()) };
-    inspection.form_fields_changed = fields_changed(&before.structure, &after.structure, &redacted);
+    // Follow-up 9 (R6b-54, N4): a rewrite may take the form's XFA away, the form otherwise as it
+    // was.
+    let xfa_removed =
+        !base_kept && before.structure.xfa && !after.structure.xfa && before.structure.form_without_xfa == after.structure.form_without_xfa;
+    inspection.copies_cleared.xfa = u32::from(
+        xfa_removed
+            || (!base_kept
+                && before.structure.catalog.contains_key(b"NeedsRendering".as_slice())
+                && !after.structure.catalog.contains_key(b"NeedsRendering".as_slice())),
+    );
+    inspection.form_fields_changed = fields_changed(&before.structure, &after.structure, &redacted, xfa_removed);
     if let Some(message) = after.unreached {
         return Err(InspectError::Edited(message));
     }
@@ -1025,15 +1070,34 @@ fn sorted_subset<T: Ord>(part: &[T], whole: &[T]) -> bool {
 
 /// Whether each page present in both files kept its label (see [`PageLabelChanges`]), and how
 /// many of them at another page number. `renumbered`: a page was deleted, moved or inserted.
-fn labels_followed(before: &Structure, after: &Structure, pairs: &Pairs, renumbered: bool) -> Result<PageLabelChanges, InspectError> {
+fn labels_followed(
+    before: &Structure,
+    after: &Structure,
+    pairs: &Pairs,
+    renumbered: bool,
+    base_kept: bool,
+) -> Result<(PageLabelChanges, u32), InspectError> {
     use structure::PageLabels;
     match (&before.page_labels, &after.page_labels) {
         (PageLabels::Read(base), PageLabels::Read(edited)) => {
             let mut followed = 0usize;
+            let mut cleared = 0usize;
             for &(old, new) in pairs {
                 let (Some(was), Some(is)) = (base.get(old), edited.get(new)) else {
                     return Err(InspectError::Edited("a page went missing".into()));
                 };
+                // Follow-up 9 (R6b-54, N8): a rewrite may take a prefix holding a removed word
+                // away, the label otherwise as it was.
+                if let (Some(was), Some(is)) = (was, is)
+                    && !base_kept
+                    && was.prefix.is_some()
+                    && is.prefix.is_none()
+                    && (was.style, was.number) == (is.style, is.number)
+                {
+                    cleared += 1;
+                    followed += usize::from(old != new);
+                    continue;
+                }
                 if was != is {
                     return Err(InspectError::Edited(format!(
                         "page {}'s label changed (its page labels did not follow it), which this comparison does not report",
@@ -1042,10 +1106,10 @@ fn labels_followed(before: &Structure, after: &Structure, pairs: &Pairs, renumbe
                 }
                 followed += usize::from(old != new && was.is_some());
             }
-            Ok(PageLabelChanges { followed: count(followed) })
+            Ok((PageLabelChanges { followed: count(followed) }, count(cleared)))
         }
         // Compared whole: unchanged, and every page where it was.
-        _ if !renumbered && before.page_labels_digest == after.page_labels_digest => Ok(PageLabelChanges::default()),
+        _ if !renumbered && before.page_labels_digest == after.page_labels_digest => Ok((PageLabelChanges::default(), 0)),
         _ => {
             Err(InspectError::Edited("the page labels changed, or cannot be compared page by page and pages were deleted, moved or inserted".into()))
         }
@@ -2614,14 +2678,15 @@ fn fields_under_areas(
         .collect()
 }
 
-fn fields_changed(before: &Structure, after: &Structure, redacted: &BTreeSet<String>) -> u32 {
+fn fields_changed(before: &Structure, after: &Structure, redacted: &BTreeSet<String>, xfa_removed: bool) -> u32 {
     let names: BTreeSet<&String> = before.fields.keys().chain(after.fields.keys()).filter(|name| !redacted.contains(*name)).collect();
     let fields = names.into_iter().filter(|name| before.fields.get(*name) != after.fields.get(*name)).count();
     // The fields' order (`/Fields`, and each field's `/Kids`): their navigation and calculation
     // order in some viewers; a change counts as the form's own (the fields a redaction took away
     // left out of the base's).
     let base_order: Vec<&String> = before.field_order.iter().filter(|name| !redacted.contains(*name)).collect();
-    let form_changed = before.form != after.form || base_order != after.field_order.iter().collect::<Vec<_>>();
+    let form_same = before.form == after.form || (xfa_removed && before.form_without_xfa == after.form_without_xfa);
+    let form_changed = !form_same || base_order != after.field_order.iter().collect::<Vec<_>>();
     count(fields).saturating_add(u32::from(form_changed))
 }
 
@@ -2650,6 +2715,8 @@ struct AnnotationOutcome {
     /// The edited file's annotations the base does not have, as (page index, position in the
     /// page's annotations).
     added: BTreeSet<(usize, usize)>,
+    /// Follow-up 9 (R6b-54, N8): annotations that lost text and nothing else (rewrites).
+    texts_cleared: u32,
 }
 
 /// The annotations compared, and how many links' destinations followed their page.
@@ -2664,6 +2731,7 @@ fn compare_annotations(
 ) -> Result<AnnotationOutcome, InspectError> {
     let mut changes = AnnotationChanges::default();
     let mut links = 0u32;
+    let mut texts_cleared = 0u32;
     let to_edited: HashMap<usize, usize> = pairs.iter().copied().collect();
     let pages: BTreeMap<usize, usize> = pairs.iter().copied().collect();
     // A link's destination may change only by following its page (R6b-32).
@@ -2727,6 +2795,22 @@ fn compare_annotations(
                             break;
                         }
                         Err(_) => retargeted = true,
+                    }
+                }
+                // Follow-up 9 (R6b-54, N8): in a rewrite, the same annotation but for text taken
+                // away (each text it keeps is the base's).
+                if found.is_none() && !base_kept {
+                    for (position, (_, other)) in list.iter().enumerate() {
+                        budget.tick().map_err(|fail| fail.of(Role::Edited))?;
+                        if other.untexted == annot.untexted
+                            && other.texts.len() < annot.texts.len()
+                            && other.texts.iter().all(|text| annot.texts.contains(text))
+                            && let Ok(moved) = link_moved(annot, other)
+                        {
+                            found = Some((position, moved));
+                            texts_cleared = texts_cleared.saturating_add(1);
+                            break;
+                        }
                     }
                 }
                 if let Some((position, moved)) = found {
@@ -2839,7 +2923,7 @@ fn compare_annotations(
             "the structure tree keeps text standing for an annotation the rewrite took away, which this comparison does not report".into(),
         ));
     }
-    Ok(AnnotationOutcome { changes, links, applied, applied_exact, added })
+    Ok(AnnotationOutcome { changes, links, applied, applied_exact, added, texts_cleared })
 }
 
 #[cfg(test)]

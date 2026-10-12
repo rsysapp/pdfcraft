@@ -259,7 +259,14 @@ pub(crate) struct Annot {
     /// Follow-up 9 (R6b-55, P6-40 (d)): the annotation this one belongs to: its `/IRT` (a
     /// reply), or for a pop-up its `/Parent`. A redaction removing that one removes this one too.
     pub reply_to: Option<ObjRef>,
+    /// Follow-up 9 (R6b-54, N8): the dictionary (as `digest`) without its text (`/Contents`,
+    /// `/RC`, `/T`), and that text by key: a redaction may take text holding a removed word away.
+    pub untexted: Digest,
+    pub texts: Vec<(Vec<u8>, Digest)>,
 }
+
+/// Follow-up 9 (R6b-54, N8): an annotation's text a redaction may clear.
+pub(crate) const ANNOTATION_TEXT_KEYS: [&[u8]; 3] = [b"Contents", b"RC", b"T"];
 
 /// What one page is, as far as the comparison goes.
 pub(crate) struct PageFacts {
@@ -617,6 +624,12 @@ pub(crate) struct Structure {
     pub fields: BTreeMap<String, Digest>,
     /// The `/AcroForm` dictionary without `/Fields`.
     pub form: Option<Digest>,
+    /// Follow-up 9 (R6b-54, N4): the same without `/XFA` either, and whether it has `/XFA`.
+    pub form_without_xfa: Option<Digest>,
+    pub xfa: bool,
+    /// Follow-up 9 (R6b-54, N8), rewrites: each optional-content group's `/Name` (its digest),
+    /// in `/OCGs` order (compared apart from the groups, which a rewrite digests without it).
+    pub layer_names: Vec<Option<(Digest, bool)>>,
     /// Each terminal field's full name, in the order `/Fields` and the fields' `/Kids` give.
     pub field_order: Vec<String>,
     /// Catalog entries not reported otherwise, by key.
@@ -692,7 +705,7 @@ pub(crate) fn catalog_change(before: &Structure, after: &Structure, base_kept: b
     keys.into_iter()
         .find(|key| {
             let (was, is) = (before.catalog.get(*key), after.catalog.get(*key));
-            was != is && !(!base_kept && key.as_slice() == b"Metadata" && is.is_none())
+            was != is && !(!base_kept && matches!(key.as_slice(), b"Metadata" | b"NeedsRendering") && is.is_none())
         })
         .map(|key| String::from_utf8_lossy(key).into_owned())
 }
@@ -1198,6 +1211,13 @@ struct Reader<'d, 'b> {
     shows_text: bool,
     /// Each terminal field's widgets (see [`Structure::field_places`]).
     field_widgets: BTreeMap<String, Vec<ObjRef>>,
+    /// Follow-up 9 (R6b-54, N8): a rewrite's comparison: an optional-content group is digested
+    /// without its `/Name` (a redaction may clear it; the names are compared apart, see
+    /// [`Structure::layer_names`]).
+    names_apart: bool,
+    /// Follow-up 9 (R6b-54, N8): each group's place in `/OCGs`, its identity where names are
+    /// compared apart.
+    ocg_index: Arc<HashMap<ObjRef, usize>>,
 }
 
 /// Follow-up 8 (R6b-51, C1): the base's content streams, by their decoded data's digest, and
@@ -1663,7 +1683,17 @@ impl<'d, 'b> Reader<'d, 'b> {
             BACK_REFERENCES.contains(&key)
                 && matches!(value, Object::Ref(_) | Object::Int(_) | Object::Real(_) | Object::Name(_) | Object::Bool(_) | Object::Null)
         };
-        let mut entries: Vec<(&Vec<u8>, &Object)> = d.iter().filter(|(key, value)| !back_reference(key, value)).collect();
+        // Follow-up 9 (R6b-54, N8): in a rewrite, a layer's name is compared apart; the group
+        // is known by its place in `/OCGs` in its stead (so groups alike but for their names
+        // stay apart).
+        let name_key = b"Name".to_vec();
+        let ocg_place = (self.names_apart && d.name(b"Type") == Some(b"OCG"))
+            .then(|| self.stack.last().and_then(|r| self.ocg_index.get(r)).map_or(Object::Null, |place| Object::Int(*place as i64)));
+        let mut entries: Vec<(&Vec<u8>, &Object)> =
+            d.iter().filter(|(key, value)| !(back_reference(key, value) || ocg_place.is_some() && key.as_slice() == b"Name")).collect();
+        if let Some(place) = &ocg_place {
+            entries.push((&name_key, place));
+        }
         entries.sort_by(|a, b| a.0.cmp(b.0));
         // Follow-up 8 (R6b-51, M4): PDFium takes a number first in a destination for a page
         // index whatever view follows (`[2]`, `[2 /Unknown]`): any such array where a
@@ -2995,7 +3025,31 @@ impl<'d, 'b> Reader<'d, 'b> {
                 _ if subtype == b"Popup" => dict.get(b"Parent").and_then(Object::as_ref),
                 _ => None,
             };
-            annots.push(Annot { id, subtype, digest, tracked: !widget && !silent_popup, areas, bare, rect, link, overlay, reply_to });
+            let untexted = match dest_key {
+                Some(key) => self.digest_without(&dict, &[b"Contents", b"RC", b"T", key])?,
+                None if subtype == b"Link" => sha256(&[b"link", &self.digest_without(&dict, &[b"Contents", b"RC", b"T"])?]),
+                None => self.digest_without(&dict, &[b"Contents", b"RC", b"T"])?,
+            };
+            let mut texts = Vec::new();
+            for key in ANNOTATION_TEXT_KEYS {
+                if let Some(value) = dict.get(key) {
+                    texts.push((key.to_vec(), self.digest(value)?));
+                }
+            }
+            annots.push(Annot {
+                id,
+                subtype,
+                digest,
+                tracked: !widget && !silent_popup,
+                areas,
+                bare,
+                rect,
+                link,
+                overlay,
+                reply_to,
+                untexted,
+                texts,
+            });
         }
         Ok((annots, in_array))
     }
@@ -4027,6 +4081,9 @@ fn section(data: &[u8], offset: u64, is_stream: bool) -> Result<Section, Fail> {
 /// objects were checked to sit where the cross-reference data says, the digests made, and the
 /// image XObjects read.
 pub(crate) struct Known {
+    /// See `Reader::names_apart`.
+    names_apart: bool,
+    ocg_index: Arc<HashMap<ObjRef, usize>>,
     checked: HashMap<u32, u16>,
     /// See `Reader::facts`.
     facts: HashSet<u32>,
@@ -4501,6 +4558,8 @@ impl Known {
             content_base: ContentBase::default(),
             shows_text: false,
             field_widgets: BTreeMap::new(),
+            names_apart: self.names_apart,
+            ocg_index: self.ocg_index.clone(),
         }
     }
 
@@ -4641,7 +4700,10 @@ pub(crate) fn read(
 ) -> Result<(Structure, Known), Fail> {
     let tolerated = Arc::new(tolerated);
     let data = doc.bytes().as_slice();
+    let names_apart = !matches!(content_rule, ContentRule::None);
     let mut reader = Reader {
+        names_apart,
+        ocg_index: Arc::new(HashMap::new()),
         doc,
         data,
         budget,
@@ -4670,14 +4732,46 @@ pub(crate) fn read(
     };
     let Some(root) = doc.root() else { return Err(read_error("the trailer's /Root is not a reference")) };
     let catalog = reader.get(root)?.as_dict().cloned().ok_or_else(|| read_error("the catalog is not a dictionary"))?;
+    if names_apart && let Some(properties) = reader.dict_of(catalog.get(b"OCProperties"), "/OCProperties")? {
+        let mut places = HashMap::new();
+        for group in reader.array_of(properties.get(b"OCGs"), "/OCGs")? {
+            if let Object::Ref(r) = group {
+                let next = places.len();
+                places.entry(r).or_insert(next);
+            }
+        }
+        reader.ocg_index = Arc::new(places);
+    }
     // The page tree first: the page bound is checked before any per-page work.
     let (nodes, page_tree_entries) = reader.page_tree(&catalog)?;
     let mut widgets = BTreeSet::new();
-    let ((fields, field_order), form) = match reader.dict_of(catalog.get(b"AcroForm"), "/AcroForm")? {
-        Some(form) => (reader.fields(&form, &mut widgets)?, Some(reader.digest_without(&form, &[b"Fields"])?)),
-        None => ((BTreeMap::new(), Vec::new()), None),
+    let ((fields, field_order), form, form_without_xfa, xfa) = match reader.dict_of(catalog.get(b"AcroForm"), "/AcroForm")? {
+        Some(form) => (
+            reader.fields(&form, &mut widgets)?,
+            Some(reader.digest_without(&form, &[b"Fields"])?),
+            Some(reader.digest_without(&form, &[b"Fields", b"XFA"])?),
+            form.contains(b"XFA"),
+        ),
+        None => ((BTreeMap::new(), Vec::new()), None, None, false),
     };
     let layers = catalog.get(b"OCProperties").map(|layers| reader.digest(layers)).transpose()?;
+    let mut layer_names = Vec::new();
+    if names_apart && let Some(properties) = reader.dict_of(catalog.get(b"OCProperties"), "/OCProperties")? {
+        for group in reader.array_of(properties.get(b"OCGs"), "/OCGs")? {
+            reader.budget.tick()?;
+            let name = match reader.dict_of(Some(&group), "an optional-content group")? {
+                Some(group) => match group.get(b"Name") {
+                    Some(name) => {
+                        let redacted = matches!(&*reader.resolve(name)?, Object::String(text) if text.to_text() == "[Redacted]");
+                        Some((reader.digest(name)?, redacted))
+                    }
+                    None => None,
+                },
+                None => None,
+            };
+            layer_names.push(name);
+        }
+    }
     let (structure_tree, structure_links) = reader.structure_tree(&catalog)?;
     let layer_config = reader.layer_config(&catalog)?;
     let page_index: HashMap<ObjRef, usize> = nodes.iter().enumerate().map(|(index, node)| (node.obj, index)).collect();
@@ -4730,6 +4824,8 @@ pub(crate) fn read(
         .map(|(name, widgets)| (name, widgets.iter().filter_map(|widget| widget_places.get(widget).copied()).collect()))
         .collect();
     let known = Known {
+        names_apart,
+        ocg_index: reader.ocg_index.clone(),
         checked: reader.checked,
         facts: reader.facts,
         object_streams: reader.object_streams,
@@ -4749,6 +4845,9 @@ pub(crate) fn read(
             pages,
             fields,
             form,
+            form_without_xfa,
+            xfa,
+            layer_names,
             field_order,
             catalog: entries,
             layers,

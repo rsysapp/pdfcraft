@@ -16,6 +16,8 @@
 
 use pdfcraft_cos::{Dict, Document, ObjRef, Object, Stream};
 
+// Embed build (R6b-52, R6b-54): copies of the removed words elsewhere in the document.
+mod copies;
 // Embed build (R6b-54, N1): paths cut exactly along the regions.
 mod geometry;
 mod image;
@@ -283,6 +285,13 @@ pub struct Report {
     /// Embed build (R6b-55): the form fields removed whole (a widget under a mark), by full
     /// name.
     pub removed_fields: Vec<String>,
+    /// Embed build (R6b-54, N4, N8): the form's XFA removed (0 or 1); annotations whose text
+    /// (`/Contents`, `/RC`, `/T`) held a removed word, cleared; optional-content groups whose
+    /// name held one, renamed "[Redacted]"; page-label prefixes holding one, removed.
+    pub xfa_removed: usize,
+    pub annotation_texts_cleared: usize,
+    pub layer_names_cleared: usize,
+    pub label_prefixes_cleared: usize,
     /// Embed build (R6b-54, N6): the most the cleared pixels of an image reach past the marks,
     /// in user space: the larger side of the largest cleared image pixel (0 without one). Every
     /// pixel a mark reaches is cleared whole, so a coarse image's cleared pixels overhang it.
@@ -530,6 +539,7 @@ fn apply_chosen(doc: &mut Document, chosen_by: &dyn Fn(&Mark) -> bool, options: 
             scope.exact = options.exact;
             let out = process(doc, &mut scope, &data, &resources, pdfcraft_content::Matrix::IDENTITY);
             removed_text.push_str(&scope.removed_text);
+            removed_text.push(RUN_END);
             // Embed build (R6b-54, N6): for a host, the cleared pixels reaching past the marks
             // are boxed too, black whatever the image's colour space renders its black as.
             if options.black {
@@ -768,7 +778,7 @@ fn apply_chosen(doc: &mut Document, chosen_by: &dyn Fn(&Mark) -> bool, options: 
     }
     // Embed build (R6b-50): copies of the removed words elsewhere in the document.
     if options.document_copies {
-        clear_copies(doc, &removed_words(&removed_text), &mut report, &work)?;
+        copies::clear(doc, &copies::Removed::from_text(&removed_text), &mut report, &work)?;
         spent(&work)?;
     }
     // The previous revision still holds the removed content: the next save must rewrite.
@@ -910,194 +920,4 @@ fn remove_threads(doc: &mut Document, removed: &mut std::collections::HashSet<Ob
     }
     gone.sort();
     Ok(gone)
-}
-
-/// Embed build (R6b-50): what a copy of the removed text elsewhere could hold: each run of
-/// removed glyphs whole (three characters or more), and each word of it of five characters or
-/// more (shorter words are in too many unrelated titles: "Page" when "Page 4" is redacted),
-/// compared without case.
-pub(crate) fn removed_words(text: &str) -> Vec<String> {
-    let mut words: Vec<String> = Vec::new();
-    let mut add = |word: &str, least: usize| {
-        let word = word.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
-        if word.chars().filter(|c| c.is_alphanumeric()).count() >= least && !words.contains(&word) {
-            words.push(word);
-        }
-    };
-    for run in text.split(RUN_END) {
-        add(run, 3);
-        for word in run.split(|c: char| !c.is_alphanumeric() && c != '-' && c != '\'') {
-            add(word, 5);
-        }
-    }
-    words
-}
-
-fn holds_word(text: &str, words: &[String]) -> bool {
-    let text = text.to_lowercase();
-    words.iter().any(|word| text.contains(word.as_str()))
-}
-
-/// Embed build (R6b-50): clear the copies of the removed `words` elsewhere in the document:
-/// bookmark titles holding one read "[Redacted]", document information entries holding one go,
-/// the document's XMP packet goes, and named destinations whose name holds one are renamed
-/// (with every destination naming them).
-fn clear_copies(doc: &mut Document, words: &[String], report: &mut Report, work: &interp::Work) -> Result<(), RedactError> {
-    let Some(root) = doc.root() else { return Ok(()) };
-    let mut catalog = doc.get(root).as_dict().cloned().unwrap_or_default();
-    if catalog.remove(b"Metadata").is_some() {
-        report.metadata_removed = 1;
-        doc.set(root, Object::Dict(catalog.clone()));
-    }
-    if words.is_empty() {
-        return Ok(());
-    }
-    // Bookmarks: depth first, bounded.
-    let mut todo: Vec<Object> =
-        catalog.get(b"Outlines").and_then(|o| doc.resolve(o).as_dict().and_then(|d| d.get(b"First").cloned())).into_iter().collect();
-    let mut seen: std::collections::HashSet<ObjRef> = std::collections::HashSet::new();
-    while let Some(entry) = todo.pop() {
-        work.charge(words.len().max(1));
-        if work.spent() {
-            return Err(RedactError::TooComplex);
-        }
-        let Some(r) = entry.as_ref() else { continue };
-        if seen.len() > 100_000 || !seen.insert(r) {
-            continue;
-        }
-        let Some(item) = doc.get(r).as_dict().cloned() else { continue };
-        if item.get(b"Title").and_then(|t| doc.resolve(t).as_string().map(|s| s.to_text())).is_some_and(|title| holds_word(&title, words)) {
-            doc.update_dict(r, |d| d.set(b"Title".to_vec(), Object::String(pdfcraft_cos::PdfString::text("[Redacted]"))))?;
-            report.bookmarks_cleared += 1;
-        }
-        todo.extend(item.get(b"Next").cloned());
-        todo.extend(item.get(b"First").cloned());
-    }
-    // The document information.
-    if let Some(info) = doc.trailer().get(b"Info").and_then(Object::as_ref)
-        && let Some(dict) = doc.get(info).as_dict().cloned()
-    {
-        let doomed: Vec<Vec<u8>> = dict
-            .iter()
-            .filter(|(_, value)| doc.resolve(value).as_string().is_some_and(|s| holds_word(&s.to_text(), words)))
-            .map(|(key, _)| key.clone())
-            .collect();
-        if !doomed.is_empty() {
-            doc.update_dict(info, |d| {
-                for key in &doomed {
-                    d.remove(key);
-                }
-            })?;
-            report.information_cleared += doomed.len();
-        }
-    }
-    // Named destinations in the catalog's /Dests (by name) and the /Names /Dests tree (by
-    // string): renamed to opaque names, and what names them follows.
-    let mut renames: Vec<(Object, Object)> = Vec::new();
-    if let Some(dests_ref) = catalog.get(b"Dests").cloned()
-        && let Some(mut dests) = doc.resolve(&dests_ref).as_dict().cloned()
-    {
-        let names: Vec<Vec<u8>> = dests.iter().map(|(key, _)| key.clone()).filter(|key| holds_word(&String::from_utf8_lossy(key), words)).collect();
-        for (index, name) in names.into_iter().enumerate() {
-            let fresh = format!("PCRedactedDest{}", report.destinations_renamed + index + 1).into_bytes();
-            if let Some(value) = dests.remove(&name) {
-                dests.set(fresh.clone(), value);
-                renames.push((Object::Name(name), Object::Name(fresh)));
-            }
-        }
-        report.destinations_renamed += renames.len();
-        match dests_ref {
-            Object::Ref(r) => doc.set(r, Object::Dict(dests)),
-            _ => {
-                catalog.set(b"Dests".to_vec(), Object::Dict(dests));
-                doc.set(root, Object::Dict(catalog.clone()));
-            }
-        }
-    }
-    if let Some(tree) = catalog.get(b"Names").and_then(|n| doc.resolve(n).as_dict().cloned()).and_then(|n| n.get(b"Dests").and_then(Object::as_ref)) {
-        rename_in_tree(doc, tree, words, &mut renames, report, 0)?;
-    }
-    if renames.is_empty() {
-        return Ok(());
-    }
-    // Every destination naming a renamed one: links' and bookmarks' /Dest, go-to actions' /D.
-    let numbers: Vec<u32> = doc.object_numbers();
-    for num in numbers {
-        work.charge(1);
-        if work.spent() {
-            return Err(RedactError::TooComplex);
-        }
-        let r = ObjRef::new(num, 0);
-        let Some(dict) = doc.get(r).as_dict().cloned() else { continue };
-        let mut changed = dict.clone();
-        let mut touched = false;
-        for key in [&b"Dest"[..], b"D"] {
-            if let Some(value) = dict.get(key)
-                && let Some((_, fresh)) = renames.iter().find(|(old, _)| old == value)
-            {
-                changed.set(key.to_vec(), fresh.clone());
-                touched = true;
-            }
-        }
-        if let Some(Object::Dict(action)) = dict.get(b"A")
-            && let Some(value) = action.get(b"D")
-            && let Some((_, fresh)) = renames.iter().find(|(old, _)| old == value)
-        {
-            let mut action = action.clone();
-            action.set(b"D".to_vec(), fresh.clone());
-            changed.set(b"A".to_vec(), Object::Dict(action));
-            touched = true;
-        }
-        if touched {
-            doc.set(r, Object::Dict(changed));
-        }
-    }
-    Ok(())
-}
-
-/// The `/Names /Dests` tree's leaves under `node`: a name holding a removed word renamed.
-fn rename_in_tree(
-    doc: &mut Document,
-    node: ObjRef,
-    words: &[String],
-    renames: &mut Vec<(Object, Object)>,
-    report: &mut Report,
-    depth: usize,
-) -> Result<(), RedactError> {
-    if depth > 32 {
-        return Ok(());
-    }
-    let Some(mut dict) = doc.get(node).as_dict().cloned() else { return Ok(()) };
-    if let Some(Object::Array(mut pairs)) = dict.get(b"Names").map(|n| (*doc.resolve(n)).clone()) {
-        let mut touched = false;
-        for pair in pairs.chunks_mut(2) {
-            if let Some(Object::String(name)) = pair.first()
-                && holds_word(&name.to_text(), words)
-            {
-                report.destinations_renamed += 1;
-                let fresh = Object::String(pdfcraft_cos::PdfString::literal(format!("PCRedactedDest{}", report.destinations_renamed).into_bytes()));
-                renames.push((pair[0].clone(), fresh.clone()));
-                pair[0] = fresh;
-                touched = true;
-            }
-        }
-        if touched {
-            // Keys must stay in order for a viewer's lookup: sorted again, with /Limits.
-            let mut sorted: Vec<(Object, Object)> = pairs.chunks(2).filter_map(|p| Some((p.first()?.clone(), p.get(1)?.clone()))).collect();
-            sorted.sort_by(|a, b| a.0.as_string().map(|s| s.bytes.clone()).cmp(&b.0.as_string().map(|s| s.bytes.clone())));
-            if let (Some(first), Some(last)) = (sorted.first().map(|p| p.0.clone()), sorted.last().map(|p| p.0.clone()))
-                && dict.contains(b"Limits")
-            {
-                dict.set(b"Limits".to_vec(), Object::Array(vec![first, last]));
-            }
-            dict.set(b"Names".to_vec(), Object::Array(sorted.into_iter().flat_map(|(k, v)| [k, v]).collect()));
-            doc.set(node, Object::Dict(dict.clone()));
-        }
-    }
-    let kids: Vec<ObjRef> =
-        dict.get(b"Kids").and_then(|k| doc.resolve(k).as_array().map(|a| a.iter().filter_map(Object::as_ref).collect())).unwrap_or_default();
-    for kid in kids {
-        rename_in_tree(doc, kid, words, renames, report, depth + 1)?;
-    }
-    Ok(())
 }

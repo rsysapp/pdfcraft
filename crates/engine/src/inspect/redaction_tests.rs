@@ -1104,3 +1104,166 @@ fn the_geometry_self_check_reads_every_point_a_path_has_under_a_mark() {
         assert!(matches!(apply::left_under_marks(&forged, &applied.facts.areas, applied.facts.overhang), Err(ApplyError::SelfCheck(_))), "{case}");
     }
 }
+
+// ── R6b-52, R6b-54 N3, N4, N5, N7, N8: copies of the removed words ─────────────────────────────
+
+/// A page showing `line` (then "Keep"), with a bookmark titled `title` and document information
+/// whose author is `author`.
+fn with_copies(line: &str, title: &str, author: &str) -> Vec<u8> {
+    Spec {
+        cat: "/Outlines 6 0 R".into(),
+        trailer: "/Info 8 0 R".into(),
+        extras: vec![
+            b"<< /Type /Outlines /First 7 0 R /Last 7 0 R /Count 1 >>".to_vec(),
+            format!("<< /Title ({title}) /Parent 6 0 R /Dest [3 0 R /Fit] >>").into_bytes(),
+            format!("<< /Author ({author}) /Title (Contract) >>").into_bytes(),
+        ],
+        ..Spec::new(&format!("{line}\n{KEEP}"))
+    }
+    .build()
+}
+
+#[test]
+fn copies_of_short_names_kerned_words_and_accented_words_are_cleared() {
+    // R6b-52, R6b-54 N5 (redaction re-review N5): the removed text read as an extractor reads it
+    // (words apart at TJ gaps, glyph by glyph shows joined), folded (NFKC, diacritics, case) on
+    // both sides; tokens of three letters or more, but function words, and every phrase.
+    let wide = [[16.0, 144.0, 190.0, 166.0]];
+    for (case, line, title, author, gone) in [
+        ("a short name", "BT /F1 12 Tf 20 150 Td (Andi) Tj ET", "Agreement with Andi", "Andi", "Andi"),
+        ("a title and a name", "BT /F1 12 Tf 20 150 Td (Mr Andi) Tj ET", "Andi", "Andi", "Andi"),
+        ("two names", "BT /F1 12 Tf 20 150 Td (Andi Wijaya) Tj ET", "Andi", "Andi", "Andi"),
+        ("kerned words", "BT /F1 12 Tf 20 150 Td [(Andi) -333 (Wijaya)] TJ ET", "Andi Wijaya", "Andi Wijaya", "Andi"),
+        (
+            "a glyph a show",
+            "BT /F1 12 Tf 20 150 Td (W) Tj 11 0 Td (i) Tj 3 0 Td (j) Tj 3 0 Td (a) Tj 7 0 Td (y) Tj 6 0 Td (a) Tj ET",
+            "Wijaya",
+            "Wijaya",
+            "Wijaya",
+        ),
+        ("a company", "BT /F1 12 Tf 20 150 Td (PT Budi SA) Tj ET", "PT Budi SA", "Budi", "Budi"),
+        ("accents", "BT /F1 12 Tf 20 150 Td (Jos\\351 Garc\\355a) Tj ET", "Jose Garcia", "Jose", "Jose"),
+    ] {
+        let base = with_copies(line, title, author);
+        let applied = apply(&base, &marked(&base, &wide)).unwrap_or_else(|error| panic!("{case}: {error:?}"));
+        assert!(found(&applied.bytes, gone).is_empty(), "{case}: {:?}", found(&applied.bytes, gone));
+        assert_eq!((applied.facts.bookmarks_cleared, applied.facts.information_cleared), (1, 1), "{case}: {:?}", applied.facts);
+    }
+    // A function word alone clears no unrelated title, nor do two letters.
+    for (line, title) in [("BT /F1 12 Tf 20 150 Td (the) Tj ET", "Other terms"), ("BT /F1 12 Tf 20 150 Td (AB) Tj ET", "AB Holdings")] {
+        let base = with_copies(line, title, "Someone");
+        let applied = apply(&base, &marked(&base, &wide)).unwrap();
+        assert!(!found(&applied.bytes, title).is_empty(), "{title}");
+        assert_eq!(applied.facts.bookmarks_cleared, 0);
+    }
+}
+
+#[test]
+fn text_without_unicode_under_a_mark_is_refused_where_copies_could_hold_it() {
+    // R6b-54 N5 (`copies-no-unicode`): removed glyphs that read as nothing cannot be looked for
+    // in the bookmarks and document information: refused by its reason.
+    let mut spec = Spec {
+        fonts: "/F2 9 0 R".into(),
+        cat: "/Outlines 6 0 R".into(),
+        trailer: "/Info 8 0 R".into(),
+        extras: vec![
+            b"<< /Type /Outlines /First 7 0 R /Last 7 0 R /Count 1 >>".to_vec(),
+            b"<< /Title (SECRETWORD) /Parent 6 0 R /Dest [3 0 R /Fit] >>".to_vec(),
+            b"<< /Author (SECRETWORD) >>".to_vec(),
+            format!("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding << /Type /Encoding /Differences [65 /g1 /g2 /g3 /g4 /g5 /g6 /g7 /g8 /g9 /g10] >> /FirstChar 32 /LastChar 126 /Widths [{HELV_WIDTHS}] >>").into_bytes(),
+        ],
+        ..Spec::new(&format!("BT /F2 12 Tf 20 150 Td (ABCDEFGHIJ) Tj ET\n{KEEP}"))
+    };
+    let base = spec.build();
+    assert_eq!(apply(&base, &marked(&base, &[BOX])).map(|_| ()), Err(ApplyError::Refused(Refusal::UnreadableMarkedText)));
+    // Without copies anywhere, it is applied.
+    spec.cat.clear();
+    spec.trailer.clear();
+    let base = spec.build();
+    assert!(apply(&base, &marked(&base, &[BOX])).is_ok());
+}
+
+#[test]
+fn a_destination_named_by_a_hex_string_follows_its_renamed_name() {
+    // R6b-54 N3 (`dest-tree-hex-link`): names matched by their bytes (a hex string alike), the
+    // tree written again in order, and every link still going where it went.
+    let base = Spec {
+        cat: "/Names << /Dests 6 0 R >>".into(),
+        page: "/Annots [9 0 R]".into(),
+        extras: vec![
+            b"<< /Kids [7 0 R 8 0 R] >>".to_vec(),
+            b"<< /Limits [(Alpha) (SECRETWORD)] /Names [(Alpha) [3 0 R /Fit] (SECRETWORD) [3 0 R /Fit]] >>".to_vec(),
+            b"<< /Limits [(Zeta) (Zulu)] /Names [(Zeta) [3 0 R /Fit] (Zulu) [3 0 R /Fit]] >>".to_vec(),
+            b"<< /Type /Annot /Subtype /Link /Rect [150 10 170 30] /Border [0 0 0] /Dest <534543524554574F5244> >>".to_vec(),
+        ],
+        ..Spec::new(&format!("{LINE}\n{KEEP}"))
+    }
+    .build();
+    let applied = apply(&base, &marked(&base, &[BOX])).unwrap();
+    assert!(found(&applied.bytes, SECRET).is_empty(), "{:?}", found(&applied.bytes, SECRET));
+    assert_eq!((applied.facts.destinations_renamed, applied.inspection.destinations.renamed), (1, 1));
+    // A fresh name is no name already in use.
+    let base = Spec {
+        cat: "/Dests << /SECRETWORD [3 0 R /Fit] /PCRedactedDest1 [3 0 R /FitH 100] >>".into(),
+        page: "/Annots [6 0 R 7 0 R]".into(),
+        extras: vec![
+            b"<< /Type /Annot /Subtype /Link /Rect [150 10 170 30] /Border [0 0 0] /Dest /SECRETWORD >>".to_vec(),
+            b"<< /Type /Annot /Subtype /Link /Rect [150 40 170 60] /Border [0 0 0] /Dest /PCRedactedDest1 >>".to_vec(),
+        ],
+        ..Spec::new(&format!("{LINE}\n{KEEP}"))
+    }
+    .build();
+    let applied = apply(&base, &marked(&base, &[BOX])).unwrap();
+    assert!(found(&applied.bytes, SECRET).is_empty());
+}
+
+#[test]
+fn the_xfa_copy_of_a_field_goes_with_any_redaction() {
+    // R6b-54 N4 (`xfa-datasets`): a removed field's value stays in the XFA datasets: any applied
+    // redaction removes /XFA (reported as a copy cleared).
+    let base = Spec {
+        cat: "/AcroForm << /Fields [6 0 R] /DA (/Helv 0 Tf 0 g) /XFA [(datasets) 8 0 R] >>".into(),
+        page: "/Annots [6 0 R]".into(),
+        extras: vec![
+            b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (f1) /V (FIELDVALUE) /Rect [20 146 100 164] /P 3 0 R /AP << /N 7 0 R >> >>".to_vec(),
+            stream("/Type /XObject /Subtype /Form /BBox [0 0 80 20] /Resources << /Font << /F1 5 0 R >> >>", b"/Tx BMC BT /F1 10 Tf 2 5 Td (FIELDVALUE) Tj ET EMC"),
+            stream("", b"<xfa:datasets xmlns:xfa='http://www.xfa.org/schema/xfa-data/1.0/'><xfa:data><form><f1>FIELDVALUE</f1></form></xfa:data></xfa:datasets>"),
+        ],
+        ..Spec::new(&format!("{LINE}\n{KEEP}"))
+    }
+    .build();
+    let applied = apply(&base, &marked(&base, &[BOX])).unwrap();
+    assert!(found(&applied.bytes, "FIELDVALUE").is_empty(), "{:?}", found(&applied.bytes, "FIELDVALUE"));
+    assert_eq!(applied.facts.xfa_removed, 1);
+}
+
+#[test]
+fn xmp_and_other_copies_holding_a_removed_word_are_cleared() {
+    // R6b-54 N7, N8 (`xmp-on-image-elsewhere`, `other-copies`): an image's XMP elsewhere, a
+    // comment's text and author, a layer's name and a page-label prefix holding the removed word.
+    let pixel = stream("/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Metadata 7 0 R", &[7]);
+    let xmp = stream("/Type /Metadata /Subtype /XML", b"<x:xmpmeta>SECRETWORD</x:xmpmeta>");
+    let base = Spec {
+        res: "/XObject << /Im1 6 0 R >>".into(),
+        extras: vec![pixel, xmp],
+        ..Spec::new(&format!("{LINE}\nq 10 0 0 10 150 20 cm /Im1 Do Q\n{KEEP}"))
+    }
+    .build();
+    let applied = apply(&base, &marked(&base, &[BOX])).unwrap();
+    assert!(found(&applied.bytes, SECRET).is_empty(), "{:?}", found(&applied.bytes, SECRET));
+    let base = Spec {
+        res: "/Properties << /L1 6 0 R >>".into(),
+        cat: "/OCProperties << /OCGs [6 0 R] /D << /ON [6 0 R] >> >> /PageLabels << /Nums [0 << /S /D /P (SECRETWORD-) >>] >>".into(),
+        page: "/Annots [7 0 R]".into(),
+        extras: vec![
+            b"<< /Type /OCG /Name (SECRETWORD layer) >>".to_vec(),
+            b"<< /Type /Annot /Subtype /Text /Rect [150 10 170 30] /T (SECRETWORD) /Contents (about SECRETWORD) >>".to_vec(),
+        ],
+        ..Spec::new(&format!("/OC /L1 BDC {KEEP} EMC\n{LINE}"))
+    }
+    .build();
+    let applied = apply(&base, &marked(&base, &[BOX])).unwrap();
+    assert!(found(&applied.bytes, SECRET).is_empty(), "{:?}", found(&applied.bytes, SECRET));
+    let facts = &applied.facts;
+    assert_eq!((facts.annotation_texts_cleared, facts.layer_names_cleared, facts.label_prefixes_cleared), (1, 1, 1), "{facts:?}");
+}

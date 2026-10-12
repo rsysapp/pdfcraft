@@ -61,6 +61,13 @@ pub struct AppliedFacts {
     pub information_cleared: u32,
     pub metadata_removed: u32,
     pub destinations_renamed: u32,
+    /// Follow-up 9 (R6b-54, N4, N8): the form's XFA removed (0 or 1); annotations elsewhere
+    /// whose `/Contents`, `/RC` or `/T` held a removed word, cleared; optional-content groups
+    /// whose name held one, renamed "[Redacted]"; page-label prefixes holding one, removed.
+    pub xfa_removed: u32,
+    pub annotation_texts_cleared: u32,
+    pub layer_names_cleared: u32,
+    pub label_prefixes_cleared: u32,
     /// Follow-up 9 (R6b-54, N6): the most an image's cleared pixels reach past the marks, in
     /// points: the larger side of the largest image pixel cleared (0 without one). Every pixel a
     /// mark reaches is cleared whole; the self-check allows bands filled this far past the marks.
@@ -274,6 +281,10 @@ fn run(base: &[u8], edited: &[u8], limits: InspectLimits) -> Result<Applied, App
         metadata_removed: count(report.metadata_removed),
         destinations_renamed: count(report.destinations_renamed),
         overhang: report.overhang as f32,
+        xfa_removed: count(report.xfa_removed),
+        annotation_texts_cleared: count(report.annotation_texts_cleared),
+        layer_names_cleared: count(report.layer_names_cleared),
+        label_prefixes_cleared: count(report.label_prefixes_cleared),
     };
     let mut budget = clock.budget(limits)?;
     self_check(&inspection, &facts, &before, &detail, (removed, fields), &mut budget)?;
@@ -469,6 +480,13 @@ fn self_check(
     }
     if !inspection.marked_areas.is_empty() {
         return refuse("a mark is left");
+    }
+    // Follow-up 9 (R6b-54, N4, N8): the copies cleared are those the redactor cleared.
+    let copies = &inspection.copies_cleared;
+    if (copies.xfa, copies.annotation_texts, copies.layer_names) != (facts.xfa_removed, facts.annotation_texts_cleared, facts.layer_names_cleared)
+        || (copies.label_prefixes > 0) != (facts.label_prefixes_cleared > 0)
+    {
+        return refuse("the copies cleared are not those the redactor cleared");
     }
     // R6b-55 (inspector re-review N8): the marks applied are the update's, area by area, by
     // value and in order (P6-35).
