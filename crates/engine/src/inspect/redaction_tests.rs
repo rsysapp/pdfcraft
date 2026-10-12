@@ -1389,3 +1389,71 @@ fn a_deep_page_label_tree_is_read_whole() {
         Err(error) => assert!(matches!(error, ApplyError::Inspect(_) | ApplyError::TooComplex), "{error:?}"),
     }
 }
+
+// ── Audit (follow-up 9, coordinator's scan of inspect.rs): who added what, and the rule read alike
+
+#[test]
+fn an_annotation_rect_read_otherwise_by_the_two_sides_refuses_the_redaction() {
+    // Audit: the redactor read /Rect leniently (any four numbers among its items, indirect ones
+    // resolved), the inspector strictly (exactly four numbers written in place): a rectangle
+    // the two read otherwise is refused by its reason, never judged by one rule here and
+    // another there.
+    for rect in ["[20 148 /x 100 162]", "[20 148 100 162 5]", "[20 148 100 9 0 R]"] {
+        let base = Spec {
+            page: "/Annots [6 0 R]".into(),
+            extras: vec![
+                format!("<< /Type /Annot /Subtype /FreeText /Rect {rect} /Contents (note) /DA (/Helv 12 Tf 0 g) >>").into_bytes(),
+                b"null".to_vec(),
+                b"null".to_vec(),
+                b"162".to_vec(),
+            ],
+            ..Spec::new(&format!("{LINE}\n{KEEP}"))
+        }
+        .build();
+        match apply(&base, &marked(&base, &[BOX])) {
+            Err(ApplyError::Refused(Refusal::ContentNotFollowable)) | Err(ApplyError::Inspect(_)) => {}
+            other => panic!("{rect}: {:?}", other.map(|applied| applied.inspection)),
+        }
+    }
+}
+
+#[test]
+fn degenerate_rectangles_follow_the_one_rule_on_both_sides() {
+    // Audit: an inverted rectangle is read normalised by both sides; one of huge extent is
+    // under every mark it meets; a mark on a rotated page is read in the page's default space.
+    let inverted = append(
+        &two_pages(),
+        &[
+            page_one("[8 0 R 10 0 R 12 0 R]"),
+            (
+                10,
+                b"<< /Type /Annot /Subtype /Redact /Rect [100 100 160 140] /QuadPoints [100 140 160 140 100 100 160 100] /IC [0 0 0] /P 3 0 R >>"
+                    .to_vec(),
+            ),
+            (12, b"<< /Type /Annot /Subtype /Stamp /Rect [150 130 110 110] /P 3 0 R /AP << /N 11 0 R >> >>".to_vec()),
+            (11, stream(STAMP_AP, b"0 0 1 rg 0 0 40 20 re f")),
+        ],
+        "/Info 9 0 R",
+    );
+    let base = two_pages();
+    assert_eq!(inspect(&base, &inverted, InspectLimits::default()).unwrap().added_under_marks.stamps, 1);
+    assert_eq!(apply(&base, &inverted).unwrap().inspection.annotations.removed_by_redaction.stamps, 1);
+    let huge = Spec {
+        page: "/Annots [6 0 R] /Rotate 90".into(),
+        extras: vec![b"<< /Type /Annot /Subtype /Square /Rect [-99999 -99999 99999 99999] /C [1 0 0] >>".to_vec()],
+        ..Spec::new(&format!("{LINE}\n{KEEP}"))
+    }
+    .build();
+    let applied = apply(&huge, &marked(&huge, &[BOX])).unwrap();
+    assert_eq!(applied.inspection.annotations.removed_by_redaction.earlier, 1);
+}
+
+#[test]
+fn a_mark_the_update_writes_in_place_is_refused() {
+    // Audit: a mark written directly in a page's /Annots (no object of its own) cannot be told
+    // apart by identity: refused by the inspector, never counted or applied.
+    let (base, edited) = hand_update(&[page_one(
+        "[8 0 R << /Type /Annot /Subtype /Redact /Rect [140 10 170 40] /QuadPoints [140 40 170 40 140 10 170 10] /IC [0 0 0] >>]",
+    )]);
+    assert!(matches!(inspect(&base, &edited, InspectLimits::default()), Err(InspectError::Edited(_))));
+}

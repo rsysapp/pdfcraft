@@ -334,6 +334,28 @@ fn rect_of(doc: &Document, o: Option<&Object>) -> Option<[f64; 4]> {
     (v.len() == 4 && v.iter().all(|x| x.is_finite())).then(|| [v[0].min(v[2]), v[1].min(v[3]), v[0].max(v[2]), v[1].max(v[3])])
 }
 
+/// Embed build (follow-up 9 audit): `/Rect` as the inspector reads it: an array of exactly four
+/// finite numbers written in place, normalised.
+fn strict_rect(doc: &Document, o: Option<&Object>) -> Option<[f64; 4]> {
+    let array = doc.resolve(o?);
+    let v: Vec<f64> =
+        array.as_array()?.iter().map(|x| matches!(x, Object::Int(_) | Object::Real(_)).then(|| x.as_f64()).flatten()).collect::<Option<_>>()?;
+    match v.as_slice() {
+        [x0, y0, x1, y1] if v.iter().all(|x| x.is_finite()) => Some([x0.min(*x1), y0.min(*y1), x0.max(*x1), y0.max(*y1)]),
+        _ => None,
+    }
+}
+
+/// Embed build (follow-up 9 audit): `/Rect` as the most lenient reader could read it: the first
+/// four numbers among its items, references followed.
+fn lenient_rect(doc: &Document, o: Option<&Object>) -> Option<[f64; 4]> {
+    let v: Vec<f64> = doc.resolve(o?).as_array()?.iter().filter_map(|x| doc.resolve(x).as_f64()).filter(|x| x.is_finite()).take(4).collect();
+    match v.as_slice() {
+        [x0, y0, x1, y1] => Some([x0.min(*x1), y0.min(*y1), x0.max(*x1), y0.max(*y1)]),
+        _ => None,
+    }
+}
+
 fn color(doc: &Document, d: &Dict, key: &[u8]) -> Option<Rgb> {
     let v: Vec<f64> = doc.resolve(d.get(key)?).as_array()?.iter().filter_map(Object::as_f64).collect();
     match v.len() {
@@ -679,7 +701,14 @@ fn apply_chosen(doc: &mut Document, chosen_by: &dyn Fn(&Mark) -> bool, options: 
             if subtype == b"Popup" {
                 continue;
             }
-            if rect_of(doc, d.get(b"Rect")).is_some_and(|b| rects.iter().any(|x| under_mark(b, *x))) && removed_here.insert(r) {
+            // Audit (follow-up 9): /Rect read as the inspector reads it (exactly four numbers
+            // written in place); one a lenient reader would place under a mark otherwise is
+            // refused, never judged by one rule here and another there.
+            let strict = strict_rect(doc, d.get(b"Rect"));
+            if strict.is_none() && lenient_rect(doc, d.get(b"Rect")).is_some_and(|b| rects.iter().any(|x| under_mark(b, *x))) {
+                return Err(RedactError::Refused(Refusal::ContentNotFollowable));
+            }
+            if strict.is_some_and(|b| rects.iter().any(|x| under_mark(b, *x))) && removed_here.insert(r) {
                 removed.push(r);
                 match widget_owner.get(&r) {
                     Some(name) if subtype == b"Widget" => {
