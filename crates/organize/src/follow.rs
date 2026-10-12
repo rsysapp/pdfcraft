@@ -68,7 +68,12 @@ struct Renumber {
 impl Renumber {
     /// A destination array as written.
     fn array(&self, items: &[Object]) -> Follow {
-        match items.first() {
+        // A whole real number names a page as an integer does (`[2.0 /Fit]`).
+        let whole = match items.first() {
+            Some(Object::Real(value)) if value.fract() == 0.0 && *value >= 0.0 && *value < 9.0e15 => Some(Object::Int(*value as i64)),
+            _ => None,
+        };
+        match whole.as_ref().or(items.first()) {
             Some(Object::Int(number)) => {
                 let Some(new) = usize::try_from(*number).ok().and_then(|old| self.map.get(old)) else { return Follow::Same };
                 match new {

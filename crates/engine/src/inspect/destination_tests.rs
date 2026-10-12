@@ -759,7 +759,9 @@ fn destinations_that_give_their_page_by_number_follow_it() {
             for (case, edits) in
                 [("delete page 1", Edit::DeletePages { pages: vec![0] }), ("move page 4 first", Edit::MovePages { pages: vec![3], to: 0 })]
             {
-                assert!(refused(run(&base, &session(&base, vec![edits]))).contains("destination"), "{form}, {target}, {case}");
+                // The session renumbers it (R6b-43): the destination follows its page.
+                let inspection = run(&base, &session(&base, vec![edits])).unwrap_or_else(|error| panic!("{form}, {target}, {case}: {error:?}"));
+                assert!(inspection.destinations.named > 0, "{form}, {target}, {case}: {inspection:?}");
             }
             // Pages before the target kept where they were: the number still names its page.
             for (case, edits) in [
@@ -876,17 +878,17 @@ fn page_labels_follow_their_pages_through_deletes_and_moves() {
         Some(&[11, 12, 13, 14]),
     );
     assert_eq!(run(&base, &deleted).unwrap().labels, PageLabelChanges { followed: 4 });
-    // Left as they were, the labels shift onto other pages (page 2 would show "i"): refused,
-    // whether the editor or an update deleted the page.
-    let message = refused(run(&base, &session(&base, vec![Edit::DeletePages { pages: vec![0] }])));
-    assert!(message.contains("page 1's label changed"), "{message}");
+    // The session rewrites them so (R6b-46)…
+    let inspection = run(&base, &session(&base, vec![Edit::DeletePages { pages: vec![0] }])).unwrap();
+    assert_eq!(inspection.labels, PageLabelChanges { followed: 4 });
+    // … left as they were, the labels shift onto other pages (page 2 would show "i"): refused.
     refused(run(&base, &relabelled(&base, ROMAN_THEN_DECIMAL, Some(&[11, 12, 13, 14]))));
     // The last page moved first: 3, i, ii, 1, 2.
     let moved = relabelled(&base, "<< /Nums [0 << /S /D /St 3 >> 1 << /S /r >> 3 << /S /D >>] >>", Some(&[14, 10, 11, 12, 13]));
     let inspection = run(&base, &moved).unwrap();
     assert_eq!((inspection.pages.moved, inspection.labels), (1, PageLabelChanges { followed: 5 }), "{inspection:?}");
-    let message = refused(run(&base, &session(&base, vec![Edit::MovePages { pages: vec![4], to: 0 }])));
-    assert!(message.contains("label changed"), "{message}");
+    let inspection = run(&base, &session(&base, vec![Edit::MovePages { pages: vec![4], to: 0 }])).unwrap();
+    assert_eq!(inspection.labels, PageLabelChanges { followed: 5 }, "the session's move keeps every label with its page");
     // A page inserted may show any label; the others keep theirs.
     let inserted = session(&base, vec![Edit::InsertBlankPage { at: 5, width: 200.0, height: 300.0 }]);
     let inspection = run(&base, &inserted).unwrap();
