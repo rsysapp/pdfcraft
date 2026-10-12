@@ -197,6 +197,9 @@ pub struct CopiesCleared {
     pub layer_names: u32,
     /// Pages whose label lost its prefix and nothing else.
     pub label_prefixes: u32,
+    /// R6b-58: form fields (of the tree, terminal or not) renamed `Field` and a number, the field
+    /// otherwise the same.
+    pub field_names: u32,
 }
 
 /// Follow-up 9 (R6b-55): what an update adds under its own marks (see
@@ -853,6 +856,8 @@ fn compare(base: &[u8], edited: &[u8], limits: Limits) -> Result<(Inspection, De
     let mut after = read_side(edited, Some((base, &before.structure, base_kept)), !base_kept, &mut budget).map_err(|fail| fail.of(Role::Edited))?;
     // Follow-up 8 (R6b-50): named destinations the redactor renamed are read as the base's.
     let renamed = if base_kept { 0 } else { structure::rename_destinations(&before.structure, &mut after.structure) };
+    // R6b-58: so are the form fields it renamed.
+    let fields_renamed = if base_kept { 0 } else { structure::rename_fields(&before.structure, &mut after.structure) };
     if let Some(key) = structure::catalog_change(&before.structure, &after.structure, base_kept) {
         return Err(InspectError::Edited(format!("the document's /{key} changed, which this comparison does not report")));
     }
@@ -961,6 +966,7 @@ fn compare(base: &[u8], edited: &[u8], limits: Limits) -> Result<(Inspection, De
     let annotations = compare_annotations(&before, &after, &pairs, base_kept, &outside_pages, &mut budget, &mut rasters)?;
     (inspection.annotations, inspection.destinations.links, inspection.applied_areas) = (annotations.changes, annotations.links, annotations.applied);
     inspection.copies_cleared.annotation_texts = annotations.texts_cleared;
+    inspection.copies_cleared.field_names = count(fields_renamed);
     // Follow-up 8 (P6-33), follow-up 9 (R6b-55): the marks the edited file added (a base's own
     // unapplied mark is its annotation, never counted), each with a usable area and an object
     // of its own, every area in page order, then the marks' order; those with overlays; and

@@ -293,11 +293,17 @@ fn check_tools(name: &str, bytes: &[u8]) -> String {
     if let Some(mut redaction) = redact_line(bytes, 0) {
         redaction.retain(|edit| !matches!(edit, Edit::ApplyRedactions { .. }));
         let edited = marking(bytes, redaction);
+        // R6b-58: a signed sample is refused by its reason; nothing else is refused.
+        let signed = name.ends_with("-signed.pdf");
         match apply_marks(bytes, &edited, InspectLimits::default()) {
-            Ok(applied) => {
+            Err(ApplyError::Refused(pdfcraft_redact::Refusal::DocumentSigned)) if signed => {
+                line.push_str("; a line marked and applied on the server: refused (document_signed)");
+            }
+            Ok(applied) if !signed => {
                 assert_eq!(applied.inspection.annotations.redactions_applied, 1, "{name}: {:?}", applied.inspection);
                 line.push_str(&format!("; a line marked and applied on the server: accepted ({} glyphs)", applied.facts.glyphs));
             }
+            Ok(_) => panic!("{name}, a line marked and applied on the server: a signed document accepted"),
             Err(error) => panic!("{name}, a line marked and applied on the server: {error:?}"),
         }
     }

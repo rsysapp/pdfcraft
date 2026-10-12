@@ -12,9 +12,9 @@
 //! candidate alike: decoded by the string's own encoding ([`read_text`]), then NFKC, then
 //! format characters taken out, then case and diacritics folded. A copy holds a removed word
 //! when it holds one of the removed tokens (three letters or digits or more, a short function
-//! word excepted), as a word of its own, a part of one where letters meet digits, or inside a
-//! word (as follow-up 8 found removed runs anywhere), five characters or more across words; or
-//! a removed phrase (two words or more) whole. A candidate not read alike by every reader
+//! word excepted) as a word of its own or a part of one where letters meet digits, or, five
+//! characters or more, inside a word or across words (R6b-59: a shorter one only at token
+//! boundaries); or a removed phrase (two words or more), inside words too. A candidate not read alike by every reader
 //! (R6b-57: ambiguous, invalid, decodings that disagree, an encoding not read, an escape that is
 //! no language mark, a character the matcher does not fold) counts as holding one: it is
 //! cleared, and counted (`copies_cleared_unread`); clearing too much is accepted, keeping a copy
@@ -25,8 +25,9 @@
 //! changing what the action does.
 //!
 //! **What clearing does.** Bookmark titles read "[Redacted]"; annotations' text entries holding
-//! one go; groups' names read "[Redacted]"; prefixes go; named destinations are renamed to opaque
-//! names, matched by their bytes (a name or a string, literal or hex alike), with every
+//! one go; form fields' names (`/T`) holding one are renamed `Field<n>` (R6b-58), and an
+//! action naming a field by such a string refuses; groups' names read "[Redacted]"; prefixes go;
+//! named destinations are renamed to opaque names, matched by their bytes (a name or a string, literal or hex alike), with every
 //! destination naming them (in links, bookmarks, the opening action, additional actions and
 //! chained actions), and the named destinations' tree written again in order.
 
@@ -287,12 +288,11 @@ impl Removed {
             let length = token.chars().count();
             copy_words.contains(&token.as_str())
                 || copy_pieces.contains(&token.as_str())
-                // Inside a word ("BudiCorp", "Daniel": follow-up 8 matched every removed run of
-                // three characters or more anywhere, and nothing it cleared may be kept now);
-                // five or more, across words ("SECRET WORD").
-                || copy_words.iter().any(|word| word.contains(token.as_str()))
+                // R6b-59: five characters or more, inside a word ("XSECRETWORDX") and across
+                // words ("SECRET WORD"); shorter, only as a word or a piece of its own ("Ani"
+                // clears "ANI," but not "Daniel").
                 || (length >= 5 && compact.contains(token.as_str()))
-        }) || self.phrases.iter().any(|phrase| joined.contains(&format!(" {phrase} ")))
+        }) || self.phrases.iter().any(|phrase| joined.contains(phrase.as_str()))
     }
 }
 
@@ -437,6 +437,8 @@ pub(crate) fn clear(doc: &mut Document, removed: &Removed, report: &mut Report, 
     if catalog_changed {
         doc.set(root, Object::Dict(catalog.clone()));
     }
+    // R6b-58: form fields' names; every object the field tree reaches is a field or its widget.
+    let in_form = rename_fields(doc, &catalog, removed, report, work)?;
     let annotations = page_annotations(doc, work);
     // Final audit: a group written in place (no object of its own) cannot be renamed alone:
     // refused, never passed over.
@@ -506,9 +508,10 @@ pub(crate) fn clear(doc: &mut Document, removed: &Removed, report: &mut Report, 
         // Not a dictionary: no annotation a viewer shows, and no text.
         let Some(dict) = doc.get(r).as_dict().cloned() else { continue };
         let mut doomed: Vec<&[u8]> = Vec::new();
-        // A widget's /T is its form field's name (form structure, as the field's value and a
-        // signature's data are), not text standing for the page: left as it is.
-        let keys: &[&[u8]] = if dict.name(b"Subtype") == Some(b"Widget") { &[b"Contents", b"RC"] } else { &[b"Contents", b"RC", b"T"] };
+        // A form field's widget: its /T is the field's name, renamed above (R6b-58). A widget
+        // the form's tree does not reach is no field: its texts are any annotation's.
+        let field_widget = dict.name(b"Subtype") == Some(b"Widget") && in_form.contains(&r);
+        let keys: &[&[u8]] = if field_widget { &[b"Contents", b"RC"] } else { &[b"Contents", b"RC", b"T"] };
         for key in keys.iter().copied() {
             if let Some(value) = dict.get(key)
                 && holds(doc, value, removed, report)
@@ -518,7 +521,7 @@ pub(crate) fn clear(doc: &mut Document, removed: &Removed, report: &mut Report, 
         }
         // Final audit: a form field's widget cannot lose its contents without changing the form:
         // refused, never kept.
-        if !doomed.is_empty() && dict.name(b"Subtype") == Some(b"Widget") {
+        if !doomed.is_empty() && field_widget {
             return Err(RedactError::Refused(Refusal::CopyNotClearable));
         }
         if !doomed.is_empty() {
@@ -546,6 +549,163 @@ pub(crate) fn clear(doc: &mut Document, removed: &Removed, report: &mut Report, 
         clear_label_prefixes(doc, &labels, removed, report, work, 0)?;
     }
     rename_destinations(doc, removed, report, work)
+}
+
+/// One object of the form's field tree (R6b-58): a field, or a widget kid (no `/T`, no `/Kids`).
+struct FormNode {
+    obj: ObjRef,
+    /// A field (not a widget kid).
+    field: bool,
+    /// The field type, inherited (`/FT`).
+    kind: Option<Vec<u8>>,
+    /// A value, inherited (`/V`, not null).
+    valued: bool,
+}
+
+/// The form's field tree from `/AcroForm /Fields`, every object once, depth first, as the
+/// inspector reads it. A tree that loops, runs past its bound or holds an entry that is no
+/// dictionary reached by reference is refused: what it holds cannot be told.
+fn form_nodes(doc: &Document, catalog: &Dict, work: &interp::Work) -> Result<Vec<FormNode>, RedactError> {
+    let refuse = || RedactError::Refused(Refusal::CopyNotClearable);
+    let mut out = Vec::new();
+    let Some(form) = catalog.get(b"AcroForm").and_then(|f| doc.resolve(f).as_dict().cloned()) else { return Ok(out) };
+    let Some(top) = form.get(b"Fields").map(|f| Object::clone(&doc.resolve(f))) else { return Ok(out) };
+    let Object::Array(top) = top else { return Err(refuse()) };
+    let mut seen: HashSet<ObjRef> = HashSet::new();
+    // Each entry with what it inherits, its depth, and whether it is read as a field.
+    let mut stack: Vec<(Object, FormNode, usize)> =
+        top.into_iter().rev().map(|entry| (entry, FormNode { obj: ObjRef::new(0, 0), field: true, kind: None, valued: false }, 0)).collect();
+    while let Some((entry, FormNode { field, kind, valued, .. }, depth)) = stack.pop() {
+        work.charge(2);
+        if work.spent() {
+            return Err(RedactError::TooComplex);
+        }
+        let Object::Ref(r) = entry else { return Err(refuse()) };
+        if depth > 64 || out.len() > 100_000 || !seen.insert(r) {
+            return Err(refuse());
+        }
+        let Some(dict) = doc.get(r).as_dict().cloned() else { return Err(refuse()) };
+        let kind = dict.get(b"FT").and_then(|t| doc.resolve(t).as_name().map(<[u8]>::to_vec)).or(kind);
+        let valued = match dict.get(b"V") {
+            Some(value) => !matches!(&*doc.resolve(value), Object::Null),
+            None => valued,
+        };
+        let kids = match dict.get(b"Kids").map(|k| Object::clone(&doc.resolve(k))) {
+            Some(Object::Array(kids)) => kids,
+            Some(_) => return Err(refuse()),
+            None => Vec::new(),
+        };
+        for kid in kids.into_iter().rev() {
+            let Some(kid_ref) = kid.as_ref() else { return Err(refuse()) };
+            let Some(kid_dict) = doc.get(kid_ref).as_dict().cloned() else { return Err(refuse()) };
+            let kid_field = kid_dict.contains(b"T") || kid_dict.contains(b"Kids");
+            stack.push((kid, FormNode { obj: kid_ref, field: kid_field, kind: kind.clone(), valued }, depth + 1));
+        }
+        out.push(FormNode { obj: r, field, kind, valued });
+    }
+    Ok(out)
+}
+
+/// R6b-58: whether the document is signed: a signature field (or widget) with a value, or a
+/// DocMDP or usage-rights signature (`/Perms`). Rewriting it breaks every signature, and the
+/// signer's data cannot be cleared without destroying it.
+pub(crate) fn signed(doc: &Document, work: &interp::Work) -> Result<bool, RedactError> {
+    let Some(root) = doc.root() else { return Ok(false) };
+    let catalog = doc.get(root).as_dict().cloned().unwrap_or_default();
+    if let Some(perms) = catalog.get(b"Perms").map(|p| Object::clone(&doc.resolve(p))) {
+        let Object::Dict(perms) = perms else { return Ok(true) };
+        if [&b"DocMDP"[..], b"UR", b"UR3"].iter().any(|key| perms.contains(key)) {
+            return Ok(true);
+        }
+    }
+    let signature = |kind: Option<&[u8]>, valued: bool| kind == Some(b"Sig") && valued;
+    if form_nodes(doc, &catalog, work)?.iter().any(|node| signature(node.kind.as_deref(), node.valued)) {
+        return Ok(true);
+    }
+    // A signature widget the form's tree does not reach still carries the signer's data.
+    for r in page_annotations(doc, work) {
+        let Some(dict) = doc.get(r).as_dict().cloned() else { continue };
+        let kind = dict.get(b"FT").and_then(|t| doc.resolve(t).as_name().map(<[u8]>::to_vec));
+        let valued = dict.get(b"V").is_some_and(|value| !matches!(&*doc.resolve(value), Object::Null));
+        if signature(kind.as_deref(), valued) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// R6b-58: the form fields whose name (`/T`) holds a removed word, or is not read alike, renamed
+/// `Field<n>` (a name no field of the form has), each counted, as destinations are. An action
+/// naming a field by a string holding one is refused: it cannot follow without changing what
+/// it does. Returns every object the form's tree reaches.
+fn rename_fields(
+    doc: &mut Document,
+    catalog: &Dict,
+    removed: &Removed,
+    report: &mut Report,
+    work: &interp::Work,
+) -> Result<HashSet<ObjRef>, RedactError> {
+    let nodes = form_nodes(doc, catalog, work)?;
+    let reached: HashSet<ObjRef> = nodes.iter().map(|node| node.obj).collect();
+    let mut taken: HashSet<Vec<u8>> = HashSet::new();
+    let mut doomed: Vec<ObjRef> = Vec::new();
+    for node in nodes.iter().filter(|node| node.field) {
+        let Some(dict) = doc.get(node.obj).as_dict().cloned() else { continue };
+        let Some(name) = dict.get(b"T").map(|t| Object::clone(&doc.resolve(t))) else { continue };
+        let reading = match &name {
+            Object::String(text) => {
+                taken.insert(text.bytes.clone());
+                read_text(&text.bytes)
+            }
+            _ => Reading::Unread,
+        };
+        if name_held(reading, removed, report) {
+            doomed.push(node.obj);
+        }
+    }
+    let mut next = 1usize;
+    for r in doomed {
+        let name = loop {
+            let name = format!("Field{next}");
+            next += 1;
+            if taken.insert(name.clone().into_bytes()) {
+                break name;
+            }
+        };
+        doc.update_dict(r, |d| d.set(b"T".to_vec(), Object::String(PdfString::text(&name))))?;
+        report.field_names_renamed += 1;
+    }
+    // Actions that name fields by their names: submitting, resetting, hiding.
+    for num in doc.object_numbers() {
+        work.charge(1);
+        if work.spent() {
+            return Err(RedactError::TooComplex);
+        }
+        let Ok(object) = doc.try_get(num) else { return Err(RedactError::Refused(Refusal::CopyNotClearable)) };
+        let dict = match &*object {
+            Object::Dict(d) => d.clone(),
+            Object::Stream(s) => s.dict.clone(),
+            _ => continue,
+        };
+        let key: &[u8] = match dict.name(b"S") {
+            Some(b"SubmitForm" | b"ResetForm") => b"Fields",
+            Some(b"Hide") => b"T",
+            _ => continue,
+        };
+        let Some(value) = dict.get(key).map(|v| Object::clone(&doc.resolve(v))) else { continue };
+        let strings: Vec<Object> = match value {
+            Object::Array(items) => items.iter().map(|item| Object::clone(&doc.resolve(item))).collect(),
+            other => vec![other],
+        };
+        for string in strings {
+            if let Object::String(text) = string
+                && name_held(read_text(&text.bytes), removed, report)
+            {
+                return Err(RedactError::Refused(Refusal::CopyNotClearable));
+            }
+        }
+    }
+    Ok(reached)
 }
 
 /// The prefixes holding a removed word in the page-label number tree under `node`, removed.
@@ -880,8 +1040,14 @@ mod tests {
         ("Andi", "Andi, Wijaya.", true),
         ("Andi", "Andi2024", true),
         ("Andi", "2024Andi", true),
-        ("Andi", "BudiAndi", true),
-        ("Budi", "BudiCorp", true),
+        // R6b-59: shorter than five, only at a boundary; five or more, and phrases, anywhere.
+        ("Andi", "BudiAndi", false),
+        ("Budi", "BudiCorp", false),
+        ("Ani", "Daniel", false),
+        ("Ani", "ANI,", true),
+        ("Ani", "ani-corp", true),
+        ("Wijaya", "PTWijayaCorp", true),
+        ("Andi Wijaya", "xandi wijayax", true),
         ("SECRETWORD", "XSECRETWORDX", true),
         ("Room101", "Room 101", true),
         ("Room 101", "Room101", true),
@@ -987,20 +1153,28 @@ mod tests {
         words.iter().any(|word| copy.contains(word.as_str()))
     }
 
-    /// Removed words R6b-52 deliberately no longer matches on their own (function words).
-    fn deliberately_left(removed: &str) -> bool {
+    /// Copies R6b-52 and R6b-59 deliberately no longer match: a function word on its own, and a
+    /// word shorter than five characters met only inside a longer one ("Ani" in "Daniel").
+    fn deliberately_left(removed: &str, copy: &str) -> bool {
         let folded = normalise(removed);
-        let words = words(&folded);
-        words.len() == 1 && STOP_WORDS.contains(&words[0])
+        let removed_words = words(&folded);
+        let copy_folded = normalise(copy);
+        let copy_words = words(&copy_folded);
+        let copy_pieces: Vec<&str> = copy_words.iter().flat_map(|word| pieces(word)).collect();
+        let function_word = removed_words.len() == 1 && STOP_WORDS.contains(&removed_words[0]);
+        let inside = removed_words.iter().all(|word| word.chars().count() < 5 && !copy_words.contains(word) && !copy_pieces.contains(word));
+        function_word || inside
     }
 
     #[test]
     fn nothing_follow_up_8_cleared_is_kept_now() {
         // Audit (follow-up 9, coverage): every copy follow-up 8's matcher cleared is cleared
-        // still, but the function words R6b-52 leaves on purpose.
+        // still, but the function words R6b-52 and the short words inside others R6b-59 leave
+        // on purpose.
         let extra: &[(&str, &str, bool)] = &[
-            ("Ani", "Daniel", true),
-            ("pen", "pending", true),
+            ("Ani", "Daniel", false),
+            ("pen", "pending", false),
+            ("Ani", "ANI,", true),
             ("X-1", "Model X-1", true),
             ("SECRET one", "the secret one clause", true),
             ("Wijaya", "wijaya-corp", true),
@@ -1008,7 +1182,7 @@ mod tests {
             ("Rp 50.000", "Rp 50.000", true),
         ];
         for (removed, copy, _) in CASES.iter().chain(extra) {
-            if follow_up_8_holds(removed, copy) && !deliberately_left(removed) {
+            if follow_up_8_holds(removed, copy) && !deliberately_left(removed, copy) {
                 assert!(Removed::from_text(removed).held_in(copy), "follow-up 8 cleared {copy:?} for {removed:?}; it is kept now");
             }
         }

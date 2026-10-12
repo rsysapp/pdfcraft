@@ -97,11 +97,15 @@ pub enum Refusal {
     /// or the opening action's URI or JavaScript holds one), or the place copies are read from
     /// cannot be read whole (a bookmark that is no dictionary).
     CopyNotClearable,
+    /// R6b-58: the document is signed (a signature field with a value, a DocMDP or UR
+    /// signature): a server rewrite breaks every signature, and the signer's data cannot be
+    /// cleared without destroying it.
+    DocumentSigned,
 }
 
 impl Refusal {
     /// Every refusal, in a fixed order.
-    pub const ALL: [Refusal; 11] = [
+    pub const ALL: [Refusal; 12] = [
         Refusal::PatternOrMaskUnderMark,
         Refusal::ShadingUnderMark,
         Refusal::UnreadableMarkedText,
@@ -113,6 +117,7 @@ impl Refusal {
         Refusal::ContentUnreadable,
         Refusal::AddedAnnotationUnderMark,
         Refusal::CopyNotClearable,
+        Refusal::DocumentSigned,
     ];
 
     /// The code a host words (`snake_case`, stable).
@@ -129,6 +134,7 @@ impl Refusal {
             Refusal::ContentUnreadable => "content_unreadable",
             Refusal::AddedAnnotationUnderMark => "added_annotation_under_mark",
             Refusal::CopyNotClearable => "copy_not_clearable",
+            Refusal::DocumentSigned => "document_signed",
         }
     }
 }
@@ -302,6 +308,9 @@ pub struct Report {
     /// alike by every reader (ambiguous, invalid or disagreeing decodings, an encoding not read,
     /// a character not folded): cleared as if they held a removed word.
     pub copies_cleared_unread: usize,
+    /// Embed build (R6b-58): form fields whose name (`/T`) held a removed word, renamed to a
+    /// neutral `Field<n>`.
+    pub field_names_renamed: usize,
     /// Embed build (R6b-54, N6): the most the cleared pixels of an image reach past the marks,
     /// in user space: the larger side of the largest cleared image pixel (0 without one). Every
     /// pixel a mark reaches is cleared whole, so a coarse image's cleared pixels overhang it.
@@ -524,6 +533,10 @@ fn apply_chosen(doc: &mut Document, chosen_by: &dyn Fn(&Mark) -> bool, options: 
         return Err(RedactError::NothingToApply);
     }
     let chosen_objects: HashSet<ObjRef> = chosen.iter().map(|m| m.obj).collect();
+    // Embed build (R6b-58): a rewrite breaks every signature; a signed document is refused.
+    if options.document_copies && copies::signed(doc, &interp::Work::new(interp::MAX_WORK, options.deadline))? {
+        return Err(RedactError::Refused(Refusal::DocumentSigned));
+    }
     let mut report = Report { marks: chosen.len(), ..Report::default() };
     let mut by_page: Vec<usize> = chosen.iter().map(|m| m.page).collect();
     by_page.sort_unstable();

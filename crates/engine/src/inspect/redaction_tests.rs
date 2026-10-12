@@ -1661,3 +1661,89 @@ fn no_way_out_of_the_copy_walk_keeps_a_copy() {
     .build();
     assert_eq!(apply(&field, &marked(&field, &[BOX])).map(|_| ()), Err(ApplyError::Refused(Refusal::CopyNotClearable)));
 }
+
+// ── R6b-58, R6b-59 ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn a_signed_document_is_refused_by_its_reason() {
+    // R6b-58: a server rewrite breaks every signature, and the signer's data cannot be cleared:
+    // a document holding one (a signature field with a value, a DocMDP or UR signature) is
+    // refused as `document_signed`.
+    let signed = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../sign/tests/data/openssl-signed.pdf")).unwrap();
+    let quads = [[16.0, 244.0, 190.0, 268.0]];
+    assert_eq!(apply(&signed, &marked(&signed, &quads)).map(|_| ()), Err(ApplyError::Refused(Refusal::DocumentSigned)));
+    for perms in ["/Perms << /DocMDP 6 0 R >>", "/Perms << /UR3 6 0 R >>"] {
+        let base = Spec {
+            cat: perms.into(),
+            extras: vec![b"<< /Type /Sig /Filter /Adobe.PPKLite /Contents <00> /ByteRange [0 0 0 0] >>".to_vec()],
+            ..Spec::new(&format!("{LINE}\n{KEEP}"))
+        }
+        .build();
+        assert_eq!(apply(&base, &marked(&base, &[BOX])).map(|_| ()), Err(ApplyError::Refused(Refusal::DocumentSigned)), "{perms}");
+    }
+    // A signature field without a value (not yet signed) is no signature.
+    let unsigned = Spec {
+        cat: "/AcroForm << /Fields [6 0 R] >>".into(),
+        page: "/Annots [6 0 R]".into(),
+        extras: vec![b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (Signature) /Rect [150 10 190 30] /P 3 0 R >>".to_vec()],
+        ..Spec::new(&format!("{LINE}\n{KEEP}"))
+    }
+    .build();
+    assert!(apply(&unsigned, &marked(&unsigned, &[BOX])).is_ok());
+    assert!(ApplyError::CODES.contains(&"document_signed"));
+}
+
+#[test]
+fn a_field_named_with_a_removed_word_is_renamed() {
+    // R6b-58: a form field whose name (/T) holds a removed word is renamed to a neutral name
+    // (Field<n>), counted, as destinations are; its widget and value stay where they were.
+    let base = Spec {
+        cat: "/AcroForm << /Fields [6 0 R] /DA (/Helv 0 Tf 0 g) >>".into(),
+        page: "/Annots [6 0 R]".into(),
+        extras: vec![b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (SECRETWORD) /V (kept value) /Rect [150 10 190 30] /P 3 0 R >>".to_vec()],
+        ..Spec::new(&format!("{LINE}\n{KEEP}"))
+    }
+    .build();
+    let applied = apply(&base, &marked(&base, &[BOX])).unwrap();
+    assert!(found(&applied.bytes, SECRET).is_empty(), "{:?}", found(&applied.bytes, SECRET));
+    assert!(!found(&applied.bytes, "kept value").is_empty() && !found(&applied.bytes, "Field1").is_empty());
+    assert_eq!(applied.facts.field_names_renamed, 1, "{:?}", applied.facts);
+    assert_eq!(applied.inspection.form_fields_changed, 0, "{:?}", applied.inspection);
+    // A parent's name: renamed once, its kids following it; a name already "Field1" kept apart.
+    let base = Spec {
+        cat: "/AcroForm << /Fields [6 0 R 9 0 R] /DA (/Helv 0 Tf 0 g) >>".into(),
+        page: "/Annots [7 0 R 8 0 R 9 0 R]".into(),
+        extras: vec![
+            b"<< /T (secretword party) /Kids [7 0 R 8 0 R] >>".to_vec(),
+            b"<< /Type /Annot /Subtype /Widget /Parent 6 0 R /FT /Tx /T (a) /V (one) /Rect [150 10 190 30] /P 3 0 R >>".to_vec(),
+            b"<< /Type /Annot /Subtype /Widget /Parent 6 0 R /FT /Tx /T (b) /V (two) /Rect [150 40 190 60] /P 3 0 R >>".to_vec(),
+            b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (Field1) /V (three) /Rect [150 70 190 90] /P 3 0 R >>".to_vec(),
+        ],
+        ..Spec::new(&format!("{LINE}\n{KEEP}"))
+    }
+    .build();
+    let applied = apply(&base, &marked(&base, &[BOX])).unwrap();
+    assert!(found(&applied.bytes, SECRET).is_empty() && !found(&applied.bytes, "Field2").is_empty());
+    assert_eq!((applied.facts.field_names_renamed, applied.inspection.copies_cleared.field_names), (1, 1), "{:?}", applied.facts);
+    assert_eq!(applied.inspection.form_fields_changed, 0, "{:?}", applied.inspection);
+}
+
+#[test]
+fn a_short_removed_word_matches_only_as_a_word() {
+    // R6b-59: a removed token shorter than five letters matches only at token boundaries, once
+    // folded: "Ani" clears "Ani" and "ANI," but not "Daniel"; five letters or more, and phrases,
+    // still match inside words.
+    for (title, cleared) in [("Daniel's clause", 0), ("ANI, the party", 1), ("Ani", 1)] {
+        let base = Spec {
+            cat: "/Outlines 6 0 R".into(),
+            extras: vec![
+                b"<< /Type /Outlines /First 7 0 R /Last 7 0 R /Count 1 >>".to_vec(),
+                format!("<< /Title ({title}) /Parent 6 0 R /Dest [3 0 R /Fit] >>").into_bytes(),
+            ],
+            ..Spec::new(&format!("BT /F1 12 Tf 20 150 Td (Ani) Tj ET\n{KEEP}"))
+        }
+        .build();
+        let applied = apply(&base, &marked(&base, &[BOX])).unwrap();
+        assert_eq!(applied.facts.bookmarks_cleared, cleared, "{title}");
+    }
+}

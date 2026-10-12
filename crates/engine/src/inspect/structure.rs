@@ -908,6 +908,58 @@ pub(crate) fn rename_destinations(before: &Structure, after: &mut Structure) -> 
     used.len()
 }
 
+/// R6b-58: the form fields a redaction renamed (a name holding a removed word, written again as
+/// `Field` and a number, the field the same), paired in order: the edited file's full names are
+/// read back as the base's, so the comparisons that follow judge them as unchanged. How many
+/// fields (of the tree, terminal or not) were renamed.
+pub(crate) fn rename_fields(before: &Structure, after: &mut Structure) -> usize {
+    let opaque = |segment: &str| segment.strip_prefix("Field").is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()));
+    let gone: Vec<&String> = before.field_order.iter().filter(|name| !after.fields.contains_key(*name)).collect();
+    let fresh: Vec<String> = after.field_order.iter().filter(|name| !before.fields.contains_key(*name)).cloned().collect();
+    let mut back: HashMap<String, String> = HashMap::new();
+    let mut nodes: HashSet<(String, String)> = HashSet::new();
+    let mut used: HashSet<usize> = HashSet::new();
+    for new in fresh {
+        if back.contains_key(&new) {
+            continue;
+        }
+        let Some(digest) = after.fields.get(&new) else { continue };
+        let new_segments: Vec<&str> = new.split('.').collect();
+        let fits = |old: &str| {
+            let old_segments: Vec<&str> = old.split('.').collect();
+            old_segments.len() == new_segments.len()
+                && old_segments.iter().zip(&new_segments).all(|(was, is)| was == is || opaque(is))
+                && before.fields.get(old) == Some(digest)
+        };
+        let Some((at, old)) = gone.iter().enumerate().find(|(at, old)| !used.contains(at) && fits(old)) else { continue };
+        used.insert(at);
+        let old_segments: Vec<&str> = old.split('.').collect();
+        for (index, (was, is)) in old_segments.iter().zip(&new_segments).enumerate() {
+            if was != is {
+                nodes.insert((new_segments[..=index].join("."), old_segments[..=index].join(".")));
+            }
+        }
+        back.insert(new, (*old).clone());
+    }
+    if back.is_empty() {
+        return 0;
+    }
+    for (new, old) in &back {
+        if let Some(digest) = after.fields.remove(new) {
+            after.fields.insert(old.clone(), digest);
+        }
+        if let Some(places) = after.field_places.remove(new) {
+            after.field_places.insert(old.clone(), places);
+        }
+    }
+    for name in &mut after.field_order {
+        if let Some(old) = back.get(name) {
+            *name = old.clone();
+        }
+    }
+    nodes.len()
+}
+
 /// Whether `part` is `whole` with some items taken away, the rest in their order.
 fn subsequence<T: PartialEq>(part: &[T], whole: &[T]) -> bool {
     let mut rest = whole.iter();
@@ -3601,7 +3653,9 @@ impl<'d, 'b> Reader<'d, 'b> {
         if dict.name(b"Subtype") == Some(b"Widget") {
             widgets.insert(*r);
         }
-        let own = self.digest_without(&dict, &[b"Kids"])?;
+        // R6b-58: in a rewrite, a field's name is compared apart (by its full name, below), so
+        // a field the redactor renamed is still known by what it is.
+        let own = if self.names_apart { self.digest_without(&dict, &[b"Kids", b"T"])? } else { self.digest_without(&dict, &[b"Kids"])? };
         let mut children = Vec::new();
         let mut widget_digests = Vec::new();
         for kid in self.array_of(dict.get(b"Kids"), "/Kids")? {
