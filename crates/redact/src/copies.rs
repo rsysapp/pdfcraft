@@ -38,15 +38,45 @@ const STOP_WORDS: [&str; 46] = [
     "lah", "kah", "tak", "dgn", "utk", "tsb",
 ];
 
-/// `text` folded for matching: NFKC, diacritics taken off, lower case.
+/// Function words that are also given names (Dan, Ada, May): a function word only written in
+/// lower case; capitalised, a name, matched like any token.
+const NAME_LIKE: [&str; 3] = ["dan", "ada", "may"];
+
+/// Audit (follow-up 9): characters a viewer does not show, which must not split a word: the soft
+/// hyphen, zero-width spaces and joiners, directional marks, the word joiner and its kin, the
+/// byte-order mark.
+fn invisible(c: char) -> bool {
+    matches!(c, '\u{ad}' | '\u{34f}' | '\u{180e}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206f}' | '\u{feff}')
+}
+
+/// `text` folded for matching: what is not shown taken out, NFKC (full-width forms, ligatures,
+/// no-break spaces), diacritics taken off, lower case.
 pub(crate) fn fold(text: &str) -> String {
-    let compatible: String = text.nfkc().collect();
-    compatible.nfd().filter(|c| !unicode_normalization::char::is_combining_mark(*c)).flat_map(char::to_lowercase).collect()
+    let shown: String = text.chars().filter(|c| !invisible(*c)).collect();
+    let compatible: String = shown.nfkc().collect();
+    compatible.nfd().filter(|c| !unicode_normalization::char::is_combining_mark(*c) && !invisible(*c)).flat_map(char::to_lowercase).collect()
 }
 
 /// The words of folded text: its runs of letters and digits.
 fn words(folded: &str) -> Vec<&str> {
     folded.split(|c: char| !c.is_alphanumeric()).filter(|word| !word.is_empty()).collect()
+}
+
+/// A word's pieces where letters meet digits ("room101": "room", "101").
+fn pieces(word: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut last: Option<bool> = None;
+    for (at, c) in word.char_indices() {
+        let digit = c.is_numeric();
+        if last.is_some_and(|was| was != digit) {
+            out.push(&word[start..at]);
+            start = at;
+        }
+        last = Some(digit);
+    }
+    out.push(&word[start..]);
+    out
 }
 
 /// What the redaction removed, for matching copies.
@@ -64,16 +94,31 @@ impl Removed {
     /// From the removed text (runs apart by [`RUN_END`], words by spaces).
     pub fn from_text(text: &str) -> Self {
         let mut removed = Removed { unreadable: text.contains('\u{fffd}'), ..Removed::default() };
+        let add = |removed: &mut Removed, token: &str, capitalised: bool| {
+            let stop = STOP_WORDS.contains(&token) && !(capitalised && NAME_LIKE.contains(&token));
+            if token.chars().count() >= 3 && !stop && !removed.tokens.iter().any(|t| t == token) {
+                removed.tokens.push(token.to_string());
+            }
+        };
         for run in text.split(RUN_END) {
-            let folded = fold(run);
-            let run_words = words(&folded);
-            for word in &run_words {
-                if word.chars().count() >= 3 && !STOP_WORDS.contains(word) && !removed.tokens.iter().any(|t| t == word) {
-                    removed.tokens.push((*word).to_string());
+            let shown: String = run.chars().filter(|c| !invisible(*c)).collect();
+            let mut run_pieces: Vec<String> = Vec::new();
+            for raw in shown.split(|c: char| !c.is_alphanumeric()).filter(|word| !word.is_empty()) {
+                let capitalised = raw.chars().next().is_some_and(char::is_uppercase);
+                let folded = fold(raw);
+                for word in words(&folded) {
+                    add(&mut removed, word, capitalised);
+                    let split = pieces(word);
+                    if split.len() > 1 {
+                        for piece in &split {
+                            add(&mut removed, piece, capitalised);
+                        }
+                    }
+                    run_pieces.extend(split.into_iter().map(str::to_string));
                 }
             }
-            if run_words.len() >= 2 {
-                let phrase = run_words.join(" ");
+            if run_pieces.len() >= 2 {
+                let phrase = run_pieces.join(" ");
                 if !removed.phrases.contains(&phrase) {
                     removed.phrases.push(phrase);
                 }
@@ -90,10 +135,18 @@ impl Removed {
     pub fn held_in(&self, copy: &str) -> bool {
         let folded = fold(copy);
         let copy_words = words(&folded);
-        let joined = format!(" {} ", copy_words.join(" "));
+        let copy_pieces: Vec<&str> = copy_words.iter().flat_map(|word| pieces(word)).collect();
+        let joined = format!(" {} ", copy_pieces.join(" "));
         let compact: String = copy_words.concat();
-        self.tokens.iter().any(|token| copy_words.contains(&token.as_str()) || (token.chars().count() >= 5 && compact.contains(token.as_str())))
-            || self.phrases.iter().any(|phrase| joined.contains(&format!(" {phrase} ")))
+        self.tokens.iter().any(|token| {
+            let length = token.chars().count();
+            copy_words.contains(&token.as_str())
+                || copy_pieces.contains(&token.as_str())
+                // Four characters or more, inside a word ("BudiCorp"); five or more, across
+                // words ("SECRET WORD").
+                || (length >= 4 && copy_words.iter().any(|word| word.contains(token.as_str())))
+                || (length >= 5 && compact.contains(token.as_str()))
+        }) || self.phrases.iter().any(|phrase| joined.contains(&format!(" {phrase} ")))
     }
 
     /// Whether bytes `copy` (a name, or a packet's data) hold one, read every way it could be
@@ -624,4 +677,64 @@ fn collect_tree(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// (removed text, a copy, whether the copy holds a removed word): R6b-52 pinned.
+    const CASES: &[(&str, &str, bool)] = &[
+        // Where in the copy.
+        ("Andi", "Andi", true),
+        ("Andi", "Andi and the others", true),
+        ("Andi", "Agreement with Andi", true),
+        ("Andi", "(Andi)", true),
+        ("Andi", "Andi, Wijaya.", true),
+        ("Andi", "Andi2024", true),
+        ("Andi", "2024Andi", true),
+        ("Andi", "BudiAndi", true),
+        ("Budi", "BudiCorp", true),
+        ("SECRETWORD", "XSECRETWORDX", true),
+        ("Room101", "Room 101", true),
+        ("Room 101", "Room101", true),
+        // Characters viewers do not show, or show alike.
+        ("Andi", "An\u{ad}di", true),
+        ("Andi", "An\u{200b}di", true),
+        ("Andi", "An\u{2060}di", true),
+        ("Andi", "\u{feff}Andi", true),
+        ("An\u{ad}di", "Andi", true),
+        ("Andi Wijaya", "Andi\u{a0}Wijaya", true),
+        ("Andi Wijaya", "Andi\t\nWijaya", true),
+        ("Andi Wijaya", "Andi  -  Wijaya", true),
+        ("Andi", "\u{ff21}\u{ff4e}\u{ff44}\u{ff49}", true),
+        ("Profit", "Pro\u{fb01}t", true),
+        ("Jos\u{e9}", "JOSE", true),
+        ("Jose", "Jos\u{e9}", true),
+        ("Jos\u{65}\u{301}", "Jos\u{e9}", true),
+        // Names that are also function words, as names.
+        ("Dan", "Meeting with Dan", true),
+        ("Ada", "Ada Lovelace notes", true),
+        ("May", "Letter to May", true),
+        ("Ani", "Ani and Budi", true),
+        ("Ida", "Ibu Ida", true),
+        // Phrases whole.
+        ("PT Budi SA", "PT Budi SA", true),
+        ("A.B. Holdings", "A B Holdings", true),
+        // Not copies: function words alone, two letters, another word.
+        ("the", "Other terms", false),
+        ("the", "The terms", false),
+        ("dan", "Syarat dan Ketentuan", false),
+        ("AB", "AB Holdings", false),
+        ("Andi", "Budi", false),
+        // Letter-spaced, it is the word still.
+        ("Wijaya", "Wija ya", true),
+    ];
+
+    #[test]
+    fn the_matcher_is_pinned() {
+        for (removed, copy, held) in CASES {
+            assert_eq!(Removed::from_text(removed).held_in(copy), *held, "{removed:?} in {copy:?}");
+        }
+    }
 }
