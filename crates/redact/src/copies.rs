@@ -12,9 +12,9 @@
 //! candidate alike: decoded by the string's own encoding ([`decode_text`]), then NFKC, then
 //! format characters taken out, then case and diacritics folded. A copy holds a removed word
 //! when it holds one of the removed tokens (three letters or digits or more, a short function
-//! word excepted), as a word of its own (or a part of one where letters meet digits), four
-//! characters or more inside a word, five or more across words; or a removed phrase (two words
-//! or more) whole. A candidate that cannot be decoded refuses the redaction
+//! word excepted), as a word of its own, a part of one where letters meet digits, or inside a
+//! word (as follow-up 8 found removed runs anywhere), five characters or more across words; or
+//! a removed phrase (two words or more) whole. A candidate that cannot be decoded refuses the redaction
 //! ([`Refusal::CopyNotClearable`]); so do removed glyphs without readable text where any of these
 //! places holds text ([`Refusal::UnreadableMarkedText`]), and a bookmark's or the opening
 //! action's URI or JavaScript holding a removed word (it cannot be cleared without changing what
@@ -57,7 +57,7 @@ fn invisible(c: char) -> bool {
     matches!(c, '\u{ad}' | '\u{34f}' | '\u{180e}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206f}' | '\u{feff}')
 }
 
-/// R6b-56: a PDF text string decoded by its own encoding (UTF-16BE or UTF-8 after their marks,
+/// R6b-56: a PDF text string decoded by its own encoding (UTF-16BE, UTF-16LE or UTF-8 after their marks,
 /// else PDFDocEncoding), its language marks (U+001B, a code, U+001B, which viewers do not show)
 /// taken out. `None` when it cannot be: an odd UTF-16 length or an unpaired surrogate, bad
 /// UTF-8, or a byte PDFDocEncoding gives no character (0x7F, 0x9F, 0xAD).
@@ -67,6 +67,13 @@ pub(crate) fn decode_text(bytes: &[u8]) -> Option<String> {
             return None;
         }
         let units = rest.as_chunks::<2>().0.iter().map(|pair| u16::from_be_bytes(*pair));
+        char::decode_utf16(units).collect::<Result<String, _>>().ok()?
+    } else if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        // Audit (follow-up 9): UTF-16 little-endian with its mark, which pdf.js shows as text.
+        if rest.len() % 2 != 0 {
+            return None;
+        }
+        let units = rest.as_chunks::<2>().0.iter().map(|pair| u16::from_le_bytes(*pair));
         char::decode_utf16(units).collect::<Result<String, _>>().ok()?
     } else if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
         String::from_utf8(rest.to_vec()).ok()?
@@ -205,9 +212,10 @@ impl Removed {
             let length = token.chars().count();
             copy_words.contains(&token.as_str())
                 || copy_pieces.contains(&token.as_str())
-                // Four characters or more, inside a word ("BudiCorp"); five or more, across
-                // words ("SECRET WORD").
-                || (length >= 4 && copy_words.iter().any(|word| word.contains(token.as_str())))
+                // Inside a word ("BudiCorp", "Daniel": follow-up 8 matched every removed run of
+                // three characters or more anywhere, and nothing it cleared may be kept now);
+                // five or more, across words ("SECRET WORD").
+                || copy_words.iter().any(|word| word.contains(token.as_str()))
                 || (length >= 5 && compact.contains(token.as_str()))
         }) || self.phrases.iter().any(|phrase| joined.contains(&format!(" {phrase} ")))
     }
@@ -774,6 +782,57 @@ mod tests {
     fn one_normalisation_is_pinned() {
         for (text, normal) in NORMALISED {
             assert_eq!(normalise(text), *normal, "{text:?}");
+        }
+    }
+
+    /// Follow-up 8's matcher (`92d7a82`, `removed_words` and `holds_word`), as it was: each
+    /// run of removed text (three characters or more) and each word of five or more, as a
+    /// substring of the lower-cased copy.
+    fn follow_up_8_holds(removed: &str, copy: &str) -> bool {
+        let mut words: Vec<String> = Vec::new();
+        let mut add = |word: &str, least: usize| {
+            let word = word.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+            if word.chars().filter(|c| c.is_alphanumeric()).count() >= least && !words.contains(&word) {
+                words.push(word);
+            }
+        };
+        for run in removed.split(RUN_END) {
+            add(run, 3);
+            for word in run.split(|c: char| !c.is_alphanumeric() && c != '-' && c != '\'') {
+                add(word, 5);
+            }
+        }
+        let copy = copy.to_lowercase();
+        words.iter().any(|word| copy.contains(word.as_str()))
+    }
+
+    /// Removed words R6b-52 deliberately no longer matches on their own (function words).
+    fn deliberately_left(removed: &str) -> bool {
+        let folded = normalise(removed);
+        let words = words(&folded);
+        words.len() == 1 && STOP_WORDS.contains(&words[0])
+    }
+
+    #[test]
+    fn nothing_follow_up_8_cleared_is_kept_now() {
+        // Audit (follow-up 9, coverage): every copy follow-up 8's matcher cleared is cleared
+        // still, but the function words R6b-52 leaves on purpose.
+        let extra: &[(&str, &str, bool)] = &[
+            ("Ani", "Daniel", true),
+            ("pen", "pending", true),
+            ("X-1", "Model X-1", true),
+            ("SECRET one", "the secret one clause", true),
+            ("Wijaya", "wijaya-corp", true),
+            ("O'Neil", "o'neil", true),
+            ("Rp 50.000", "Rp 50.000", true),
+        ];
+        for (removed, copy, _) in CASES.iter().chain(extra) {
+            if follow_up_8_holds(removed, copy) && !deliberately_left(removed) {
+                assert!(Removed::from_text(removed).held_in(copy), "follow-up 8 cleared {copy:?} for {removed:?}; it is kept now");
+            }
+        }
+        for (removed, copy, held) in extra {
+            assert_eq!(Removed::from_text(removed).held_in(copy), *held, "{removed:?} in {copy:?}");
         }
     }
 

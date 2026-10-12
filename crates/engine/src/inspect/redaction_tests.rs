@@ -1542,3 +1542,22 @@ fn xmp_on_an_appearance_goes_too_and_the_output_keeps_none() {
     assert!(found(&applied.bytes, "xmpmeta").is_empty());
     assert_eq!(applied.facts.metadata_removed, 1, "{:?}", applied.facts);
 }
+
+#[test]
+fn a_bookmark_title_read_as_a_viewer_reads_it_is_matched() {
+    // Audit (follow-up 9, parser differential): a title in UTF-16 little-endian with its mark,
+    // which pdf.js shows as text, is read as such, never as PDFDocEncoding bytes that hold no
+    // word: the copy is cleared.
+    let title = format!("<FFFE{}>", "Andi".encode_utf16().flat_map(u16::to_le_bytes).map(|byte| format!("{byte:02X}")).collect::<String>());
+    let base = Spec {
+        cat: "/Outlines 6 0 R".into(),
+        extras: vec![
+            b"<< /Type /Outlines /First 7 0 R /Last 7 0 R /Count 1 >>".to_vec(),
+            format!("<< /Title {title} /Parent 6 0 R /Dest [3 0 R /Fit] >>").into_bytes(),
+        ],
+        ..Spec::new(&format!("BT /F1 12 Tf 20 150 Td (Andi) Tj ET\n{KEEP}"))
+    }
+    .build();
+    let applied = apply(&base, &marked(&base, &[BOX])).unwrap();
+    assert_eq!(applied.facts.bookmarks_cleared, 1, "{:?}", applied.facts);
+}
