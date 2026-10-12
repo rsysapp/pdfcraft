@@ -83,7 +83,7 @@ fn escapes_known(text: &str) -> bool {
     let mut parts = text.split('\u{1b}');
     parts.next();
     let codes: Vec<&str> = parts.collect();
-    if codes.len() % 2 != 0 {
+    if !codes.len().is_multiple_of(2) {
         return false;
     }
     codes.chunks(2).all(|pair| {
@@ -98,7 +98,7 @@ fn escapes_known(text: &str) -> bool {
 /// fails; its table leaves bytes it does not translate (0x9F) as they are.
 fn as_pdf_js_reads(bytes: &[u8]) -> String {
     let utf16 = |rest: &[u8], le: bool| {
-        (rest.len() % 2 == 0)
+        rest.len().is_multiple_of(2)
             .then(|| {
                 let units = rest.as_chunks::<2>().0.iter().map(|p| if le { u16::from_le_bytes(*p) } else { u16::from_be_bytes(*p) });
                 char::decode_utf16(units).collect::<Result<String, _>>().ok()
