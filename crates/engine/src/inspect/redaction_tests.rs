@@ -1616,3 +1616,48 @@ fn the_text_standing_for_what_was_removed_still_goes() {
         assert!(found(&applied.bytes, SECRET).is_empty(), "{case}: {:?}", found(&applied.bytes, SECRET));
     }
 }
+
+// ── Final audit of copies.rs (R6b-52, R6b-56, R6b-57): nothing kept by an early way out ──────
+
+#[test]
+fn no_way_out_of_the_copy_walk_keeps_a_copy() {
+    // Final audit: a bookmark naming a destination that is defined nowhere (a dangling name
+    // holding the removed word) is renamed too, or the redaction refused, never kept; a copy not
+    // read alike is cleared even when the redaction removed no text (an image only); a form
+    // field's widget whose /Contents holds the word cannot be cleared without changing the form:
+    // refused. (A widget's /T is its field's name, form structure: left as it is.)
+    let dangling = Spec {
+        cat: "/Outlines 6 0 R".into(),
+        extras: vec![
+            b"<< /Type /Outlines /First 7 0 R /Last 7 0 R /Count 1 >>".to_vec(),
+            b"<< /Title (Clause) /Parent 6 0 R /Dest (SECRETWORD) >>".to_vec(),
+        ],
+        ..Spec::new(&format!("{LINE}\n{KEEP}"))
+    }
+    .build();
+    match apply(&dangling, &marked(&dangling, &[BOX])) {
+        Ok(applied) => assert!(found(&applied.bytes, SECRET).is_empty(), "{:?}", found(&applied.bytes, SECRET)),
+        Err(error) => assert!(matches!(error, ApplyError::Refused(_) | ApplyError::SelfCheck(_) | ApplyError::Inspect(_)), "{error:?}"),
+    }
+    let image_only = Spec {
+        res: "/XObject << /Im1 8 0 R >>".into(),
+        cat: "/Outlines 6 0 R".into(),
+        extras: vec![
+            b"<< /Type /Outlines /First 7 0 R /Last 7 0 R /Count 1 >>".to_vec(),
+            b"<< /Title <41629F63> /Parent 6 0 R /Dest [3 0 R /Fit] >>".to_vec(),
+            stream("/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", &[9]),
+        ],
+        ..Spec::new(&format!("q 30 0 0 10 20 150 cm /Im1 Do Q\n{KEEP}"))
+    }
+    .build();
+    let applied = apply(&image_only, &marked(&image_only, &[BOX])).unwrap();
+    assert_eq!((applied.facts.bookmarks_cleared, applied.facts.copies_cleared_unread), (1, 1), "{:?}", applied.facts);
+    let field = Spec {
+        cat: "/AcroForm << /Fields [6 0 R] /DA (/Helv 0 Tf 0 g) >>".into(),
+        page: "/Annots [6 0 R]".into(),
+        extras: vec![b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (f1) /Contents (SECRETWORD) /V (x) /Rect [150 10 190 30] /P 3 0 R >>".to_vec()],
+        ..Spec::new(&format!("{LINE}\n{KEEP}"))
+    }
+    .build();
+    assert_eq!(apply(&field, &marked(&field, &[BOX])).map(|_| ()), Err(ApplyError::Refused(Refusal::CopyNotClearable)));
+}

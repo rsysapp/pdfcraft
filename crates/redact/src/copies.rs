@@ -276,10 +276,6 @@ impl Removed {
         removed
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.tokens.is_empty() && self.phrases.is_empty()
-    }
-
     /// Whether decoded text `copy` holds a removed word (see the module documentation).
     pub fn held_in(&self, copy: &str) -> bool {
         let folded = normalise(copy);
@@ -404,7 +400,8 @@ pub(crate) fn clear(doc: &mut Document, removed: &Removed, report: &mut Report, 
         work.charge(1);
         spent(work)?;
         let r = ObjRef::new(num, 0);
-        let Ok(object) = doc.try_get(num) else { continue };
+        // Final audit: an object that cannot be read could hold a packet: refused, not passed.
+        let Ok(object) = doc.try_get(num) else { return Err(RedactError::Refused(Refusal::CopyNotClearable)) };
         let has = match &*object {
             Object::Dict(d) => d.contains(b"Metadata"),
             Object::Stream(s) => s.dict.contains(b"Metadata"),
@@ -441,12 +438,17 @@ pub(crate) fn clear(doc: &mut Document, removed: &Removed, report: &mut Report, 
         doc.set(root, Object::Dict(catalog.clone()));
     }
     let annotations = page_annotations(doc, work);
-    let groups: Vec<ObjRef> = catalog
+    // Final audit: a group written in place (no object of its own) cannot be renamed alone:
+    // refused, never passed over.
+    let listed = catalog
         .get(b"OCProperties")
         .and_then(|p| doc.resolve(p).as_dict().cloned())
         .and_then(|p| p.get(b"OCGs").and_then(|g| doc.resolve(g).as_array().cloned()))
-        .map(|items| items.iter().filter_map(Object::as_ref).collect())
         .unwrap_or_default();
+    let groups: Vec<ObjRef> = listed.iter().filter_map(Object::as_ref).collect();
+    if groups.len() != listed.len() {
+        return Err(RedactError::Refused(Refusal::CopyNotClearable));
+    }
     // Removed glyphs without readable text cannot be looked for where copies are matched.
     if removed.unreadable {
         let bookmarks = catalog.get(b"Outlines").and_then(|o| doc.resolve(o).as_dict().and_then(|d| d.get(b"First").cloned())).is_some();
@@ -457,9 +459,8 @@ pub(crate) fn clear(doc: &mut Document, removed: &Removed, report: &mut Report, 
             return Err(RedactError::Refused(Refusal::UnreadableMarkedText));
         }
     }
-    if removed.is_empty() {
-        return Ok(());
-    }
+    // R6b-57: a candidate not read alike is cleared whatever was removed (an image alone too), so
+    // every candidate is read even when no text was removed.
     // The opening action holding a removed word cannot be cleared.
     if let Some(action) = catalog.get(b"OpenAction").filter(|action| !matches!(&*doc.resolve(action), Object::Array(_)))
         && action_holds(doc, action, removed, work, 0)?
@@ -502,17 +503,23 @@ pub(crate) fn clear(doc: &mut Document, removed: &Removed, report: &mut Report, 
     for r in annotations {
         work.charge(4);
         spent(work)?;
+        // Not a dictionary: no annotation a viewer shows, and no text.
         let Some(dict) = doc.get(r).as_dict().cloned() else { continue };
-        if dict.name(b"Subtype") == Some(b"Widget") {
-            continue;
-        }
         let mut doomed: Vec<&[u8]> = Vec::new();
-        for key in [&b"Contents"[..], b"RC", b"T"] {
+        // A widget's /T is its form field's name (form structure, as the field's value and a
+        // signature's data are), not text standing for the page: left as it is.
+        let keys: &[&[u8]] = if dict.name(b"Subtype") == Some(b"Widget") { &[b"Contents", b"RC"] } else { &[b"Contents", b"RC", b"T"] };
+        for key in keys.iter().copied() {
             if let Some(value) = dict.get(key)
                 && holds(doc, value, removed, report)
             {
                 doomed.push(key);
             }
+        }
+        // Final audit: a form field's widget cannot lose its contents without changing the form:
+        // refused, never kept.
+        if !doomed.is_empty() && dict.name(b"Subtype") == Some(b"Widget") {
+            return Err(RedactError::Refused(Refusal::CopyNotClearable));
         }
         if !doomed.is_empty() {
             doc.update_dict(r, |d| {
@@ -664,6 +671,31 @@ fn rename_destinations(doc: &mut Document, removed: &Removed, report: &mut Repor
             renames.insert(old, new);
         }
     }
+    // Final audit: a destination named nowhere (in no /Dests, no tree) whose name holds a removed
+    // word is renamed too (it stays named nowhere), never kept.
+    for num in doc.object_numbers() {
+        work.charge(2);
+        if work.spent() {
+            return Err(RedactError::TooComplex);
+        }
+        let Ok(object) = doc.try_get(num) else { return Err(RedactError::Refused(Refusal::CopyNotClearable)) };
+        let mut names_used: Vec<Object> = Vec::new();
+        destination_names(&object, &mut names_used, 0)?;
+        for name in names_used {
+            let Some(bytes) = name_bytes(&name).map(<[u8]>::to_vec) else { continue };
+            if existing.contains(&bytes) || renames.contains_key(&bytes) {
+                continue;
+            }
+            let reading = match &name {
+                Object::Name(n) => read_name(n),
+                _ => read_text(&bytes),
+            };
+            if name_held(reading, removed, report) {
+                let new = fresh(&mut existing);
+                renames.insert(bytes, new);
+            }
+        }
+    }
     let mut tree_changed = false;
     for (key, _) in &mut tree {
         if name_held(read_text(key), removed, report) {
@@ -675,6 +707,7 @@ fn rename_destinations(doc: &mut Document, removed: &Removed, report: &mut Repor
     }
     report.destinations_renamed += renames.len();
     if renames.is_empty() {
+        // Nothing renamed, nothing to follow.
         return Ok(());
     }
     if let (Some(dict), Some(entry)) = (dests, dests_entry) {
@@ -713,10 +746,37 @@ fn rename_destinations(doc: &mut Document, removed: &Removed, report: &mut Repor
             return Err(RedactError::TooComplex);
         }
         let r = ObjRef::new(num, 0);
-        let Ok(object) = doc.try_get(num) else { continue };
+        let Ok(object) = doc.try_get(num) else { return Err(RedactError::Refused(Refusal::CopyNotClearable)) };
         let mut value = (*object).clone();
         if follow(&mut value, &renames, 0) {
             doc.set(r, value);
+        }
+    }
+    Ok(())
+}
+
+/// Every name or string a `/Dest` or `/D` in `value` (dictionaries and arrays written in it)
+/// holds, into `out`. Deeper than 64 levels refuses (never passed over).
+fn destination_names(value: &Object, out: &mut Vec<Object>, depth: usize) -> Result<(), RedactError> {
+    if depth > 64 {
+        return Err(RedactError::TooComplex);
+    }
+    let dict = match value {
+        Object::Dict(dict) => dict,
+        Object::Stream(stream) => &stream.dict,
+        Object::Array(items) => {
+            for item in items {
+                destination_names(item, out, depth + 1)?;
+            }
+            return Ok(());
+        }
+        _ => return Ok(()),
+    };
+    for (key, value) in dict.iter() {
+        if matches!(key.as_slice(), b"Dest" | b"D") && matches!(value, Object::Name(_) | Object::String(_)) {
+            out.push(value.clone());
+        } else {
+            destination_names(value, out, depth + 1)?;
         }
     }
     Ok(())
@@ -781,20 +841,21 @@ fn collect_tree(
     if depth > 64 || out.len() > 100_000 {
         return Err(RedactError::TooComplex);
     }
+    // Final audit: a tree that loops is refused (the inspector refuses it too), never passed.
     if let Some(r) = node.as_ref()
         && !seen.insert(r)
     {
-        return Ok(());
+        return Err(RedactError::Refused(Refusal::CopyNotClearable));
     }
     work.charge(4);
     let Some(dict) = doc.resolve(node).as_dict().cloned() else { return Ok(()) };
     if let Some(items) = dict.get(b"Names").and_then(|n| doc.resolve(n).as_array().cloned()) {
         for pair in items.chunks(2) {
-            if let (Some(key), Some(value)) = (pair.first(), pair.get(1))
-                && let Some(key) = doc.resolve(key).as_string()
-            {
-                out.push((key.bytes.clone(), value.clone()));
-            }
+            let (Some(key), Some(value)) = (pair.first(), pair.get(1)) else { return Err(RedactError::Refused(Refusal::CopyNotClearable)) };
+            let Some(key) = doc.resolve(key).as_string().map(|key| key.bytes.clone()) else {
+                return Err(RedactError::Refused(Refusal::CopyNotClearable));
+            };
+            out.push((key, value.clone()));
         }
     }
     if let Some(kids) = dict.get(b"Kids").and_then(|k| doc.resolve(k).as_array().cloned()) {
@@ -953,6 +1014,113 @@ mod tests {
         }
         for (removed, copy, held) in extra {
             assert_eq!(Removed::from_text(removed).held_in(copy), *held, "{removed:?} in {copy:?}");
+        }
+    }
+
+    /// A small deterministic generator (xorshift), so the property tests repeat exactly.
+    struct Random(u64);
+
+    impl Random {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+
+        fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
+            &items[self.below(items.len())]
+        }
+    }
+
+    /// How a candidate reads, as `holds` takes it: read alike and holding a removed word, or not
+    /// read alike (cleared either way).
+    fn cleared(bytes: &[u8], removed: &Removed) -> bool {
+        match read_text(bytes) {
+            Reading::Read(text) => removed.held_in(&text),
+            Reading::Unread => true,
+        }
+    }
+
+    fn encode(text: &str, how: usize) -> Option<Vec<u8>> {
+        match how {
+            0 => Some([0xFE, 0xFF].into_iter().chain(text.encode_utf16().flat_map(u16::to_be_bytes)).collect()),
+            1 => Some([0xEF, 0xBB, 0xBF].into_iter().chain(text.bytes()).collect()),
+            // PDFDocEncoding, where every character is one of its printable Latin-1 ones.
+            _ => text
+                .chars()
+                .map(|c| u8::try_from(u32::from(c)).ok().filter(|b| (0x20..0x7F).contains(b) || (0xA1..=0xFF).contains(b) && *b != 0xAD))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_copy_holding_the_token_in_any_form_is_cleared() {
+        // Final audit (property): for random tokens, whatever form the copy writes them in (case,
+        // full-width, decomposed, a ligature, a final sigma, an invisible character inside) and
+        // whatever encoding (UTF-16BE, UTF-8, PDFDocEncoding), with any separators around, the
+        // copy is cleared.
+        const LETTERS: [char; 34] = [
+            'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'k', 'l', 'm', 'n', 'o', 'p', 'r', 's', 't', 'u', 'w', 'y', 'z', '\u{e9}', '\u{fc}',
+            '\u{f1}', '\u{e7}', '\u{3b1}', '\u{3b2}', '\u{3b3}', '\u{3b4}', '\u{3bb}', '\u{3bc}', '\u{3c0}', '\u{3c3}',
+        ];
+        const SEPARATORS: [&str; 7] = [" ", "\t", ", ", " - ", "\u{a0}", "/", "\n"];
+        let mut random = Random(0x9E37_79B9_7F4A_7C15);
+        for _ in 0..4_000 {
+            let length = 4 + random.below(6);
+            let token: String = (0..length).map(|_| *random.pick(&LETTERS)).collect();
+            let removed_form = if random.below(2) == 0 { token.clone() } else { token.to_uppercase() };
+            let removed = Removed::from_text(&removed_form);
+            let mut form = match random.below(6) {
+                0 => token.clone(),
+                1 => token.to_uppercase(),
+                2 => token
+                    .chars()
+                    .map(|c| if c.is_ascii_lowercase() { char::from_u32(u32::from(c) - 0x61 + 0xFF41).unwrap_or(c) } else { c })
+                    .collect(),
+                3 => token.nfd().collect(),
+                4 => token.replace("fi", "\u{fb01}"),
+                _ => token.strip_suffix('\u{3c3}').map(|rest| format!("{rest}\u{3c2}")).unwrap_or_else(|| token.clone()),
+            };
+            if random.below(3) == 0 {
+                let at = form.char_indices().map(|(at, _)| at).nth(1 + random.below(length - 1)).unwrap_or(form.len());
+                form.insert(at, *random.pick(&['\u{ad}', '\u{200b}', '\u{2060}', '\u{feff}']));
+            }
+            let copy = format!("Clause{}{form}{}annex", random.pick(&SEPARATORS), random.pick(&SEPARATORS));
+            for how in 0..3 {
+                let Some(bytes) = encode(&copy, how) else { continue };
+                assert!(cleared(&bytes, &removed), "{removed_form:?} in {copy:?} (encoding {how})");
+            }
+        }
+    }
+
+    #[test]
+    fn a_string_the_readers_read_otherwise_or_not_at_all_is_cleared() {
+        // Final audit (property): for random bytes (with or without a mark), a string pdf.js's
+        // rules and the standard's read otherwise, or that either cannot read cleanly, is
+        // cleared, whatever was removed.
+        let nothing = Removed::from_text("");
+        let mut random = Random(0xD1B5_4A32_D192_ED03);
+        for _ in 0..20_000 {
+            let mut bytes: Vec<u8> = match random.below(4) {
+                0 => vec![0xFE, 0xFF],
+                1 => vec![0xFF, 0xFE],
+                2 => vec![0xEF, 0xBB, 0xBF],
+                _ => Vec::new(),
+            };
+            let length = random.below(12);
+            bytes.extend((0..length).map(|_| if random.below(3) == 0 { random.next() as u8 } else { b'a' + random.below(26) as u8 }));
+            let (pdf_js, standard) = (as_pdf_js_reads(&bytes), as_the_standard_reads(&bytes));
+            if pdf_js != standard
+                || standard.contains('\u{fffd}')
+                || standard.chars().any(|c| c.is_control() && !matches!(c, '\t' | '\n' | '\r' | '\u{c}' | '\u{1b}'))
+            {
+                assert!(cleared(&bytes, &nothing), "{bytes:02X?}: {pdf_js:?} / {standard:?}");
+            }
         }
     }
 
