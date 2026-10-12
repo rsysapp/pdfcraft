@@ -199,28 +199,27 @@ pub(crate) fn value(data: &[u8], pos: usize, depth: usize, budget: &mut Budget) 
     }
 }
 
-/// Follow-up 8 (R6b-51, I3): the number of the object whose header (`N G obj`, after
-/// whitespace) starts at `offset`, read without loading anything: `None` when none does.
-pub(crate) fn object_header(data: &[u8], offset: usize) -> Option<u32> {
+/// Follow-up 8 (R6b-51, I3): the number and generation of the object whose header (`N G obj`,
+/// after whitespace) starts at `offset`, read without loading anything: `None` when none does.
+pub(crate) fn object_header(data: &[u8], offset: usize) -> Option<(u32, u16)> {
     let mut pos = offset;
-    let mut number = None;
-    for expected in [None, None, Some(&b"obj"[..])] {
+    let mut parts = [0u64; 2];
+    for (index, expected) in [None, None, Some(&b"obj"[..])].into_iter().enumerate() {
         pos = past_whitespace(data, pos);
         let word = token(data, pos);
-        let fits = match expected {
-            None => !word.is_empty() && word.len() <= 10 && word.iter().all(u8::is_ascii_digit),
-            Some(keyword) => word == keyword,
-        };
-        if !fits {
-            return None;
-        }
-        if number.is_none() {
-            number = std::str::from_utf8(word).ok().and_then(|digits| digits.parse::<u32>().ok());
-            number?;
+        match expected {
+            None => {
+                if word.is_empty() || word.len() > 10 || !word.iter().all(u8::is_ascii_digit) {
+                    return None;
+                }
+                *parts.get_mut(index)? = std::str::from_utf8(word).ok()?.parse().ok()?;
+            }
+            Some(keyword) if word == keyword => {}
+            Some(_) => return None,
         }
         pos = pos.saturating_add(word.len());
     }
-    number
+    Some((u32::try_from(parts[0]).ok()?, u16::try_from(parts[1]).ok()?))
 }
 
 /// The end (past `endobj`) of the object whose header starts at `listed.offset`, and its keys

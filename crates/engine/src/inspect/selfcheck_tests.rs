@@ -115,3 +115,46 @@ fn resources_drawn_under_the_box_cannot_keep_the_redacted_word() {
         assert!(!passes(&base, &page(&format!("{BLACK}\n{KEEP}"), &format!("/Font << /F1 {font} >>"), &[tounicode])), "{font}");
     }
 }
+
+#[test]
+fn every_operand_a_brought_stream_holds_is_what_its_operator_takes() {
+    // Follow-up 8 audit (operators): operands of the wrong type, arrays and dictionaries
+    // nested in operands, inline images, colour operands past what a colour takes, text in a
+    // pattern's cell.
+    let base = page(&format!("{LINE}\n{KEEP}\nq 10 0 0 10 150 10 cm BI /W 2 /H 1 /CS /G /BPC 8 ID\nab\nEI Q"), "", &[]);
+    let kept_image = "q 10 0 0 10 150 10 cm BI /W 2 /H 1 /CS /G /BPC 8 ID\nab\nEI Q";
+    assert!(passes(&base, &page(&format!("{BLACK}\n{KEEP}\n{kept_image}"), "", &[])), "the honest redaction");
+    for (case, content) in [
+        ("a string for a number", format!("0 0 (SECRETWORD) RG\n{BLACK}\n{KEEP}\n{kept_image}")),
+        ("a string in a dash array", format!("[1 (SECRETWORD)] 0 d\n{BLACK}\n{KEEP}\n{kept_image}")),
+        ("an array in a dash array", format!("[1 [2]] 0 d\n{BLACK}\n{KEEP}\n{kept_image}")),
+        ("a string before a pattern name", format!("/Pattern cs (SECRETWORD) /P1 scn\n{BLACK}\n{KEEP}\n{kept_image}")),
+        ("five colour operands", format!("1 2 3 4 5 sc\n{BLACK}\n{KEEP}\n{kept_image}")),
+        (
+            "an inline image's own entry",
+            format!("{BLACK}\n{KEEP}\nq 10 0 0 10 150 10 cm BI /W 2 /H 1 /CS /G /BPC 8 /Secret (SECRETWORD) ID\nab\nEI Q"),
+        ),
+        ("an inline image the base had not", format!("{BLACK}\n{KEEP}\nq 10 0 0 10 150 10 cm BI /W 10 /H 1 /CS /G /BPC 8 ID\nSECRETWORD\nEI Q")),
+        ("an unknown operator inside BX/EX", format!("BX /SECRETWORD secretop EX\n{BLACK}\n{KEEP}\n{kept_image}")),
+    ] {
+        assert!(!passes(&base, &page(&content, "", &[])), "{case}");
+    }
+    // A pattern whose cell the rewrite brings shows text no comparison reads.
+    let cell = |content: &str| {
+        stream(
+            "/PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 200 300] /XStep 200 /YStep 300 /Resources << /Font << /F1 6 0 R >> >>",
+            content.as_bytes(),
+        )
+    };
+    let painted = |rest: &str| format!("q /Pattern cs /P1 scn 150 250 40 40 re f Q\n{rest}");
+    let base = page(&painted(&format!("{LINE}\n{KEEP}")), "/Pattern << /P1 5 0 R >>", &[cell("0 g 0 0 10 10 re f"), HELVETICA.as_bytes().to_vec()]);
+    let honest =
+        page(&painted(&format!("{BLACK}\n{KEEP}")), "/Pattern << /P1 5 0 R >>", &[cell("0 g 0 0 10 10 re f"), HELVETICA.as_bytes().to_vec()]);
+    assert!(passes(&base, &honest), "the pattern kept");
+    let forged = page(
+        &painted(&format!("{BLACK}\n{KEEP}")),
+        "/Pattern << /P1 5 0 R >>",
+        &[cell("0 g 0 0 10 10 re f BT /F1 1 Tf 20 150 Td (SECRETWORD) Tj ET"), HELVETICA.as_bytes().to_vec()],
+    );
+    assert!(!passes(&base, &forged), "text in a cell the rewrite brings");
+}

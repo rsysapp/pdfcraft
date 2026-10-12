@@ -263,14 +263,34 @@ impl Stream {
             .collect()
     }
 
-    /// Embed build: the encoded bytes past where the first filter stops reading (a Flate
-    /// stream's data after its end; `None`: no such filter, or nothing after it), and the bytes
-    /// inflated to find it (for a caller that charges the work). `Err` when the data cannot be
-    /// read to its end within `max` bytes made.
+    /// Embed build: the encoded bytes past where the first filter stops reading (after a Flate
+    /// stream's end and Adler-32, an ASCII filter's or run-length end-of-data marker, a JPEG's
+    /// last end-of-image marker; `None`: nothing after it, or a filter whose end is not told),
+    /// and the bytes inflated to find it (for a caller that charges the work). `Err` when Flate
+    /// data cannot be read to its end within `max` bytes made, or its Adler-32 is wrong.
     pub fn trailing_data(&self, max: usize) -> Result<(Option<&[u8]>, usize), CosError> {
-        let Some((Filter::Flate, _)) = self.filters().first().cloned() else { return Ok((None, 0)) };
-        let (end, made) = pdfcraft_filters::flate_end(&self.raw, max).map_err(|e| CosError::Filter(e.to_string()))?;
-        Ok((self.raw.get(end..).filter(|rest| !rest.is_empty()), made))
+        let raw = self.raw.as_slice();
+        let (end, made) = match self.filters().first().map(|(filter, _)| filter) {
+            Some(Filter::Flate) => pdfcraft_filters::flate_end(raw, max).map_err(|e| CosError::Filter(e.to_string()))?,
+            // Their end-of-data markers: `>`, `~>`, a length byte of 128, a JPEG's last
+            // end-of-image marker.
+            Some(Filter::AsciiHex) => (raw.iter().position(|byte| *byte == b'>').map_or(raw.len(), |at| at + 1), 0),
+            Some(Filter::Ascii85) => (raw.windows(2).position(|pair| pair == b"~>").map_or(raw.len(), |at| at + 2), 0),
+            Some(Filter::RunLength) => {
+                let mut at = 0usize;
+                loop {
+                    match raw.get(at) {
+                        None => break (raw.len(), 0),
+                        Some(128) => break (at + 1, 0),
+                        Some(&length) if length < 128 => at = at.saturating_add(usize::from(length) + 2),
+                        Some(_) => at = at.saturating_add(2),
+                    }
+                }
+            }
+            Some(Filter::Dct) => (raw.windows(2).rposition(|pair| pair == [0xFF, 0xD9]).map_or(raw.len(), |at| at + 2), 0),
+            _ => return Ok((None, 0)),
+        };
+        Ok((raw.get(end..).filter(|rest| !rest.is_empty()), made))
     }
 
     /// Decoded data, tolerating truncated or corrupt encodings the way viewers do (the data

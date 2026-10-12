@@ -1168,7 +1168,7 @@ fn account_bytes(doc: &Document, from: usize, base_trailer: Option<&pdfcraft_cos
     for num in doc.object_numbers() {
         budget.tick()?;
         match doc.xref_entry(num) {
-            Some(pdfcraft_cos::XrefEntry::InFile { offset, .. }) => {
+            Some(pdfcraft_cos::XrefEntry::InFile { offset, generation }) => {
                 let offset = usize::try_from(offset).map_err(|_| refuse(format!("object {num} lies past the file")))?;
                 if offset < from {
                     continue;
@@ -1177,7 +1177,7 @@ fn account_bytes(doc: &Document, from: usize, base_trailer: Option<&pdfcraft_cos
                 // refused before anything is loaded (`pdfcraft_cos` would search the whole file
                 // for the number, once per such row).
                 budget.object()?;
-                if layout::object_header(data, offset) != Some(num) {
+                if layout::object_header(data, offset) != Some((num, generation)) {
                     return Err(refuse(format!("the file lists object {num} where no object {num} starts")));
                 }
                 let found = doc.try_get(num).map_err(|_| refuse(format!("the file holds object {num}, which cannot be read")))?;
@@ -1193,6 +1193,16 @@ fn account_bytes(doc: &Document, from: usize, base_trailer: Option<&pdfcraft_cos
                             return Err(refuse(format!("stream {num} holds data after its end, which no decoder reads")));
                         }
                         if stream.dict.name(b"Type") == Some(b"ObjStm") {
+                            // Its dictionary is read for nothing but how to find what it holds.
+                            const OBJECT_STREAM_KEYS: [&[u8]; 7] = [b"Type", b"N", b"First", b"Filter", b"DecodeParms", b"Length", b"DL"];
+                            if let Some((key, _)) =
+                                stream.dict.iter().find(|(key, value)| !OBJECT_STREAM_KEYS.contains(&key.as_slice()) || !plain_entry(key, value))
+                            {
+                                return Err(refuse(format!(
+                                    "object stream {num}'s /{} is not what an object stream says",
+                                    String::from_utf8_lossy(key)
+                                )));
+                            }
                             let (decoded, made) = stream
                                 .decoded_strict_counted(budget.content_room())
                                 .map_err(|_| refuse(format!("object stream {num} cannot be decoded")))?;
@@ -1251,6 +1261,11 @@ fn account_bytes(doc: &Document, from: usize, base_trailer: Option<&pdfcraft_cos
             if !own && !kept {
                 return Err(refuse(format!("a trailer holds /{}, which no fact reports", String::from_utf8_lossy(key))));
             }
+            // Its value is what the key says, and nothing more (a dictionary or array that no
+            // reader reads could hold anything).
+            if own && !kept && key.as_slice() != b"ID" && !trailer.get(key).is_some_and(|value| plain_entry(key, value)) {
+                return Err(refuse(format!("a trailer's /{} is not what the key says", String::from_utf8_lossy(key))));
+            }
         }
         if let Some(id) = trailer.get(b"ID") {
             let fresh = matches!(id, pdfcraft_cos::Object::Array(items) if items.len() == 2
@@ -1263,6 +1278,37 @@ fn account_bytes(doc: &Document, from: usize, base_trailer: Option<&pdfcraft_cos
         }
     }
     Ok(())
+}
+
+/// Follow-up 8 audit (C): whether a trailer's, cross-reference stream's or object stream's
+/// entry holds what its key says and nothing more: numbers where numbers go, references,
+/// filter names, and decoding parameters of numbers.
+fn plain_entry(key: &[u8], value: &pdfcraft_cos::Object) -> bool {
+    use pdfcraft_cos::Object;
+    let int = |value: &Object| matches!(value, Object::Int(_));
+    let parameters = |value: &Object| match value {
+        Object::Dict(parameters) => parameters
+            .iter()
+            .all(|(key, value)| matches!(key.as_slice(), b"Predictor" | b"Columns" | b"Colors" | b"BitsPerComponent" | b"EarlyChange") && int(value)),
+        Object::Null => true,
+        _ => false,
+    };
+    match key {
+        b"Size" | b"Prev" | b"N" | b"First" | b"Length" | b"DL" => int(value),
+        b"Root" | b"Info" => matches!(value, Object::Ref(_)),
+        b"Type" => matches!(value, Object::Name(name) if matches!(name.as_slice(), b"XRef" | b"ObjStm")),
+        b"W" | b"Index" => matches!(value, Object::Array(items) if items.iter().all(int)),
+        b"Filter" => match value {
+            Object::Name(_) => true,
+            Object::Array(names) => names.iter().all(|name| matches!(name, Object::Name(_))),
+            _ => false,
+        },
+        b"DecodeParms" => match value {
+            Object::Array(items) => items.iter().all(parameters),
+            other => parameters(other),
+        },
+        _ => false,
+    }
 }
 
 /// R6b-48: every object a rewrite holds must be reachable from the trailer's `/Root` or `/Info`

@@ -127,6 +127,12 @@ pub(crate) fn gather(data: &[u8], base: &mut ContentBase, budget: &mut Budget) -
         if matches!(operator, b"BMC" | b"BDC" | b"MP" | b"DP") {
             base.marked.insert(marked(operator, operands));
         }
+        if operator == b"BI" {
+            if let Some(Object::String(image)) = operands.get(1) {
+                base.inline.insert(sha256(&[b"inline", &image.bytes]));
+            }
+            return Ok(());
+        }
         if shape(operator).is_none_or(|shape| !fits(shape, operands)) {
             base.odd.insert(whole(operator, operands));
         }
@@ -134,16 +140,79 @@ pub(crate) fn gather(data: &[u8], base: &mut ContentBase, budget: &mut Budget) -
     })
 }
 
+/// What a content stream a rewrite brings holds (see [`check`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Brought {
+    /// It shows text (`Tj`, `TJ`, `'`, `"`): where no glyph is extracted (a tiling pattern's
+    /// cell, a soft mask's group), nothing would compare it.
+    pub shows_text: bool,
+}
+
+/// An inline image's dictionary entry as the redactor keeps one: a standard key holding a
+/// name, a number, a boolean, an array of them, or decoding parameters of numbers. (Its data is
+/// compared whole with the base's inline images.)
+fn plain_image_entry(key: &[u8], value: &Object) -> bool {
+    const KEYS: [&[u8]; 22] = [
+        b"W",
+        b"Width",
+        b"H",
+        b"Height",
+        b"BPC",
+        b"BitsPerComponent",
+        b"CS",
+        b"ColorSpace",
+        b"D",
+        b"Decode",
+        b"DP",
+        b"DecodeParms",
+        b"F",
+        b"Filter",
+        b"I",
+        b"Interpolate",
+        b"IM",
+        b"ImageMask",
+        b"Intent",
+        b"L",
+        b"Length",
+        b"SMaskInData",
+    ];
+    let plain = |value: &Object| matches!(value, Object::Int(_) | Object::Real(_) | Object::Name(_) | Object::Bool(_) | Object::Null);
+    KEYS.contains(&key)
+        && match value {
+            Object::Array(items) => {
+                items.iter().all(|item| plain(item) || matches!(item, Object::Dict(parameters) if parameters.iter().all(|(_, v)| plain(v))))
+            }
+            Object::Dict(parameters) => parameters.iter().all(|(_, v)| plain(v)),
+            other => plain(other),
+        }
+}
+
 /// Check a content stream a rewrite brings (see the module documentation) against what the
 /// base's content streams hold (see [`gather`]): an operator written otherwise than the
 /// redactor writes may only be one the base's content had, operands and all.
-pub(crate) fn check(data: &[u8], base: &ContentBase, budget: &mut Budget) -> Result<(), Fail> {
+pub(crate) fn check(data: &[u8], base: &ContentBase, budget: &mut Budget) -> Result<Brought, Fail> {
     // The editor's own wrapper around a page's original content (`pdfcraft_edit`), whose
     // comment names the editor and nothing else.
     if matches!(data, b"q %PdfCraft\n" | b"Q %PdfCraft\n") {
-        return Ok(());
+        return Ok(Brought::default());
     }
+    let mut brought = Brought::default();
     walk(data, budget, true, &mut |operator, operands| {
+        if operator == b"BI" {
+            // An inline image: one of the base's, its dictionary holding nothing but how to
+            // read it.
+            let (Some(Object::Dict(dict)), Some(Object::String(image))) = (operands.first(), operands.get(1)) else {
+                return Err(refused("an inline image that cannot be read"));
+            };
+            if let Some((key, _)) = dict.iter().find(|(key, value)| !plain_image_entry(key, value)) {
+                return Err(refused(format!("an inline image's /{}", String::from_utf8_lossy(key))));
+            }
+            if !base.inline.contains(&sha256(&[b"inline", &image.bytes])) {
+                return Err(refused("an inline image the base's content did not have"));
+            }
+            return Ok(());
+        }
+        brought.shows_text |= matches!(operator, b"Tj" | b"TJ" | b"'" | b"\"");
         let fitting = shape(operator).filter(|shape| fits(*shape, operands));
         if fitting.is_none() && !base.odd.contains(&whole(operator, operands)) {
             return Err(match shape(operator) {
@@ -155,7 +224,8 @@ pub(crate) fn check(data: &[u8], base: &ContentBase, budget: &mut Budget) -> Res
             return Err(refused(format!("marked content (`{}`) the base's content did not have", String::from_utf8_lossy(operator))));
         }
         Ok(())
-    })
+    })?;
+    Ok(brought)
 }
 
 /// What [`walk`] calls with each operator and its operands.
@@ -216,8 +286,12 @@ fn walk(data: &[u8], budget: &mut Budget, strict: bool, each: &mut Each<'_>) -> 
             if strict && !operands.is_empty() {
                 return Err(refused("operands before an inline image"));
             }
-            match inline_image_end(data, lexer.pos) {
-                Some(end) => lexer.pos = end,
+            match inline_image(data, lexer.pos) {
+                Some((end, dict, image)) => {
+                    lexer.pos = end;
+                    let image = data.get(image).unwrap_or_default().to_vec();
+                    each(b"BI", &[Object::Dict(dict), Object::String(pdfcraft_cos::PdfString { bytes: image, hex: false })])?;
+                }
                 None if strict => return Err(refused("an inline image that does not end")),
                 None => break,
             }
@@ -237,7 +311,7 @@ fn walk(data: &[u8], budget: &mut Budget, strict: bool, each: &mut Each<'_>) -> 
 /// up to `ID`; where its size, colour space and depth give its data's length (no filter), that
 /// many bytes after the one whitespace byte, then whitespace and `EI`; otherwise as the
 /// structure scan finds it (whitespace, `EI`, then whitespace, a delimiter or the end).
-fn inline_image_end(data: &[u8], from: usize) -> Option<usize> {
+fn inline_image(data: &[u8], from: usize) -> Option<(usize, Dict, std::ops::Range<usize>)> {
     let mut lexer = Lexer::new(data, from);
     let mut dict = Dict::new();
     loop {
@@ -266,7 +340,7 @@ fn inline_image_end(data: &[u8], from: usize) -> Option<usize> {
         let rest = data.get(end..)?;
         let ei = rest.iter().position(|byte| !byte.is_ascii_whitespace())?;
         if rest.get(ei..ei.checked_add(2)?) == Some(b"EI") {
-            return end.checked_add(ei)?.checked_add(2);
+            return Some((end.checked_add(ei)?.checked_add(2)?, dict, begin..end));
         }
     }
     let mut at = begin;
@@ -275,7 +349,7 @@ fn inline_image_end(data: &[u8], from: usize) -> Option<usize> {
         let before = at == begin || data.get(at.wrapping_sub(1)).is_some_and(|byte| byte.is_ascii_whitespace());
         let after = data.get(at.checked_add(2)?).is_none_or(|byte| byte.is_ascii_whitespace() || b"()<>[]{}/%".contains(byte));
         if e == b'E' && i == b'I' && before && after {
-            return at.checked_add(2);
+            return Some((at.checked_add(2)?, dict, begin..at));
         }
         at = at.checked_add(1)?;
     }

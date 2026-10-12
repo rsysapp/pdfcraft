@@ -871,6 +871,9 @@ struct Scan {
     /// Follow-up 8 (R6b-51, C1): a content stream (or, for a page, one of its streams) the
     /// rewrite brings: the resources it names must all exist.
     new: bool,
+    /// Follow-up 8 audit (operators): a form's, pattern's or group's content stream the rewrite
+    /// brings shows text.
+    shows_text: bool,
     /// Follow-up 8 (R6b-51, C1): why a content stream the rewrite brings is not written as the
     /// redactor writes (see `operators`).
     violation: Option<String>,
@@ -1107,6 +1110,8 @@ struct Reader<'d, 'b> {
     /// [`ContentRule`]), and the base's content as gathered.
     content_rule: ContentRule,
     content_base: ContentBase,
+    /// Whether the content stream last checked shows text (see `operators::Brought`).
+    shows_text: bool,
 }
 
 /// Follow-up 8 (R6b-51, C1): the base's content streams, by their decoded data's digest, and
@@ -1117,6 +1122,8 @@ pub(crate) struct ContentBase {
     pub marked: HashSet<Digest>,
     /// The operators written otherwise than the redactor writes them (see `operators::gather`).
     pub odd: HashSet<Digest>,
+    /// The inline images' data.
+    pub inline: HashSet<Digest>,
 }
 
 /// What the reader does with each content stream it decodes.
@@ -1808,10 +1815,12 @@ impl<'d, 'b> Reader<'d, 'b> {
             return Ok(found.clone());
         }
         let data = self.decode(stream)?;
+        self.shows_text = false;
         let (new, violation) = self.content_stream(&data)?;
         let mut scan = self.scan(&data)?;
         scan.new = new;
         scan.violation = violation;
+        scan.shows_text = std::mem::take(&mut self.shows_text);
         let scan = Arc::new(scan);
         self.forms.insert(r, scan.clone());
         Ok(scan)
@@ -1837,7 +1846,10 @@ impl<'d, 'b> Reader<'d, 'b> {
                     return Ok((false, None));
                 }
                 match super::operators::check(data, &base, self.budget) {
-                    Ok(()) => Ok((true, None)),
+                    Ok(brought) => {
+                        self.shows_text = brought.shows_text;
+                        Ok((true, None))
+                    }
                     Err(Fail::Read(why)) => Ok((true, Some(why))),
                     Err(other) => Err(other),
                 }
@@ -1935,7 +1947,7 @@ impl<'d, 'b> Reader<'d, 'b> {
             before = None;
             dict = None;
         }
-        Ok(Scan { digest: sha256(&[data]), items, len: data.len(), new: false, violation: None })
+        Ok(Scan { digest: sha256(&[data]), items, len: data.len(), new: false, violation: None, shows_text: false })
     }
 
     /// An inline image after `BI`: its digest and pixel count, and where it ends (after `EI`).
@@ -2216,6 +2228,11 @@ impl<'d, 'b> Reader<'d, 'b> {
                     if drawn.violation.is_none() {
                         drawn.violation.clone_from(&scan.violation);
                     }
+                    // Follow-up 8 audit (operators): no glyph in a cell is extracted, so a cell
+                    // the rewrite brings may show no text.
+                    if scan.new && scan.shows_text && drawn.violation.is_none() {
+                        drawn.violation = Some("a tiling pattern's cell the rewrite brings shows text no comparison reads".into());
+                    }
                     drawn.interpreted = drawn.interpreted.saturating_add(scan.len);
                     let (inner, key) = self.inner_chain(stream.dict.get(b"Resources"), "a pattern's /Resources", chain, &at.chain)?;
                     if let Some(own) = inner.first() {
@@ -2251,6 +2268,9 @@ impl<'d, 'b> Reader<'d, 'b> {
                     let scan = self.form_content(group, stream)?;
                     if drawn.violation.is_none() {
                         drawn.violation.clone_from(&scan.violation);
+                    }
+                    if scan.new && scan.shows_text && drawn.violation.is_none() {
+                        drawn.violation = Some("a soft mask's group the rewrite brings shows text no comparison reads".into());
                     }
                     let key = self.form_key(group, stream)?;
                     self.group_risk(&stream.dict, drawn)?;
@@ -2343,6 +2363,13 @@ impl<'d, 'b> Reader<'d, 'b> {
                         list.iter().filter(|(key, _)| !STRUCT_TEXT_KEYS.contains(&key.as_slice())).map(|(k, v)| (k.clone(), v.clone())).collect();
                     let digest = self.digest(&Object::Dict(untexted))?;
                     sha256(&[b"resource", kind, &digest])
+                }
+                // A tiling pattern's cell is content, judged as content the rewrite brings is
+                // (written as the redactor writes, showing no text, its images compared by
+                // identity, its pixels by the renders): the pattern but for its cell.
+                (b"Pattern", Object::Stream(pattern)) => {
+                    let dict = self.digest_without(&pattern.dict, &FORM_KEY_LEFT_OUT)?;
+                    sha256(&[b"resource", kind, b"cell left out", &dict])
                 }
                 // A soft mask's group is a form, compared as forms are (its glyphs, images and
                 // pixels): the state but for it.
@@ -4281,6 +4308,7 @@ impl Known {
             label_values: (Vec::new(), Vec::new()),
             content_rule: ContentRule::None,
             content_base: ContentBase::default(),
+            shows_text: false,
         }
     }
 
@@ -4445,6 +4473,7 @@ pub(crate) fn read(
         label_values: (Vec::new(), Vec::new()),
         content_rule,
         content_base: ContentBase::default(),
+        shows_text: false,
     };
     let Some(root) = doc.root() else { return Err(read_error("the trailer's /Root is not a reference")) };
     let catalog = reader.get(root)?.as_dict().cloned().ok_or_else(|| read_error("the catalog is not a dictionary"))?;

@@ -1602,6 +1602,12 @@ fn objects_the_readers_could_take_differently_fail_closed() {
 /// file and, in an object stream, the catalog, the page tree and `extra` (objects 6…), each
 /// listed.
 fn rewrite_with_object_stream(extra: &[&str]) -> Vec<u8> {
+    rewrite_with_object_stream_dicts(extra, "", "")
+}
+
+/// [`rewrite_with_object_stream`], with entries added to the object stream's dictionary and the
+/// cross-reference stream's.
+fn rewrite_with_object_stream_dicts(extra: &[&str], object_stream: &str, xref: &str) -> Vec<u8> {
     let mut b = Builder::new();
     b.object(3, format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R {RESOURCES} >>").as_bytes());
     b.object(4, &stream("", &[text("Alpha"), b"\n0 g 146 14 16 18 re f".to_vec()].concat()));
@@ -1616,7 +1622,10 @@ fn rewrite_with_object_stream(extra: &[&str]) -> Vec<u8> {
         bodies.push(' ');
     }
     let container = 6 + extra.len() as u32;
-    b.object(container, &stream(&format!("/Type /ObjStm /N {} /First {}", members.len(), header.len()), format!("{header}{bodies}").as_bytes()));
+    b.object(
+        container,
+        &stream(&format!("/Type /ObjStm /N {} /First {} {object_stream}", members.len(), header.len()), format!("{header}{bodies}").as_bytes()),
+    );
     let xref_num = container + 1;
     let at = b.out.len();
     let row = |kind: u8, field: usize, extra: u16| {
@@ -1634,7 +1643,7 @@ fn rewrite_with_object_stream(extra: &[&str]) -> Vec<u8> {
         });
     }
     entries.extend(row(1, at, 0));
-    b.object(xref_num, &stream(&format!("/Type /XRef /Size {} /W [1 4 2] /Root 1 0 R", xref_num + 1), &entries));
+    b.object(xref_num, &stream(&format!("/Type /XRef /Size {} /W [1 4 2] /Root 1 0 R {xref}", xref_num + 1), &entries));
     b.out.extend_from_slice(format!("startxref\n{at}\n%%EOF\n").as_bytes());
     b.out
 }
@@ -2509,4 +2518,59 @@ fn names_nothing_reads_cannot_carry_what_a_rewrite_took_away() {
         inspect(&base, &laid_out("", &fonts("Spare"), X_BOX, b""), InspectLimits::default()).unwrap().content.pages_changed_outside_redactions,
         0
     );
+}
+
+#[test]
+fn what_a_stream_holds_past_its_end_or_beside_what_it_says_is_refused() {
+    // Follow-up 8 audit (A, B, C). The byte accounting reads each stream to where its filter
+    // stops, and the dictionaries no fact compares (a trailer, a cross-reference stream's, an
+    // object stream's) hold only what their keys say.
+    let base = laid_out("", "", X, b"");
+    let content = [text("Alpha"), b"\n".to_vec(), X_BOX.as_bytes().to_vec()].concat();
+    let encoded = |filter: &str, raw: Vec<u8>| strictly("%PDF-1.7\n", move |num, body| if num == 4 { stream(filter, &raw) } else { body }, "");
+    let deflated = pdfcraft_cos::Stream::flate(pdfcraft_cos::Dict::new(), &content).raw.as_ref().clone();
+    assert!(inspect(&base, &encoded("/Filter /FlateDecode", deflated.clone()), InspectLimits::default()).is_ok());
+    let mut wrong_sum = deflated.clone();
+    let last = wrong_sum.len() - 4;
+    wrong_sum[last..].copy_from_slice(b"SECR");
+    let mut second = deflated.clone();
+    second.extend_from_slice(&pdfcraft_cos::Stream::flate(pdfcraft_cos::Dict::new(), b"SECRET X").raw);
+    let hex: Vec<u8> = content.iter().flat_map(|byte| format!("{byte:02X}").into_bytes()).chain(b">SECRET X".iter().copied()).collect();
+    let mut run = Vec::new();
+    for chunk in content.chunks(128) {
+        run.push(u8::try_from(chunk.len() - 1).unwrap());
+        run.extend_from_slice(chunk);
+    }
+    run.push(128);
+    assert!(inspect(&base, &encoded("/Filter /RunLengthDecode", run.clone()), InspectLimits::default()).is_ok());
+    run.extend_from_slice(b"SECRET X");
+    for (case, edited) in [
+        ("an Adler-32 holding other bytes", encoded("/Filter /FlateDecode", wrong_sum)),
+        ("a second zlib stream", encoded("/Filter /FlateDecode", second)),
+        ("data after ASCIIHex's end", encoded("/Filter /ASCIIHexDecode", hex)),
+        ("data after run-length's end", encoded("/Filter /RunLengthDecode", run)),
+    ] {
+        match inspect(&base, &edited, InspectLimits::default()) {
+            Err(InspectError::Edited(_)) => {}
+            other => panic!("{case}: {other:?}"),
+        }
+    }
+    // A header naming another generation than its row.
+    let mut other_generation = strictly("%PDF-1.7\n", |_, body| body, "");
+    let at = other_generation.windows(8).position(|w| w == b"3 0 obj\n").unwrap();
+    other_generation[at + 2] = b'5';
+    assert!(matches!(inspect(&base, &other_generation, InspectLimits::default()), Err(InspectError::Edited(_))));
+    // The dictionaries nothing compares.
+    let base = tagged(false, "", &[]);
+    assert!(inspect(&base, &rewrite_with_object_stream_dicts(&[], "", ""), InspectLimits::default()).is_ok());
+    for (case, object_stream, xref) in [
+        ("an object stream's own entry", "/Secret (SECRET X)", ""),
+        ("an object stream extending another", "/Extends 3 0 R", ""),
+        ("decoding parameters holding text", "/DecodeParms << /Columns 1 /Secret (SECRET X) >>", ""),
+        ("a cross-reference stream's parameters", "", "/DecodeParms << /Predictor 1 /Secret (SECRET X) >>"),
+        ("a cross-reference stream's own entry", "", "/Secret (SECRET X)"),
+    ] {
+        let message = refused_against(&base, &rewrite_with_object_stream_dicts(&[], object_stream, xref));
+        assert!(message.contains("object stream") || message.contains("trailer"), "{case}: {message}");
+    }
 }

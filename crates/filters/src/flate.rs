@@ -38,10 +38,14 @@ pub(crate) fn decode(data: &[u8], max: usize) -> Step {
 /// does not inflate to its end within `max` bytes of output (`Some(true)`: past `max`). Also
 /// the bytes it inflated to.
 pub(crate) fn end(data: &[u8], max: usize) -> Result<(usize, usize), bool> {
+    // The Adler-32 of the data last inflated to its end.
+    let checksum = std::cell::RefCell::new(0u32);
     let raw_end = |input: &[u8]| -> Result<(usize, usize), bool> {
         let mut d = Decompress::new(false);
-        // Inflated a block at a time and dropped: only how far the input goes is wanted.
+        // Inflated a block at a time and dropped: only how far the input goes, and the
+        // Adler-32 of what it makes, are wanted.
         let mut block = vec![0u8; 64 << 10];
+        let (mut a, mut b) = (1u32, 0u32);
         loop {
             let (consumed, made) = (d.total_in(), d.total_out());
             let rest = usize::try_from(consumed).ok().and_then(|consumed| input.get(consumed..)).ok_or(false)?;
@@ -49,7 +53,13 @@ pub(crate) fn end(data: &[u8], max: usize) -> Result<(usize, usize), bool> {
             if d.total_out() > max as u64 {
                 return Err(true);
             }
+            let produced = usize::try_from(d.total_out().saturating_sub(made)).map_err(|_| false)?;
+            for &byte in block.get(..produced).unwrap_or_default() {
+                a = (a + u32::from(byte)) % 65_521;
+                b = (b + a) % 65_521;
+            }
             if status == Status::StreamEnd {
+                *checksum.borrow_mut() = (b << 16) | a;
                 return Ok((usize::try_from(d.total_in()).map_err(|_| false)?, usize::try_from(d.total_out()).map_err(|_| false)?));
             }
             if d.total_in() == consumed && d.total_out() == made {
@@ -60,7 +70,18 @@ pub(crate) fn end(data: &[u8], max: usize) -> Result<(usize, usize), bool> {
     match zlib_header(data) {
         Some((_, flg)) if flg & 0x20 != 0 => Err(false),
         Some(_) => match raw_end(data.get(2..).ok_or(false)?) {
-            Ok((deflate, made)) => Ok((data.len().min(deflate.saturating_add(2).saturating_add(4)), made)),
+            Ok((deflate, made)) => {
+                // Embed build: the four bytes after the deflate data are its Adler-32, or (some
+                // producers leave it out) nothing; four other bytes would be data no decoder
+                // checks.
+                let at = deflate.saturating_add(2);
+                match data.get(at..at.saturating_add(4)) {
+                    Some(sum) if sum.iter().all(u8::is_ascii_whitespace) && sum != checksum.borrow().to_be_bytes() => Ok((at, made)),
+                    Some(sum) if sum != checksum.borrow().to_be_bytes() => Err(false),
+                    Some(_) => Ok((at.saturating_add(4), made)),
+                    None => Ok((at, made)),
+                }
+            }
             Err(true) => Err(true),
             Err(false) => raw_end(data),
         },
@@ -127,6 +148,11 @@ mod tests {
         assert_eq!(end(&data, 1 << 20), Ok((len, 17)));
         data.extend_from_slice(b"SECRET");
         assert_eq!(end(&data, 1 << 20).map(|(at, _)| at), Ok(len));
+        // A wrong Adler-32 holds four bytes of anything.
+        let mut wrong = encode(b"hello hello hello");
+        let last = wrong.len() - 1;
+        wrong[last] ^= 1;
+        assert_eq!(end(&wrong, 1 << 20), Err(false));
         // Bounded by what it may make, and data that does not end is no end.
         assert_eq!(end(&encode(&[0; 4096]), 100), Err(true));
         assert_eq!(end(&data[..len / 2], 1 << 20), Err(false));
