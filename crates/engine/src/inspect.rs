@@ -1343,7 +1343,8 @@ fn read_side(bytes: &[u8], against: Option<(&[u8], &Structure, bool)>, placement
     }
     // R6b-48: a rewrite carries nothing that is neither drawn nor referenced.
     if let Some((_, _, false)) = against {
-        side.unreached = match check_rewrite_reachable(&doc, &side.structure.sections, &known, budget) {
+        let base_bytes = against.map(|(bytes, _, _)| bytes).unwrap_or_default();
+        side.unreached = match check_rewrite_reachable(&doc, base_bytes, &side.structure.sections, &known, budget) {
             Ok(()) => None,
             Err(Fail::Read(message)) => Some(message),
             Err(other) => return Err(other),
@@ -1379,7 +1380,7 @@ fn check_update_read(
     };
     // Follow-up 8 (R6b-51, I1): every byte the update adds is a listed object, written strictly,
     // or its cross-reference sections.
-    account_bytes(doc, base.len(), Some(base_doc.trailer()), budget)?;
+    account_bytes(doc, base.len(), Some(base_doc.trailer()), &base_doc, budget)?;
     let section_offsets: BTreeSet<u64> = sections.iter().map(|section| section.offset).collect();
     for num in doc.object_numbers() {
         budget.tick()?;
@@ -1396,6 +1397,49 @@ fn check_update_read(
         }
     }
     Ok(())
+}
+
+/// Follow-up 9 (R6b-53): the filters this comparison decodes to their end within its bounds
+/// (Flate with its checksum, the ASCII and run-length codings, baseline JPEG by its own reader).
+const READ_TO_THE_END: [&[u8]; 10] =
+    [b"FlateDecode", b"Fl", b"ASCIIHexDecode", b"AHx", b"ASCII85Decode", b"A85", b"RunLengthDecode", b"RL", b"DCTDecode", b"DCT"];
+
+/// Follow-up 9 (R6b-53): a stream coded otherwise than with [`READ_TO_THE_END`] filters, as its
+/// coding entries and its bytes; `None` for one this comparison reads to its end.
+fn opaque_coding(stream: &pdfcraft_cos::Stream) -> Option<Digest> {
+    let read = match stream.dict.get(b"Filter") {
+        None => true,
+        Some(pdfcraft_cos::Object::Name(name)) => READ_TO_THE_END.contains(&name.as_slice()),
+        Some(pdfcraft_cos::Object::Array(names)) => names.iter().all(|name| name.as_name().is_some_and(|name| READ_TO_THE_END.contains(&name))),
+        Some(_) => false,
+    };
+    if read {
+        return None;
+    }
+    let mut coding = Vec::new();
+    for key in [&b"Filter"[..], b"DecodeParms", b"DL"] {
+        if let Some(value) = stream.dict.get(key) {
+            coding.extend_from_slice(key);
+            pdfcraft_cos::serialize(value, &mut coding);
+        }
+    }
+    Some(structure::sha256(&[b"opaque", &coding, &structure::sha256(&[&stream.raw])]))
+}
+
+/// Follow-up 9 (R6b-53): every stream of `base` [`opaque_coding`] keys, so keyed.
+fn opaque_streams(base: &Document, budget: &mut Budget) -> Result<BTreeSet<Digest>, Fail> {
+    let mut out = BTreeSet::new();
+    for num in base.object_numbers() {
+        budget.tick()?;
+        if let Ok(object) = base.try_get(num)
+            && let pdfcraft_cos::Object::Stream(stream) = &*object
+            && stream.dict.get(b"Filter").is_some()
+        {
+            budget.hashed(stream.raw.len())?;
+            out.extend(opaque_coding(stream));
+        }
+    }
+    Ok(out)
 }
 
 /// Trailer entries a cross-reference section may hold (and those a stream section's dictionary
@@ -1417,9 +1461,12 @@ const ID_LENGTH: usize = 16;
 /// - a section's trailer holds only `/Size`, `/Root`, `/Info`, `/ID`, `/Prev` (and a stream's
 ///   own entries), or for an update an entry the base's trailer holds with the same value; a
 ///   file identifier is two strings of the writer's 16 bytes (an update keeps the base's).
-fn account_bytes(doc: &Document, from: usize, base_trailer: Option<&pdfcraft_cos::Dict>, budget: &mut Budget) -> Result<(), Fail> {
+fn account_bytes(doc: &Document, from: usize, base_trailer: Option<&pdfcraft_cos::Dict>, base: &Document, budget: &mut Budget) -> Result<(), Fail> {
     let data = doc.bytes().as_slice();
     let refuse = |what: String| Fail::Read(what);
+    // Follow-up 9 (R6b-53): the base's streams coded with a filter this comparison does not
+    // decode to its end within its bounds, by their coding and bytes, read once when needed.
+    let mut opaque_in_base: Option<BTreeSet<Digest>> = None;
     let mut listed = Vec::new();
     let mut containers: HashMap<u32, Vec<u32>> = HashMap::new();
     let mut stored: Vec<(u32, u32, u32)> = Vec::new();
@@ -1449,6 +1496,21 @@ fn account_bytes(doc: &Document, from: usize, base_trailer: Option<&pdfcraft_cos
                         budget.content(made)?;
                         if tail.is_some_and(|tail| tail.iter().any(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n' | b'\x0c' | b'\0'))) {
                             return Err(refuse(format!("stream {num} holds data after its end, which no decoder reads")));
+                        }
+                        // Follow-up 9 (R6b-53): a stream coded with a filter this comparison
+                        // cannot decode to its end within its bounds (LZW, JPX, JBIG2, CCITT,
+                        // Crypt, any other) could hold anything past what is read: it is only
+                        // the base's own, byte for byte.
+                        if let Some(key) = opaque_coding(stream) {
+                            let known = match &opaque_in_base {
+                                Some(known) => known,
+                                None => opaque_in_base.insert(opaque_streams(base, budget)?),
+                            };
+                            if !known.contains(&key) {
+                                return Err(refuse(format!(
+                                    "stream {num} is coded with a filter this comparison does not read to its end, and is not the base's"
+                                )));
+                            }
                         }
                         if stream.dict.name(b"Type") == Some(b"ObjStm") {
                             // Its dictionary is read for nothing but how to find what it holds.
@@ -1575,7 +1637,13 @@ fn plain_entry(key: &[u8], value: &pdfcraft_cos::Object) -> bool {
 /// section's objects are carried, superseded, beside the ones read. Anything else could hold
 /// what the rewrite took away (the unredacted original as an object nothing reaches), which no
 /// fact would report. Each object visited counts toward the objects bound.
-fn check_rewrite_reachable(doc: &Document, sections: &[structure::Section], known: &structure::Known, budget: &mut Budget) -> Result<(), Fail> {
+fn check_rewrite_reachable(
+    doc: &Document,
+    base: &[u8],
+    sections: &[structure::Section],
+    known: &structure::Known,
+    budget: &mut Budget,
+) -> Result<(), Fail> {
     if sections.len() != 1 {
         return Err(Fail::Read(format!(
             "the rewrite has {} cross-reference sections, so it carries objects of an earlier one nothing reaches",
@@ -1585,7 +1653,11 @@ fn check_rewrite_reachable(doc: &Document, sections: &[structure::Section], know
     let section_offsets: BTreeSet<u64> = sections.iter().map(|section| section.offset).collect();
     // Follow-up 7 audit (item 4), follow-up 8 (R6b-51, I1): no bytes but what the
     // cross-reference data lists, each written strictly.
-    account_bytes(doc, 0, None, budget)?;
+    let base_doc = match catch_unwind(AssertUnwindSafe(|| Document::open(Arc::new(base.to_vec())))) {
+        Ok(Ok(base_doc)) => base_doc,
+        _ => return Err(Fail::Read("the base could not be read again to check the rewrite".into())),
+    };
+    account_bytes(doc, 0, None, &base_doc, budget)?;
     let mut reached: BTreeSet<u32> = BTreeSet::new();
     let mut todo: Vec<pdfcraft_cos::Object> = [&b"Root"[..], b"Info"].iter().filter_map(|key| doc.trailer().get(key).cloned()).collect();
     while let Some(object) = todo.pop() {

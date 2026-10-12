@@ -1267,3 +1267,24 @@ fn xmp_and_other_copies_holding_a_removed_word_are_cleared() {
     let facts = &applied.facts;
     assert_eq!((facts.annotation_texts_cleared, facts.layer_names_cleared, facts.label_prefixes_cleared), (1, 1, 1), "{facts:?}");
 }
+
+#[test]
+fn a_stream_coded_with_a_filter_not_read_to_its_end_is_only_the_base_s() {
+    // R6b-53: an appended update (or the server's output) may bring a stream coded with LZW,
+    // JPX, JBIG2, CCITT or Crypt only byte for byte as the base has it: past what is decoded,
+    // anything could be held.
+    let stamp = |metadata: Vec<u8>| {
+        hand_update(&[
+            page_one("[8 0 R 12 0 R]"),
+            (12, b"<< /Type /Annot /Subtype /Stamp /Rect [100 100 140 120] /P 3 0 R /AP << /N 11 0 R >> >>".to_vec()),
+            (11, stream(&format!("{STAMP_AP} /Metadata 13 0 R"), b"0 0 1 rg 0 0 40 20 re f")),
+            (13, metadata),
+        ])
+    };
+    for filter in ["/LZWDecode", "/JPXDecode", "/JBIG2Decode", "/CCITTFaxDecode", "/Crypt", "[/FlateDecode /LZWDecode]"] {
+        let (base, edited) = stamp(stream(&format!("/Type /Metadata /Subtype /XML /Filter {filter}"), b"\x80\x0b\x60\x50SECRETWORD"));
+        assert!(matches!(inspect(&base, &edited, InspectLimits::default()), Err(InspectError::Edited(_))), "{filter}");
+    }
+    let (base, edited) = stamp(stream("/Type /Metadata /Subtype /XML", b"<x:xmpmeta/>"));
+    assert_eq!(inspect(&base, &edited, InspectLimits::default()).unwrap().annotations.stamps, 1);
+}
