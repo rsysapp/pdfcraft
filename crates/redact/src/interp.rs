@@ -28,6 +28,14 @@ use pdfcraft_fonts::pdf::Metrics;
 
 const MAX_DEPTH: usize = 12;
 
+/// The nesting a redaction follows (forms, tiling patterns, soft masks together).
+#[cfg(test)]
+pub(crate) const MAX_NESTING: u32 = MAX_DEPTH as u32;
+
+/// Embed build (follow-up 8 audit): the work one redaction may do (see [`Scope::work`]): about
+/// a second or two.
+pub(crate) const MAX_WORK: u64 = 400_000_000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Mode {
     Apply,
@@ -211,6 +219,10 @@ pub(crate) struct Scope<'a> {
     /// Embed build (R6b-50): the text of the glyphs removed, each run of them followed by a
     /// space (for clearing copies of the removed words elsewhere in the document).
     pub removed_text: String,
+    /// Embed build (follow-up 8 audit): the work left for the whole redaction (an operator, a
+    /// glyph or pixel tested against each region), shared by every nested scope; at zero the
+    /// redaction fails (see [`Scope::exhausted`]).
+    pub work: std::rc::Rc<std::cell::Cell<u64>>,
 }
 
 impl<'a> Scope<'a> {
@@ -227,7 +239,18 @@ impl<'a> Scope<'a> {
             depth: 0,
             parents: Vec::new(),
             removed_text: String::new(),
+            work: std::rc::Rc::new(std::cell::Cell::new(MAX_WORK)),
         }
+    }
+
+    /// Embed build (follow-up 8 audit): spend `units` of work.
+    fn charge(&self, units: usize) {
+        self.work.set(self.work.get().saturating_sub(units as u64));
+    }
+
+    /// Embed build (follow-up 8 audit): whether the work bound is spent.
+    pub fn exhausted(&self) -> bool {
+        self.work.get() == 0
     }
 
     /// Embed build: resource `name` of `category`: in `own` (the scope's resources, by
@@ -285,11 +308,13 @@ impl<'a> Scope<'a> {
         if gw < 0.01 || gh < 0.01 {
             return self.rects.iter().any(|r| origin.0 >= r[0] && origin.0 <= r[2] && origin.1 >= r[1] && origin.1 <= r[3]);
         }
-        let (mx, my) = ((gw * 0.2).min(1.0), (gh * 0.2).min(1.0));
+        // Embed build (follow-up 8 audit): any glyph whose box reaches into a region goes, however
+        // little (one only partly covered would keep part of what was marked readable).
+        self.charge(self.rects.len());
         self.rects.iter().any(|r| {
             let ox = b[2].min(r[2]) - b[0].max(r[0]);
             let oy = b[3].min(r[3]) - b[1].max(r[1]);
-            ox > mx && oy > my
+            ox > 0.0 && oy > 0.0
         })
     }
 }
@@ -437,6 +462,11 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
     for (piece, mut changed) in pieces.into_iter().zip(rewrite) {
         let mut ops: Vec<Op> = Vec::with_capacity(piece.len());
         for op in piece {
+            scope.charge(1usize.saturating_add(scope.rects.len() / 64));
+            if scope.exhausted() {
+                out.residue += 1;
+                break;
+            }
             let o = op.op.as_slice();
             // Path construction.
             if matches!(o, b"m" | b"l" | b"c" | b"v" | b"y" | b"h" | b"re" | b"W" | b"W*") {
@@ -894,6 +924,13 @@ fn xobject(
                 scope.report.images_removed += 1;
                 return Some(None);
             }
+            // Embed build (follow-up 8 audit): each pixel is tested against the regions.
+            let pixels = s.dict.int(b"Width").unwrap_or(0).max(0).saturating_mul(s.dict.int(b"Height").unwrap_or(0).max(0));
+            scope.charge(usize::try_from(pixels).unwrap_or(usize::MAX).saturating_mul(scope.rects.len().max(1)).saturating_mul(2));
+            if scope.exhausted() {
+                out.residue += 1;
+                return None;
+            }
             match image::clear(doc, s, &gs.ctm, scope.rects) {
                 Ok(None) => None,
                 Ok(Some(mut new)) => {
@@ -943,11 +980,9 @@ fn xobject(
                 return None;
             }
             if scope.depth >= MAX_DEPTH {
-                if scope.mode == Mode::Verify {
-                    return None;
-                }
-                scope.report.forms_removed += 1;
-                return Some(None);
+                // Embed build (follow-up 8 audit): nested past the bound, the redaction fails.
+                out.residue += 1;
+                return None;
             }
             let data = match s.decoded() {
                 Ok(d) => d,
@@ -1053,6 +1088,10 @@ fn redact_pattern(doc: &mut Document, scope: &mut Scope<'_>, name: &[u8], resour
     if out.patterns.iter().any(|(done, _)| done.as_slice() == name) {
         return;
     }
+    if scope.depth >= MAX_DEPTH {
+        out.residue += 1;
+        return;
+    }
     let Some(r) = scope.resource(doc, &res_dict(doc, resources, b"Pattern"), b"Pattern", name).and_then(|o| o.as_ref()) else { return };
     let obj = doc.get(r);
     let Object::Stream(pattern) = &*obj else { return };
@@ -1092,6 +1131,13 @@ fn redact_pattern(doc: &mut Document, scope: &mut Scope<'_>, name: &[u8], resour
     }
     // Each tile is the cell moved by a whole number of steps: in user space, a translation.
     let origin = to_user.apply(0.0, 0.0);
+    let moved = usize::try_from(count).unwrap_or(usize::MAX).saturating_mul(under.len());
+    scope.charge(moved);
+    // Held at once: at most a million moved regions.
+    if scope.exhausted() || moved > 1_000_000 {
+        out.residue += 1;
+        return;
+    }
     let mut shifted = Vec::new();
     for i in columns {
         for j in rows.clone() {
@@ -1111,6 +1157,7 @@ fn redact_pattern(doc: &mut Document, scope: &mut Scope<'_>, name: &[u8], resour
         cell_scope.parents = scope.parents.clone();
         cell_scope.parents.push(resources.clone());
         cell_scope.depth = scope.depth + 1;
+        cell_scope.work = scope.work.clone();
         let inner = process(doc, &mut cell_scope, std::slice::from_ref(&data), &own, to_user);
         (inner, std::mem::take(&mut cell_scope.removed_text))
     };
@@ -1136,6 +1183,10 @@ fn redact_pattern(doc: &mut Document, scope: &mut Scope<'_>, name: &[u8], resour
 /// regions, in the space current when the state is set, set under the same name.
 fn redact_soft_mask(doc: &mut Document, scope: &mut Scope<'_>, name: &[u8], resources: &Dict, gs: &Gs, out: &mut Output) {
     if out.states.iter().any(|(done, _)| done.as_slice() == name) {
+        return;
+    }
+    if scope.depth >= MAX_DEPTH {
+        out.residue += 1;
         return;
     }
     let Some(entry) = scope.resource(doc, &res_dict(doc, resources, b"ExtGState"), b"ExtGState", name) else { return };
@@ -1165,6 +1216,7 @@ fn redact_soft_mask(doc: &mut Document, scope: &mut Scope<'_>, name: &[u8], reso
         group_scope.parents = scope.parents.clone();
         group_scope.parents.push(resources.clone());
         group_scope.depth = scope.depth + 1;
+        group_scope.work = scope.work.clone();
         let inner = process(doc, &mut group_scope, std::slice::from_ref(&data), &own, to_user);
         (inner, std::mem::take(&mut group_scope.removed_text))
     };

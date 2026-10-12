@@ -38,6 +38,10 @@ pub enum RedactError {
     Unreadable(usize),
     #[error("redaction could not be verified: {0} item(s) were still found under the marks, so nothing was changed")]
     Residue(usize),
+    /// Embed build (follow-up 8 audit): the page's content asks for more work than a redaction
+    /// may do, or nests deeper than it may follow.
+    #[error("the page's content is too complex to redact safely, so nothing was changed")]
+    TooComplex,
     #[error(transparent)]
     Edit(#[from] pdfcraft_edit::EditError),
     #[error(transparent)]
@@ -329,6 +333,8 @@ pub fn apply_with(doc: &mut Document, pages: Option<&[usize]>, options: Options)
         pdfcraft_forms::fields(doc).into_iter().flat_map(|f| f.widgets.iter().map(|w| (w.obj, f.name.clone())).collect::<Vec<_>>()).collect();
     // Embed build (R6b-50): the removed glyphs' text, and every annotation removed.
     let mut removed_text = String::new();
+    // Embed build (follow-up 8 audit): one work bound for every page.
+    let work = std::rc::Rc::new(std::cell::Cell::new(interp::MAX_WORK));
     let mut all_removed: Vec<ObjRef> = Vec::new();
 
     for &pi in &by_page {
@@ -339,12 +345,17 @@ pub fn apply_with(doc: &mut Document, pages: Option<&[usize]>, options: Options)
         // 1. Content.
         let (list, data) = page_streams(doc, &page.dict, pi)?;
         let resources = page.dict.get(b"Resources").and_then(|r| doc.resolve(r).as_dict().cloned()).unwrap_or_default();
-        let out = {
+        let (out, exhausted) = {
             let mut scope = Scope::new(&rects, Mode::Apply, &mut report);
+            scope.work = work.clone();
             let out = process(doc, &mut scope, &data, &resources, pdfcraft_content::Matrix::IDENTITY);
             removed_text.push_str(&scope.removed_text);
-            out
+            (out, scope.exhausted())
         };
+        // Embed build (follow-up 8 audit): past the work bound, or nested too deep.
+        if exhausted {
+            return Err(RedactError::TooComplex);
+        }
         // Embed build (R6b-50): a pattern cell or soft mask the redactor could not redact.
         if out.residue > 0 {
             return Err(RedactError::Residue(out.residue));

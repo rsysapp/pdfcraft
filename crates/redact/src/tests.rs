@@ -4,6 +4,7 @@ use pdfcraft_annot::{Meta, NewAnnotation, Shape, Style, add_annotation, rect_qua
 use pdfcraft_cos::{Document, SaveOptions, write_full, write_incremental};
 
 use super::*;
+use crate::interp::MAX_NESTING;
 
 fn stream(dict: &str, data: &[u8]) -> Vec<u8> {
     let mut v = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
@@ -162,7 +163,8 @@ fn kerning_spacing_scaling_and_line_operators_are_honoured() {
     // D at 21 (space advance (5+2+4)×0.5 = 5.5). Remove C only.
     mark(&mut doc, 0, &[[12.2, 195.0, 14.8, 210.0]], "");
     // Line 2 (y 188) "EF" and line 3 (y 176) "GH" (Tw 1, Tc 0): remove F and G.
-    mark(&mut doc, 0, &[[3.8, 183.0, 6.0, 198.0 - 10.0], [0.2, 171.0, 2.3, 180.0]], "");
+    // (Clear of line 3's glyph boxes, which reach up to 184: any glyph a mark reaches goes.)
+    mark(&mut doc, 0, &[[3.8, 185.0, 6.0, 198.0 - 10.0], [0.2, 171.0, 2.3, 180.0]], "");
     let r = apply(&mut doc, None).unwrap();
     assert_eq!(r.glyphs, 3, "{r:?}");
     let c = content(&doc, 0);
@@ -1002,4 +1004,103 @@ fn applied_for_a_host_every_area_is_filled_black_and_overlays_are_ignored() {
     apply_with(&mut doc, None, Options { black: true, document_copies: false }).unwrap();
     let c = content(&doc, 0);
     assert!(c.contains("0 0 0 rg") && !c.contains("1 0 0 rg") && !c.contains("Withheld"), "{c}");
+}
+
+// ── Embed build: follow-up 8 audit of the interpreter ───────────────────────────────────────
+
+#[test]
+fn a_glyph_a_mark_reaches_at_all_goes() {
+    // Follow-up 8 audit: a glyph only partly under a mark (its box reaching a little way in)
+    // was kept, part of what was marked readable.
+    let mut doc = one_page(b"BT /F1 10 Tf 10 100 Td (AB) Tj ET", "", vec![]);
+    // A at 10–15, B at 15–20: the mark reaches 0.5 pt into A.
+    mark(&mut doc, 0, &[[14.5, 95.0, 20.0, 110.0]], "");
+    let report = apply(&mut doc, None).unwrap();
+    assert_eq!(report.glyphs, 2, "{report:?}");
+}
+
+/// `levels` forms, each drawing the next, the last showing "SECRET" under the mark.
+fn nested_forms(levels: u32) -> Document {
+    let mut extra = Vec::new();
+    for level in 0..levels {
+        let num = 7 + level;
+        let content = if level + 1 == levels { b"BT /F1 10 Tf 10 100 Td (SECRET) Tj ET".to_vec() } else { b"/Fm Do".to_vec() };
+        extra.push(stream(
+            &format!("/Type /XObject /Subtype /Form /BBox [0 0 300 300] /Resources << /Font << /F1 5 0 R >> /XObject << /Fm {} 0 R >> >>", num + 1),
+            &content,
+        ));
+    }
+    one_page(b"/Fm Do", "/XObject << /Fm 7 0 R >>", extra)
+}
+
+/// `levels` tiling patterns, each painting the next over its cell, the last showing "SECRET".
+fn nested_patterns(levels: u32) -> Document {
+    let mut extra = Vec::new();
+    for level in 0..levels {
+        let num = 7 + level;
+        let content =
+            if level + 1 == levels { b"BT /F1 10 Tf 10 100 Td (SECRET) Tj ET".to_vec() } else { b"/Pattern cs /P scn 0 0 300 300 re f".to_vec() };
+        extra.push(stream(
+            &format!(
+                "/PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 300 300] /XStep 300 /YStep 300 /Resources << /Font << /F1 5 0 R >> /Pattern << /P {} 0 R >> >>",
+                num + 1
+            ),
+            &content,
+        ));
+    }
+    one_page(b"/Pattern cs /P scn 0 0 300 300 re f", "/Pattern << /P 7 0 R >>", extra)
+}
+
+/// `levels` soft masks, each group setting the next, the last showing "SECRET".
+fn nested_masks(levels: u32) -> Document {
+    let mut extra = Vec::new();
+    for level in 0..levels {
+        let num = 7 + level;
+        let content = if level + 1 == levels { b"BT /F1 10 Tf 10 100 Td (SECRET) Tj ET".to_vec() } else { b"/M gs 0 0 300 300 re f".to_vec() };
+        extra.push(stream(
+            &format!(
+                "/Type /XObject /Subtype /Form /BBox [0 0 300 300] /Group << /S /Transparency >> /Resources << /Font << /F1 5 0 R >> /ExtGState << /M << /SMask << /S /Luminosity /G {} 0 R >> >> >> >>",
+                num + 1
+            ),
+            &content,
+        ));
+    }
+    one_page(b"/M gs 0 0 300 300 re f", "/ExtGState << /M << /SMask << /S /Luminosity /G 7 0 R >> >> >>", extra)
+}
+
+#[test]
+fn nesting_past_the_bound_fails_the_redaction_quickly() {
+    // Follow-up 8 audit: forms, patterns and soft masks nest through one depth bound; past it
+    // the redaction fails (nothing changed), within a small time.
+    for (kind, within, past) in [
+        ("forms", nested_forms(MAX_NESTING), nested_forms(MAX_NESTING + 1)),
+        ("patterns", nested_patterns(MAX_NESTING), nested_patterns(MAX_NESTING + 1)),
+        ("masks", nested_masks(MAX_NESTING), nested_masks(MAX_NESTING + 1)),
+    ] {
+        let mut within = within;
+        mark(&mut within, 0, &[OVER_SECRET], "");
+        assert!(apply(&mut within, None).is_ok(), "{kind} within the bound");
+        let mut past = past;
+        mark(&mut past, 0, &[OVER_SECRET], "");
+        let started = std::time::Instant::now();
+        assert!(apply(&mut past, None).is_err(), "{kind} past the bound");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{kind}");
+    }
+}
+
+#[test]
+fn work_past_the_bound_fails_the_redaction() {
+    // Follow-up 8 audit: a shared work counter bounds the whole redaction, whatever the input:
+    // 200,000 glyphs each tested against 3,000 marks.
+    let mut content = b"BT /F1 1 Tf 0 0 Td (".to_vec();
+    content.extend(std::iter::repeat_n(b'S', 200_000));
+    content.extend_from_slice(b") Tj ET");
+    let mut doc = one_page(&content, "", vec![]);
+    let marks: Vec<[f64; 4]> = (0..3_000)
+        .map(|i| [f64::from(i % 60) * 4.0 + 1.0, f64::from(i / 60) * 4.0 + 50.0, f64::from(i % 60) * 4.0 + 2.0, f64::from(i / 60) * 4.0 + 51.0])
+        .collect();
+    mark(&mut doc, 0, &marks, "");
+    let started = std::time::Instant::now();
+    assert_eq!(apply(&mut doc, None), Err(RedactError::TooComplex));
+    assert!(started.elapsed() < std::time::Duration::from_secs(30), "{:?}", started.elapsed());
 }
