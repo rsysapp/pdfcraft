@@ -837,9 +837,8 @@ fn a_soft_mask_read_otherwise_than_its_samples_is_not_the_same_mask() {
         ("another depth", Box::new(|d: &mut pdfcraft_cos::Dict| d.set(b"BitsPerComponent".to_vec(), pdfcraft_cos::Object::Int(4)))),
     ] {
         let forged = forge_soft_mask(&applied.bytes, change);
-        match inspect(&edited, &forged, InspectLimits::default()) {
-            Ok(inspection) => assert!(inspection.content.pages_changed_outside_redactions > 0, "{case}: {inspection:?}"),
-            Err(_) => {}
+        if let Ok(inspection) = inspect(&edited, &forged, InspectLimits::default()) {
+            assert!(inspection.content.pages_changed_outside_redactions > 0, "{case}: {inspection:?}");
         }
     }
 }
