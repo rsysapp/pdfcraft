@@ -91,10 +91,8 @@ fn as_pdf_js_reads(bytes: &[u8]) -> String {
                 .then(|| char::decode_utf16(rest.as_chunks::<2>().0.iter().map(|p| u16::from_le_bytes(*p))).collect::<Result<String, _>>().ok())
                 .flatten(),
         )
-    } else if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
-        Some(String::from_utf8(rest.to_vec()).ok())
     } else {
-        None
+        bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).map(|rest| String::from_utf8(rest.to_vec()).ok())
     };
     if let Some(Some(text)) = marked {
         return without_escapes(&text);
