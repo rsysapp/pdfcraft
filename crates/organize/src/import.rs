@@ -194,8 +194,11 @@ pub(crate) fn copy_object(dst: &mut Document, src: &Document, o: &Object, map: H
 /// Resources identical to ones already in `dst` (the same fonts, images, colour profiles) are
 /// shared rather than stored twice (see `dedupe`).
 pub fn import_pages(dst: &mut Document, src: &Document, src_pages: &[usize], at: usize) -> Result<Vec<ObjRef>, OrganizeError> {
+    // Embed build: destinations by number and labels follow their pages (R6b-43/46).
+    let before = crate::follow::Before::read(dst)?;
     let first_new = dst.object_numbers().last().map_or(1, |n| n + 1);
     let pages = import_pages_mapped(dst, src, src_pages, at)?.pages;
+    before.follow(dst)?;
     let created: Vec<ObjRef> = dst.object_numbers().into_iter().filter(|n| *n >= first_new).map(|n| ObjRef::new(n, dst.generation(n))).collect();
     crate::dedupe::dedupe_resources(dst, &created, true);
     Ok(pages)

@@ -15,6 +15,7 @@ use pdfcraft_cos::{Dict, Document, ObjRef, Object, PdfString};
 
 mod boxes;
 mod dedupe;
+mod follow;
 mod import;
 mod labels;
 mod outline;
@@ -155,6 +156,8 @@ pub fn rotate_pages(doc: &mut Document, indices: &[usize], degrees: i64) -> Resu
 
 /// Delete pages. Refuses to delete every page.
 pub fn delete_pages(doc: &mut Document, indices: &[usize]) -> Result<(), OrganizeError> {
+    // Embed build: destinations by number, named destinations and labels follow (R6b-34/43/46).
+    let before = follow::Before::read(doc)?;
     let all = walk(doc)?;
     check(indices, all.len())?;
     let keep: Vec<(ObjRef, Dict)> = all.iter().enumerate().filter(|(i, _)| !indices.contains(i)).map(|(_, p)| p.clone()).collect();
@@ -177,6 +180,7 @@ pub fn delete_pages(doc: &mut Document, indices: &[usize]) -> Result<(), Organiz
     }
     drop_widgets(doc, widgets)?;
     drop_destinations_to(doc, &gone, &keep)?;
+    before.follow(doc)?;
     for r in gone {
         doc.free(r);
     }
@@ -259,6 +263,8 @@ fn drop_widgets(doc: &mut Document, mut widgets: Vec<ObjRef>) -> Result<(), Orga
 /// Move the pages at `indices` (kept in their relative order) so they start at position `to`
 /// in the resulting document.
 pub fn move_pages(doc: &mut Document, indices: &[usize], to: usize) -> Result<(), OrganizeError> {
+    // Embed build: destinations by number and labels follow their pages (R6b-43/46).
+    let before = follow::Before::read(doc)?;
     let all = walk(doc)?;
     check(indices, all.len())?;
     let mut sorted = indices.to_vec();
@@ -268,7 +274,8 @@ pub fn move_pages(doc: &mut Document, indices: &[usize], to: usize) -> Result<()
     let mut rest: Vec<(ObjRef, Dict)> = all.iter().enumerate().filter(|(i, _)| !sorted.contains(i)).map(|(_, p)| p.clone()).collect();
     let at = to.min(rest.len());
     rest.splice(at..at, moving);
-    rebuild(doc, &rest)
+    rebuild(doc, &rest)?;
+    before.follow(doc)
 }
 
 /// Duplicate pages: copies of `indices` (in order) are inserted after the last of them, sharing
@@ -318,6 +325,8 @@ pub fn replace_pages(doc: &mut Document, targets: &[usize], src: &Document, src_
 
 /// Insert a blank page of `width × height` points at position `at` (0 = before the first page).
 pub fn insert_blank_page(doc: &mut Document, at: usize, width: f64, height: f64) -> Result<ObjRef, OrganizeError> {
+    // Embed build: destinations by number and labels follow their pages (R6b-43/46).
+    let before = follow::Before::read(doc)?;
     let mut all = walk(doc)?;
     let root = pages_root(doc)?;
     let mut page = Dict::new();
@@ -329,6 +338,7 @@ pub fn insert_blank_page(doc: &mut Document, at: usize, width: f64, height: f64)
     let at = at.min(all.len());
     all.insert(at, (r, Dict::new()));
     rebuild(doc, &all)?;
+    before.follow(doc)?;
     Ok(r)
 }
 
