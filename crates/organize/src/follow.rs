@@ -126,7 +126,8 @@ impl Renumber {
     fn holders(&mut self, doc: &mut Document, pages: &[ObjRef]) -> Result<(), OrganizeError> {
         let mut holders = crate::outline::items(doc);
         for page in pages {
-            let annots = doc.get(*page).as_dict().and_then(|d| d.get(b"Annots").cloned()).map(|a| doc.resolve(&a).as_array().cloned().unwrap_or_default());
+            let annots =
+                doc.get(*page).as_dict().and_then(|d| d.get(b"Annots").cloned()).map(|a| doc.resolve(&a).as_array().cloned().unwrap_or_default());
             holders.extend(
                 annots
                     .unwrap_or_default()
@@ -228,7 +229,10 @@ impl Renumber {
         // Written again as one leaf, in order: no node's limits can be wrong.
         kept.sort_by(|a, b| a.0.cmp(&b.0));
         let mut leaf = Dict::new();
-        leaf.set(b"Names".to_vec(), Object::Array(kept.into_iter().flat_map(|(key, value)| [Object::String(PdfString::literal(key)), value]).collect()));
+        leaf.set(
+            b"Names".to_vec(),
+            Object::Array(kept.into_iter().flat_map(|(key, value)| [Object::String(PdfString::literal(key)), value]).collect()),
+        );
         // Written over the tree's root when it is indirect: a second page edit in the same save
         // must not leave the first one's leaf behind, written and read by nothing.
         match top {
@@ -251,7 +255,13 @@ impl Renumber {
 
 /// Every (key, value) of the name tree under `node`, in tree order. A tree that loops, runs too
 /// deep or holds a key that is not a string is refused: what it names could not be followed.
-fn tree_entries(doc: &Document, node: &Object, out: &mut Vec<(Vec<u8>, Object)>, seen: &mut HashSet<ObjRef>, depth: usize) -> Result<(), OrganizeError> {
+fn tree_entries(
+    doc: &Document,
+    node: &Object,
+    out: &mut Vec<(Vec<u8>, Object)>,
+    seen: &mut HashSet<ObjRef>,
+    depth: usize,
+) -> Result<(), OrganizeError> {
     let unreadable = || OrganizeError::Invalid("the named destinations cannot be read".into());
     if depth > 64 || out.len() > 100_000 {
         return Err(unreadable());
@@ -292,7 +302,10 @@ fn page_labels(doc: &Document, pages: usize) -> Option<Vec<Option<Label>>> {
         let Some(d) = node.as_dict() else { continue };
         if let Some(nums) = d.get(b"Nums").map(|n| doc.resolve(n)).and_then(|n| n.as_array().cloned()) {
             for pair in nums.chunks(2) {
-                let (Some(start), Some(spec)) = (pair.first().and_then(Object::as_int), pair.get(1).and_then(|s| doc.resolve(s).as_dict().cloned())) else { continue };
+                let (Some(start), Some(spec)) = (pair.first().and_then(Object::as_int), pair.get(1).and_then(|s| doc.resolve(s).as_dict().cloned()))
+                else {
+                    continue;
+                };
                 ranges.push((start, spec));
             }
         }
@@ -337,9 +350,9 @@ fn relabel(doc: &mut Document, pages: &[ObjRef], old: &HashMap<ObjRef, Option<La
             }
             continue;
         };
-        let continues = previous.as_ref().is_some_and(|(prev_spec, prev_number)| {
-            *prev_spec == spec && (spec.get(b"S").is_none() || prev_number.checked_add(1) == Some(number))
-        });
+        let continues = previous
+            .as_ref()
+            .is_some_and(|(prev_spec, prev_number)| *prev_spec == spec && (spec.get(b"S").is_none() || prev_number.checked_add(1) == Some(number)));
         if !continues {
             let mut written = spec.clone();
             if number == 1 {

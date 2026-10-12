@@ -292,7 +292,9 @@ impl PdfCraftApp {
         match self.embed.as_ref() {
             None => true,
             // Embed API 0.2: edit mode also runs the tools its permissions allow (`edit`).
-            Some(embed) => VIEW_COMMANDS.contains(&command) || embed.edit.as_ref().is_some_and(|edit| edit::allows_command(command, &edit.permissions)),
+            Some(embed) => {
+                VIEW_COMMANDS.contains(&command) || embed.edit.as_ref().is_some_and(|edit| edit::allows_command(command, &edit.permissions))
+            }
         }
     }
 

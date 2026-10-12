@@ -13,7 +13,8 @@ use pdfcraft_ui_egui::embed::{EditAuthor, EditPermissions, EditorMode, HostBridg
 
 type Harness = egui_kittest::Harness<'static, PdfCraftApp>;
 
-const ALL: EditPermissions = EditPermissions { accept_reject_changes: false, organize_pages: true, fill_forms: true, redact: true, stamps: true, drawing: true };
+const ALL: EditPermissions =
+    EditPermissions { accept_reject_changes: false, organize_pages: true, fill_forms: true, redact: true, stamps: true, drawing: true };
 
 fn editing(bytes: Vec<u8>) -> (Harness, HostBridge) {
     let (mut h, bridge) = embed_support::embedded();
@@ -44,7 +45,8 @@ fn save(h: &mut Harness, bridge: &HostBridge) -> Vec<u8> {
 /// The host's rules for a browser's save (`judgePdfSave` and the appended-update rules), as the
 /// inspection's facts show them: `Err` names the refusal.
 fn host_judges(inspection: &Inspection, permissions: EditPermissions) -> Result<(), &'static str> {
-    let (pages, annotations, content, text, outlines) = (&inspection.pages, &inspection.annotations, &inspection.content, &inspection.text, &inspection.outlines);
+    let (pages, annotations, content, text, outlines) =
+        (&inspection.pages, &inspection.annotations, &inspection.content, &inspection.text, &inspection.outlines);
     let removed = &inspection.structure_removed;
     let page_edits = pages.rotated + pages.inserted + pages.deleted + pages.moved;
     let renumbered = pages.inserted + pages.deleted + pages.moved > 0;
@@ -152,7 +154,11 @@ fn inserted_pages_are_accepted() {
 fn a_filled_form_is_accepted() {
     let base = include_bytes!("data/form.pdf").to_vec();
     let (mut h, bridge) = editing(base.clone());
-    let name = h.state().active_document().and_then(|document| document.form.iter().find(|field| field.kind == pdfcraft_engine::FormFieldKind::Text).map(|field| field.name.clone())).expect("a text field");
+    let name = h
+        .state()
+        .active_document()
+        .and_then(|document| document.form.iter().find(|field| field.kind == pdfcraft_engine::FormFieldKind::Text).map(|field| field.name.clone()))
+        .expect("a text field");
     assert!(h.state_mut().apply_edit(Edit::SetFieldValue { name, value: pdfcraft_engine::FieldValue::Text("Sari Wulan".into()) }));
     assert!(accepted(&base, &save(&mut h, &bridge)).form_fields_changed > 0);
 }

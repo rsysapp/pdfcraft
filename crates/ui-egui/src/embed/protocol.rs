@@ -260,7 +260,9 @@ fn is_utc_timestamp(text: &str) -> bool {
         && digits(17..19);
     let tail = match bytes.get(19..) {
         Some([b'Z']) => true,
-        Some([b'.', rest @ ..]) => rest.split_last().is_some_and(|(last, fraction)| *last == b'Z' && !fraction.is_empty() && fraction.iter().all(u8::is_ascii_digit)),
+        Some([b'.', rest @ ..]) => {
+            rest.split_last().is_some_and(|(last, fraction)| *last == b'Z' && !fraction.is_empty() && fraction.iter().all(u8::is_ascii_digit))
+        }
         _ => false,
     };
     head && tail

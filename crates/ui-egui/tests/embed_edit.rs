@@ -28,7 +28,13 @@ fn edit_request(all: bool) -> HostCommand {
 }
 
 fn annotation(shape: Shape) -> Edit {
-    Edit::AddAnnotation(NewAnnotation { page: 0, style: Style::default_for(&shape), shape, contents: String::new(), author: "typed by the page".into() })
+    Edit::AddAnnotation(NewAnnotation {
+        page: 0,
+        style: Style::default_for(&shape),
+        shape,
+        contents: String::new(),
+        author: "typed by the page".into(),
+    })
 }
 
 fn ink(at: f64) -> Edit {
@@ -93,7 +99,10 @@ fn a_too_large_open_leaves_edit_mode_and_leaves_nothing_to_edit() {
     let (mut h, bridge) = editing(true);
     bridge.send(HostCommand::OpenTooLarge { len: MAX_OPEN_BYTES + 1 });
     h.run_steps(2);
-    assert_eq!(bridge.take_events(), vec![HostEvent::ModeChanged { mode: EditorMode::View }, HostEvent::OpenFailed { message: OPEN_TOO_LARGE.into() }]);
+    assert_eq!(
+        bridge.take_events(),
+        vec![HostEvent::ModeChanged { mode: EditorMode::View }, HostEvent::OpenFailed { message: OPEN_TOO_LARGE.into() }]
+    );
     bridge.send(edit_request(true));
     h.run_steps(2);
     assert_eq!(bridge.take_events(), vec![HostEvent::ModeChanged { mode: EditorMode::View }]);
@@ -147,7 +156,11 @@ fn never_offers_signing_protection_splitting_applying_redactions_or_new_document
 fn applies_drawings_in_the_host_s_author_s_name_and_date_and_refuses_comments_in_the_file() {
     let (mut h, bridge) = editing(true);
     assert!(h.state_mut().apply_edit(ink(10.0)));
-    let added = h.state().active_document().and_then(|document| document.info.annotations.iter().find(|annotation| annotation.subtype == "Ink").cloned()).unwrap();
+    let added = h
+        .state()
+        .active_document()
+        .and_then(|document| document.info.annotations.iter().find(|annotation| annotation.subtype == "Ink").cloned())
+        .unwrap();
     assert_eq!(added.author.as_deref(), Some("Sari Wulan"));
     assert_eq!(added.modified.as_deref(), Some("2026-10-10 08:00"), "the host's date, as the page view shows it");
     bridge.take_events();
@@ -163,7 +176,18 @@ fn moves_and_deletes_only_annotations_made_in_this_edit_session() {
         let mut session = pdfcraft_engine::Session::new();
         let id = session.open("lease.pdf", None, Arc::new(embed_support::three_pages()), None).unwrap();
         let ink = Shape::Ink { strokes: vec![vec![[10.0, 10.0], [60.0, 60.0]]] };
-        session.apply(id, Edit::AddAnnotation(NewAnnotation { page: 0, style: Style::default_for(&ink), shape: ink, contents: String::new(), author: "Andi Pratama".into() })).unwrap();
+        session
+            .apply(
+                id,
+                Edit::AddAnnotation(NewAnnotation {
+                    page: 0,
+                    style: Style::default_for(&ink),
+                    shape: ink,
+                    contents: String::new(),
+                    author: "Andi Pratama".into(),
+                }),
+            )
+            .unwrap();
         session.save_bytes(id).unwrap().as_ref().clone()
     };
     let (mut h, bridge) = embed_support::embedded();
@@ -173,7 +197,19 @@ fn moves_and_deletes_only_annotations_made_in_this_edit_session() {
     assert!(!h.state_mut().apply_edit(Edit::DeleteAnnotation { page: 0, index: 0 }), "the file's own drawing stays");
     assert!(!h.state_mut().apply_edit(Edit::MoveAnnotation { page: 0, index: 0, dx: 5.0, dy: 5.0 }));
     assert!(h.state_mut().apply_edit(ink(80.0)));
-    let mine = h.state().active_document().and_then(|document| document.info.annotations.iter().filter(|annotation| annotation.page == 0 && annotation.subtype == "Ink").map(|annotation| annotation.index).max()).unwrap();
+    let mine = h
+        .state()
+        .active_document()
+        .and_then(|document| {
+            document
+                .info
+                .annotations
+                .iter()
+                .filter(|annotation| annotation.page == 0 && annotation.subtype == "Ink")
+                .map(|annotation| annotation.index)
+                .max()
+        })
+        .unwrap();
     assert!(mine > 0);
     assert!(h.state_mut().apply_edit(Edit::MoveAnnotation { page: 0, index: mine, dx: 5.0, dy: 5.0 }));
     assert!(h.state_mut().apply_edit(Edit::DeleteAnnotation { page: 0, index: mine }));
@@ -207,7 +243,8 @@ fn clears_a_reported_selection_before_editing_and_reports_none_while_editing() {
     bridge.send(edit_request(true));
     h.run_steps(2);
     let events = bridge.take_events();
-    let order: Vec<HostEvent> = events.iter().filter(|event| matches!(event, HostEvent::SelectionCleared | HostEvent::ModeChanged { .. })).cloned().collect();
+    let order: Vec<HostEvent> =
+        events.iter().filter(|event| matches!(event, HostEvent::SelectionCleared | HostEvent::ModeChanged { .. })).cloned().collect();
     assert_eq!(order, vec![HostEvent::SelectionCleared, HostEvent::ModeChanged { mode: EditorMode::Edit }]);
     h.key_press_modifiers(Modifiers::COMMAND, Key::A);
     h.run_steps(2);
@@ -280,7 +317,10 @@ fn takes_the_save_shortcut_as_a_save_request_in_edit_mode_only() {
     bridge.take_events();
     assert!(!h.state_mut().execute("file.save"));
     h.run_steps(2);
-    assert!(bridge.take_events().iter().all(|event| !matches!(event, HostEvent::SaveRequested { .. } | HostEvent::SaveFailed { .. })), "nothing in view mode");
+    assert!(
+        bridge.take_events().iter().all(|event| !matches!(event, HostEvent::SaveRequested { .. } | HostEvent::SaveFailed { .. })),
+        "nothing in view mode"
+    );
 }
 
 #[test]
@@ -350,7 +390,10 @@ fn reports_dirty_after_an_edit_and_clean_again_after_undoing_it() {
     let (mut h, bridge) = editing(true);
     assert!(h.state_mut().apply_edit(Edit::RotatePages { pages: vec![0], degrees: 90 }));
     h.run_steps(2);
-    assert_eq!(bridge.take_events().iter().filter(|event| matches!(event, HostEvent::DirtyChanged { .. })).collect::<Vec<_>>(), vec![&HostEvent::DirtyChanged { dirty: true }]);
+    assert_eq!(
+        bridge.take_events().iter().filter(|event| matches!(event, HostEvent::DirtyChanged { .. })).collect::<Vec<_>>(),
+        vec![&HostEvent::DirtyChanged { dirty: true }]
+    );
     // A save never clears dirty (W3-4).
     bridge.send(HostCommand::RequestSave);
     h.run_steps(2);
@@ -380,7 +423,10 @@ fn turns_a_comment_tool_with_a_selection_into_a_comment_request() {
         h.run_steps(2);
         let events = bridge.take_events();
         let request = events.iter().find(|event| matches!(event, HostEvent::CommentRequested { .. }));
-        assert!(matches!(request, Some(HostEvent::CommentRequested { text, page: Some(_), .. }) if text.contains("Definitions")), "{command}: {events:?}");
+        assert!(
+            matches!(request, Some(HostEvent::CommentRequested { text, page: Some(_), .. }) if text.contains("Definitions")),
+            "{command}: {events:?}"
+        );
     }
     assert_eq!(h.state().active_document().map(|document| document.info.annotations.len()), Some(0));
 }
@@ -405,7 +451,11 @@ fn keeps_one_author_and_one_date_per_save() {
     bridge.send(edit_request(true));
     h.run_steps(2);
     assert_eq!(bridge.take_events(), vec![HostEvent::ModeChanged { mode: EditorMode::View }, HostEvent::ModeChanged { mode: EditorMode::Edit }]);
-    let mine = h.state().active_document().and_then(|document| document.info.annotations.iter().find(|annotation| annotation.subtype == "Ink").map(|annotation| annotation.index)).unwrap();
+    let mine = h
+        .state()
+        .active_document()
+        .and_then(|document| document.info.annotations.iter().find(|annotation| annotation.subtype == "Ink").map(|annotation| annotation.index))
+        .unwrap();
     assert!(h.state_mut().apply_edit(Edit::MoveAnnotation { page: 0, index: mine, dx: 5.0, dy: 5.0 }), "still this session's");
     // Undone back to the opened file, another date starts a new session, and redo brings nothing back.
     while h.state_mut().execute("edit.undo") {}

@@ -106,21 +106,28 @@ pub(crate) fn allows_command(id: &str, permissions: &EditPermissions) -> bool {
 /// it. Changing an existing annotation also needs it to be this session's (`embed_edit_prepare`).
 pub(crate) fn allows_edit(edit: &Edit, permissions: &EditPermissions) -> bool {
     match edit {
-        Edit::RotatePages { .. } | Edit::DeletePages { .. } | Edit::MovePages { .. } | Edit::InsertBlankPage { .. } | Edit::InsertPagesFrom { .. } => {
-            permissions.organize_pages
-        }
+        Edit::RotatePages { .. }
+        | Edit::DeletePages { .. }
+        | Edit::MovePages { .. }
+        | Edit::InsertBlankPage { .. }
+        | Edit::InsertPagesFrom { .. } => permissions.organize_pages,
         Edit::SetFieldValue { .. } | Edit::ResetForm { .. } => permissions.fill_forms,
         Edit::AddCustomStamp { .. } => permissions.stamps,
         Edit::AddAnnotation(annotation) => match &annotation.shape {
             Shape::Redact { .. } => permissions.redact,
             Shape::Stamp { .. } | Shape::CustomStamp { .. } => permissions.stamps,
-            Shape::Ink { .. } | Shape::Line { .. } | Shape::Rectangle { .. } | Shape::Oval { .. } | Shape::Polygon { .. } | Shape::PolyLine { .. } => {
-                permissions.drawing
-            }
+            Shape::Ink { .. }
+            | Shape::Line { .. }
+            | Shape::Rectangle { .. }
+            | Shape::Oval { .. }
+            | Shape::Polygon { .. }
+            | Shape::PolyLine { .. } => permissions.drawing,
             _ => false,
         },
         Edit::EraseInk { .. } => permissions.drawing,
-        Edit::MoveAnnotation { .. } | Edit::ResizeAnnotation { .. } | Edit::DeleteAnnotation { .. } => permissions.drawing || permissions.stamps || permissions.redact,
+        Edit::MoveAnnotation { .. } | Edit::ResizeAnnotation { .. } | Edit::DeleteAnnotation { .. } => {
+            permissions.drawing || permissions.stamps || permissions.redact
+        }
         Edit::Batch { edits, .. } => edits.iter().all(|edit| allows_edit(edit, permissions)),
         _ => false,
     }
@@ -129,7 +136,10 @@ pub(crate) fn allows_edit(edit: &Edit, permissions: &EditPermissions) -> bool {
 /// The annotation an edit changes in place, as (page, index in `/Annots`).
 fn changed_annotations(edit: &Edit, out: &mut Vec<(usize, usize)>) {
     match edit {
-        Edit::EraseInk { page, index, .. } | Edit::MoveAnnotation { page, index, .. } | Edit::ResizeAnnotation { page, index, .. } | Edit::DeleteAnnotation { page, index } => {
+        Edit::EraseInk { page, index, .. }
+        | Edit::MoveAnnotation { page, index, .. }
+        | Edit::ResizeAnnotation { page, index, .. }
+        | Edit::DeleteAnnotation { page, index } => {
             out.push((*page, *index));
         }
         Edit::Batch { edits, .. } => edits.iter().for_each(|edit| changed_annotations(edit, out)),
@@ -175,9 +185,10 @@ fn snap_to_glyphs(bytes: &Arc<Vec<u8>>, page: usize, quads: &mut [[f64; 8]]) {
         ];
         // A few rounds: a glyph taken in can reach a neighbour the drawn mark did not.
         for _ in 0..4 {
-            let grown = boxes.iter().filter(|glyph| glyph[0] < rect[2] && glyph[2] > rect[0] && glyph[1] < rect[3] && glyph[3] > rect[1]).fold(rect, |r, g| {
-                [r[0].min(g[0]), r[1].min(g[1]), r[2].max(g[2]), r[3].max(g[3])]
-            });
+            let grown = boxes
+                .iter()
+                .filter(|glyph| glyph[0] < rect[2] && glyph[2] > rect[0] && glyph[1] < rect[3] && glyph[3] > rect[1])
+                .fold(rect, |r, g| [r[0].min(g[0]), r[1].min(g[1]), r[2].max(g[2]), r[3].max(g[3])]);
             if grown == rect {
                 break;
             }
@@ -368,7 +379,8 @@ impl PdfCraftApp {
         let author = session.author.clone();
         let mut changed = Vec::new();
         changed_annotations(edit, &mut changed);
-        let allowed = allows_edit(edit, &session.permissions) && changed.iter().all(|(page, index)| self.made_in_this_session(*page, *index, &author));
+        let allowed =
+            allows_edit(edit, &session.permissions) && changed.iter().all(|(page, index)| self.made_in_this_session(*page, *index, &author));
         if !allowed {
             embed.bridge.emit(HostEvent::EditRefused { code: refusal::COMMAND_NOT_ALLOWED });
             return false;
