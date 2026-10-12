@@ -277,7 +277,7 @@ fn run(base: &[u8], edited: &[u8], limits: InspectLimits) -> Result<Applied, App
     };
     let mut budget = clock.budget(limits)?;
     self_check(&inspection, &facts, &before, &detail, (removed, fields), &mut budget)?;
-    left_under_marks(&bytes, &facts.areas)?;
+    left_under_marks(&bytes, &facts.areas, facts.overhang)?;
     clock.left(limits)?;
     canonical_streams(edited, &bytes, &mut budget)?;
     inspection.annotations.removed_by_redaction = removed;
@@ -340,11 +340,52 @@ fn normalise(doc: &mut Document, newest: u32, contents: &std::collections::HashS
 /// Follow-up 9 (R6b-54, N1): the output read again, page by page: nothing the redactor reads as
 /// drawn under an applied area (a glyph, an inline image, a point or control point of a path)
 /// but its own boxes.
-pub(crate) fn left_under_marks(output: &[u8], areas: &[(u32, [f32; 4])]) -> Result<(), ApplyError> {
+pub(crate) fn left_under_marks(output: &[u8], areas: &[(u32, [f32; 4])], overhang: f32) -> Result<(), ApplyError> {
     let mut doc = Document::open(Arc::new(output.to_vec())).map_err(|error| ApplyError::SelfCheck(error.to_string()))?;
     let mut by_page: std::collections::BTreeMap<u32, Vec<[f64; 4]>> = std::collections::BTreeMap::new();
     for (page, area) in areas {
         by_page.entry(*page).or_default().push(area.map(f64::from));
+    }
+    // Audit (follow-up 9): the stream the reading below leaves out as the redactor's boxes
+    // (`/PCMark /Redaction`) holds nothing but its boxes: black, filled, each within the marks of
+    // its page (or the image overhang past them), on every page.
+    let reach = f64::from(BAND_SLACK + overhang);
+    let mut budget = Budget::new(Limits::default());
+    for (index, page) in pdfcraft_model::pages(&doc).iter().enumerate() {
+        let number = count(index.saturating_add(1));
+        let marks = by_page.get(&number).map(Vec::as_slice).unwrap_or_default();
+        let list = match page.dict.get(b"Contents").map(|c| (*doc.resolve(c)).clone()) {
+            Some(Object::Array(items)) => items,
+            Some(other) => vec![other],
+            None => Vec::new(),
+        };
+        for item in list {
+            let Object::Stream(stream) = &*doc.resolve(&item) else { continue };
+            if stream.dict.name(b"PCMark") != Some(b"Redaction") {
+                continue;
+            }
+            let data = stream.decoded().map_err(|error| ApplyError::SelfCheck(error.to_string()))?;
+            let canonical = operators::canonical(&data, &mut budget).map_err(|_| ApplyError::SelfCheck("the boxes cannot be read".into()))?;
+            for line in String::from_utf8_lossy(&canonical).lines() {
+                let words: Vec<&str> = line.split_whitespace().collect();
+                let boxed = match words.as_slice() {
+                    ["q"] | ["Q"] | ["f"] | ["0", "0", "0", "rg"] | ["0", "g"] => None,
+                    [x, y, w, h, "re"] => {
+                        let numbers: Option<Vec<f64>> = [x, y, w, h].iter().map(|v| v.parse::<f64>().ok()).collect();
+                        match numbers.as_deref() {
+                            Some(&[x, y, w, h]) => Some([x.min(x + w), y.min(y + h), x.max(x + w), y.max(y + h)]),
+                            _ => return Err(ApplyError::SelfCheck("the boxes hold something else".into())),
+                        }
+                    }
+                    _ => return Err(ApplyError::SelfCheck(format!("the boxes on page {number} hold something else than boxes"))),
+                };
+                if let Some(b) = boxed
+                    && !marks.iter().any(|m| b[0] >= m[0] - reach && b[1] >= m[1] - reach && b[2] <= m[2] + reach && b[3] <= m[3] + reach)
+                {
+                    return Err(ApplyError::SelfCheck(format!("a box on page {number} lies outside the marks")));
+                }
+            }
+        }
     }
     for (page, rects) in by_page {
         let index = usize::try_from(page.saturating_sub(1)).unwrap_or(usize::MAX);

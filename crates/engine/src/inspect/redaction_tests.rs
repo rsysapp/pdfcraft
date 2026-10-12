@@ -1026,7 +1026,7 @@ fn the_self_check_reads_no_path_point_under_a_mark() {
     // redactor's cut would never leave) fails the self-check.
     let base = Spec::new(&format!("{LINE}\n{KEEP}")).build();
     let applied = apply(&base, &marked(&base, &[BOX])).unwrap();
-    assert_eq!(apply::left_under_marks(&applied.bytes, &applied.facts.areas), Ok(()));
+    assert_eq!(apply::left_under_marks(&applied.bytes, &applied.facts.areas, applied.facts.overhang), Ok(()));
     let mut doc = pdfcraft_cos::Document::open(Arc::new(applied.bytes.clone())).unwrap();
     let page = pdfcraft_model::pages(&doc).swap_remove(0);
     let mut list = match page.dict.get(b"Contents").map(|c| (*doc.resolve(c)).clone()) {
@@ -1039,5 +1039,68 @@ fn the_self_check_reads_no_path_point_under_a_mark() {
     list.insert(0, pdfcraft_cos::Object::Ref(added));
     doc.update_dict(page.obj, |d| d.set(b"Contents".to_vec(), pdfcraft_cos::Object::Array(list))).unwrap();
     let forged = pdfcraft_cos::write_full(&doc, &pdfcraft_cos::SaveOptions { mod_date: None, ..Default::default() }).unwrap();
-    assert!(matches!(apply::left_under_marks(&forged, &applied.facts.areas), Err(ApplyError::SelfCheck(_))));
+    assert!(matches!(apply::left_under_marks(&forged, &applied.facts.areas, applied.facts.overhang), Err(ApplyError::SelfCheck(_))));
+}
+
+// ── Audit (follow-up 9, coordinator's scan of operators.rs): the geometry self-check ─────────
+
+/// `applied` written again with `content` drawn first on page 1, in a stream tagged `tag`
+/// (`/PCMark`, the redactor's box tag when given), with `extra` resources.
+fn forge_page(applied: &[u8], content: &[u8], tag: Option<&str>, form: Option<&[u8]>) -> Vec<u8> {
+    let mut doc = pdfcraft_cos::Document::open(Arc::new(applied.to_vec())).unwrap();
+    let page = pdfcraft_model::pages(&doc).swap_remove(0);
+    let mut list = match page.dict.get(b"Contents").map(|c| (*doc.resolve(c)).clone()) {
+        Some(pdfcraft_cos::Object::Array(items)) => items,
+        Some(other) => vec![other],
+        None => Vec::new(),
+    };
+    let mut dict = pdfcraft_cos::Dict::new();
+    if let Some(tag) = tag {
+        dict.set(b"PCMark".to_vec(), pdfcraft_cos::Object::name(tag));
+    }
+    let added = doc.add(pdfcraft_cos::Object::Stream(pdfcraft_cos::Stream::from_raw(dict, content.to_vec())));
+    list.insert(0, pdfcraft_cos::Object::Ref(added));
+    let mut resources = page.dict.get(b"Resources").and_then(|r| doc.resolve(r).as_dict().cloned()).unwrap_or_default();
+    if let Some(form) = form {
+        let mut form_dict = pdfcraft_cos::Dict::new();
+        form_dict.set(b"Type".to_vec(), pdfcraft_cos::Object::name("XObject"));
+        form_dict.set(b"Subtype".to_vec(), pdfcraft_cos::Object::name("Form"));
+        form_dict.set(b"BBox".to_vec(), pdfcraft_cos::Object::Array([0, 0, 200, 300].map(pdfcraft_cos::Object::Int).to_vec()));
+        let form = doc.add(pdfcraft_cos::Object::Stream(pdfcraft_cos::Stream::from_raw(form_dict, form.to_vec())));
+        let mut xobjects = pdfcraft_cos::Dict::new();
+        xobjects.set(b"Forged".to_vec(), pdfcraft_cos::Object::Ref(form));
+        resources.set(b"XObject".to_vec(), pdfcraft_cos::Object::Dict(xobjects));
+    }
+    doc.update_dict(page.obj, |d| {
+        d.set(b"Contents".to_vec(), pdfcraft_cos::Object::Array(list));
+        d.set(b"Resources".to_vec(), pdfcraft_cos::Object::Dict(resources));
+    })
+    .unwrap();
+    pdfcraft_cos::write_full(&doc, &pdfcraft_cos::SaveOptions { mod_date: None, ..Default::default() }).unwrap()
+}
+
+#[test]
+fn the_geometry_self_check_reads_every_point_a_path_has_under_a_mark() {
+    // Audit (operators.rs): the content check accepts the redactor's cut paths by their syntax;
+    // where their points lie is the self-check's to judge, on the output `apply_marks` wrote.
+    // Every way a forged output could keep a point under an applied area is refused: a
+    // rectangle's corner, a curve's control point alone (its ends outside), a path built across
+    // a change of the matrix, a path in a form drawn under the mark, and a path hidden in a
+    // stream tagged as the redactor's boxes.
+    let base = Spec::new(&format!("{LINE}\n{KEEP}")).build();
+    let applied = apply(&base, &marked(&base, &[BOX])).unwrap();
+    assert_eq!(apply::left_under_marks(&applied.bytes, &applied.facts.areas, applied.facts.overhang), Ok(()));
+    for (case, content, tag, form) in [
+        ("a rectangle", &b"0 g 40 150 4 4 re f\n"[..], None, None),
+        ("a control point", &b"0 g 0 0 m 60 155 60 155 150 0 c S\n"[..], None, None),
+        ("v's control point", &b"0 g 0 0 m 60 155 150 0 v S\n"[..], None, None),
+        ("y's control point", &b"0 g 0 0 m 60 155 150 0 y S\n"[..], None, None),
+        ("across a matrix", &b"q 0 g 0 0 m 1 0 0 1 50 150 cm 1 1 l S Q\n"[..], None, None),
+        ("in a form", &b"q /Forged Do Q\n"[..], None, Some(&b"0 g 50 150 m 51 151 l S"[..])),
+        ("as the boxes", &b"q 0 g 50 150 m 51 151 l S Q\n"[..], Some("Redaction"), None),
+        ("a box elsewhere", &b"q 0 0 0 rg 150 10 20 20 re f Q\n"[..], Some("Redaction"), None),
+    ] {
+        let forged = forge_page(&applied.bytes, content, tag, form);
+        assert!(matches!(apply::left_under_marks(&forged, &applied.facts.areas, applied.facts.overhang), Err(ApplyError::SelfCheck(_))), "{case}");
+    }
 }
