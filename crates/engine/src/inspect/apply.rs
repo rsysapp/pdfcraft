@@ -71,6 +71,9 @@ pub struct AppliedFacts {
     pub annotation_texts_cleared: u32,
     pub layer_names_cleared: u32,
     pub label_prefixes_cleared: u32,
+    /// R6b-57: of the copies cleared, those cleared because no two readers read them alike (or
+    /// they could not be read): over-clearing, counted.
+    pub copies_cleared_unread: u32,
     /// Follow-up 9 (R6b-54, N6): the most an image's cleared pixels reach past the marks, in
     /// points: the larger side of the largest image pixel cleared (0 without one). Every pixel a
     /// mark reaches is cleared whole; the self-check allows bands filled this far past the marks.
@@ -290,6 +293,7 @@ fn run(base: &[u8], edited: &[u8], limits: InspectLimits) -> Result<Applied, App
         annotation_texts_cleared: count(report.annotation_texts_cleared),
         layer_names_cleared: count(report.layer_names_cleared),
         label_prefixes_cleared: count(report.label_prefixes_cleared),
+        copies_cleared_unread: count(report.copies_cleared_unread),
     };
     let mut budget = clock.budget(limits)?;
     self_check(&inspection, &facts, &before, &detail, (removed, fields), &mut budget)?;

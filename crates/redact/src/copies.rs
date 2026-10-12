@@ -9,16 +9,20 @@
 //! **Matched (R6b-52, R6b-56).** Bookmark titles, annotations' `/Contents` (and its rich-text
 //! form `/RC`) and `/T` outside the marks, optional-content groups' names, page-label prefixes
 //! and destination names. One normalisation ([`normalise`]) reads the removed text and every
-//! candidate alike: decoded by the string's own encoding ([`decode_text`]), then NFKC, then
+//! candidate alike: decoded by the string's own encoding ([`read_text`]), then NFKC, then
 //! format characters taken out, then case and diacritics folded. A copy holds a removed word
 //! when it holds one of the removed tokens (three letters or digits or more, a short function
 //! word excepted), as a word of its own, a part of one where letters meet digits, or inside a
 //! word (as follow-up 8 found removed runs anywhere), five characters or more across words; or
-//! a removed phrase (two words or more) whole. A candidate that cannot be decoded refuses the redaction
-//! ([`Refusal::CopyNotClearable`]); so do removed glyphs without readable text where any of these
-//! places holds text ([`Refusal::UnreadableMarkedText`]), and a bookmark's or the opening
-//! action's URI or JavaScript holding a removed word (it cannot be cleared without changing what
-//! the action does).
+//! a removed phrase (two words or more) whole. A candidate not read alike by every reader
+//! (R6b-57: ambiguous, invalid, decodings that disagree, an encoding not read, an escape that is
+//! no language mark, a character the matcher does not fold) counts as holding one: it is
+//! cleared, and counted (`copies_cleared_unread`); clearing too much is accepted, keeping a copy
+//! is not. Refused are only structural failures (a bookmark that is no dictionary, an outline
+//! that loops, a bound reached), removed glyphs without readable text where any of these places
+//! holds text ([`Refusal::UnreadableMarkedText`]), and a bookmark's or the opening action's URI
+//! or JavaScript holding a removed word (or not read alike): it cannot be cleared without
+//! changing what the action does.
 //!
 //! **What clearing does.** Bookmark titles read "[Redacted]"; annotations' text entries holding
 //! one go; groups' names read "[Redacted]"; prefixes go; named destinations are renamed to opaque
@@ -51,13 +55,11 @@ const STOP_WORDS: [&str; 46] = [
 /// lower case; capitalised, a name, matched like any token.
 const NAME_LIKE: [&str; 3] = ["dan", "ada", "may"];
 
-/// Characters a viewer does not show, which must not split a word: control characters (a null
-/// in a UTF-16 string among them; not the white space a viewer shows), the soft hyphen,
-/// zero-width spaces and joiners, directional marks, the word joiner and its kin, the byte-order
-/// mark.
+/// Characters a viewer does not show, which the matcher folds out (they must not split a word):
+/// the soft hyphen, zero-width spaces and joiners, directional marks, the word joiner and its
+/// kin, the byte-order mark.
 fn invisible(c: char) -> bool {
-    (c.is_control() && !matches!(c, '\t' | '\n' | '\r' | '\u{c}'))
-        || matches!(c, '\u{ad}' | '\u{34f}' | '\u{180e}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206f}' | '\u{feff}')
+    matches!(c, '\u{ad}' | '\u{34f}' | '\u{180e}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206f}' | '\u{feff}')
 }
 
 /// The language escapes of a text string (U+001B, a code, U+001B) taken out, as pdf.js takes
@@ -75,60 +77,100 @@ fn without_escapes(text: &str) -> String {
     out
 }
 
-/// A text string as pdf.js reads it (`stringToPDFString`): after a UTF-16BE, UTF-16LE or UTF-8
-/// mark, decoded strictly, falling back to its PDFDocEncoding table when that fails; its
-/// table leaves bytes it does not translate (0x9F) as they are.
+/// Whether every escape of a text string is a language mark the standard defines (U+001B, a
+/// two-letter language code, an optional two-letter country code, U+001B).
+fn escapes_known(text: &str) -> bool {
+    let mut parts = text.split('\u{1b}');
+    parts.next();
+    let codes: Vec<&str> = parts.collect();
+    if codes.len() % 2 != 0 {
+        return false;
+    }
+    codes.chunks(2).all(|pair| {
+        let code = pair[0];
+        let letters = |s: &str, lower: bool| s.len() == 2 && s.chars().all(|c| if lower { c.is_ascii_lowercase() } else { c.is_ascii_uppercase() });
+        (code.len() == 2 && letters(code, true)) || (code.len() == 4 && letters(&code[..2], true) && letters(&code[2..], false))
+    })
+}
+
+/// A text string as pdf.js reads it (`stringToPDFString`, escapes kept): after a UTF-16BE,
+/// UTF-16LE or UTF-8 mark, decoded strictly, falling back to its PDFDocEncoding table when that
+/// fails; its table leaves bytes it does not translate (0x9F) as they are.
 fn as_pdf_js_reads(bytes: &[u8]) -> String {
+    let utf16 = |rest: &[u8], le: bool| {
+        (rest.len() % 2 == 0)
+            .then(|| {
+                let units = rest.as_chunks::<2>().0.iter().map(|p| if le { u16::from_le_bytes(*p) } else { u16::from_be_bytes(*p) });
+                char::decode_utf16(units).collect::<Result<String, _>>().ok()
+            })
+            .flatten()
+    };
     let marked: Option<Option<String>> = if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
-        Some(
-            (rest.len() % 2 == 0)
-                .then(|| char::decode_utf16(rest.as_chunks::<2>().0.iter().map(|p| u16::from_be_bytes(*p))).collect::<Result<String, _>>().ok())
-                .flatten(),
-        )
+        Some(utf16(rest, false))
     } else if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
-        Some(
-            (rest.len() % 2 == 0)
-                .then(|| char::decode_utf16(rest.as_chunks::<2>().0.iter().map(|p| u16::from_le_bytes(*p))).collect::<Result<String, _>>().ok())
-                .flatten(),
-        )
+        Some(utf16(rest, true))
     } else {
         bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).map(|rest| String::from_utf8(rest.to_vec()).ok())
     };
     if let Some(Some(text)) = marked {
-        return without_escapes(&text);
+        return text;
     }
-    let text: String = bytes
+    bytes
         .iter()
         .map(|&byte| match PdfString::literal(vec![byte]).to_text().chars().next() {
             Some('\u{fffd}') | None => char::from(byte),
             Some(c) => c,
         })
-        .collect();
-    without_escapes(&text)
+        .collect()
 }
 
 /// A text string as the standard reads it (ISO 32000-2 §7.9.2.2; PDFium and this file's own
-/// reader): UTF-16BE or UTF-8 after its mark, else PDFDocEncoding, bad sequences replaced.
+/// reader, escapes kept): UTF-16BE or UTF-8 after its mark, else PDFDocEncoding, bad sequences
+/// replaced.
 fn as_the_standard_reads(bytes: &[u8]) -> String {
-    without_escapes(&PdfString::literal(bytes.to_vec()).to_text())
+    PdfString::literal(bytes.to_vec()).to_text()
 }
 
-/// R6b-56, audit (follow-up 9): a PDF text string decoded as viewers decode it: as pdf.js reads
-/// it and as the standard reads it (see above). `None` when the two read it otherwise (an odd
-/// UTF-16 length, an unpaired surrogate, bad UTF-8 after its mark, UTF-16LE, a byte the two
-/// PDFDocEncoding tables read otherwise): what a viewer shows cannot be known, so the redaction is
-/// refused rather than matched on a guess.
-pub(crate) fn decode_text(bytes: &[u8]) -> Option<String> {
+/// Whether a character is one the matcher cannot stand for: a replacement character, a control
+/// character but white space, a private-use or non-character, or a format character it does not
+/// fold out (see [`invisible`]).
+fn unfolded(c: char) -> bool {
+    let code = u32::from(c);
+    let format = matches!(code, 0x0600..=0x0605 | 0x061C | 0x06DD | 0x070F | 0x0890..=0x0891 | 0x08E2 | 0xFFF9..=0xFFFB | 0x110BD | 0x110CD | 0x13430..=0x1343F | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A | 0xE0001 | 0xE0020..=0xE007F);
+    c == '\u{fffd}'
+        || (c.is_control() && !matches!(c, '\t' | '\n' | '\r' | '\u{c}' | '\u{1b}'))
+        || matches!(code, 0xE000..=0xF8FF | 0xF0000..=0x10FFFF | 0xFDD0..=0xFDEF)
+        || code & 0xFFFE == 0xFFFE
+        || (format && !invisible(c))
+}
+
+/// How a candidate reads (R6b-57).
+pub(crate) enum Reading {
+    /// Read alike by every reader: its text, escapes out.
+    Read(String),
+    /// Not read alike (ambiguous, invalid, decodings that disagree, an encoding not read, a
+    /// character the matcher cannot stand for): taken as holding a removed word.
+    Unread,
+}
+
+/// R6b-57: a PDF text string as every reader reads it: pdf.js's rules and the standard's must
+/// give the same text; a mark's decoding must be valid; bytes past 0x7F without a mark must not
+/// also be UTF-8 (which a reader could take them for); every escape must be a language mark; and
+/// every character one the matcher folds or stands for.
+pub(crate) fn read_text(bytes: &[u8]) -> Reading {
     let (pdf_js, standard) = (as_pdf_js_reads(bytes), as_the_standard_reads(bytes));
-    (pdf_js == standard).then_some(standard)
+    let marked = bytes.starts_with(&[0xFE, 0xFF]) || bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xEF, 0xBB, 0xBF]);
+    let utf8_too = !marked && !bytes.is_ascii() && std::str::from_utf8(bytes).is_ok();
+    if pdf_js != standard || utf8_too || !escapes_known(&standard) || standard.chars().any(unfolded) {
+        return Reading::Unread;
+    }
+    Reading::Read(without_escapes(&standard))
 }
 
-/// A name's bytes as text (destination names): UTF-8 when they are, else as a text string.
-fn decode_name(bytes: &[u8]) -> Option<String> {
-    match std::str::from_utf8(bytes) {
-        Ok(text) => Some(text.to_string()),
-        Err(_) => decode_text(bytes),
-    }
+/// A name's bytes as text (destination names): printable ASCII is read as it is; anything
+/// else is unread (R6b-57: readers take a name's other bytes each their own way).
+fn read_name(bytes: &[u8]) -> Reading {
+    if bytes.iter().all(|byte| (0x21..0x7F).contains(byte)) { Reading::Read(String::from_utf8_lossy(bytes).into_owned()) } else { Reading::Unread }
 }
 
 /// Case and diacritics folded (after NFKC): decomposed, marks and what is not shown taken out,
@@ -246,20 +288,22 @@ impl Removed {
     }
 }
 
-/// A candidate's text (R6b-56): a string decoded by its own encoding, a name's bytes as text;
-/// `None` for anything else. A string or name that cannot be decoded refuses.
-fn copy_text(doc: &Document, o: &Object) -> Result<Option<String>, RedactError> {
-    let undecodable = RedactError::Refused(Refusal::CopyNotClearable);
-    match &*doc.resolve(o) {
-        Object::String(s) => decode_text(&s.bytes).map(Some).ok_or(undecodable),
-        Object::Name(n) => decode_name(n).map(Some).ok_or(undecodable),
-        _ => Ok(None),
+/// R6b-57: whether candidate `o` (a string, or a name's bytes) holds a removed word: read alike
+/// by every reader and holding one, or not read alike at all (counted in
+/// `copies_cleared_unread`: cleared as if it held one). Anything else is no candidate.
+fn holds(doc: &Document, o: &Object, removed: &Removed, report: &mut Report) -> bool {
+    let reading = match &*doc.resolve(o) {
+        Object::String(s) => read_text(&s.bytes),
+        Object::Name(n) => read_name(n),
+        _ => return false,
+    };
+    match reading {
+        Reading::Read(text) => removed.held_in(&text),
+        Reading::Unread => {
+            report.copies_cleared_unread += 1;
+            true
+        }
     }
-}
-
-/// Whether candidate `o` (see [`copy_text`]) holds a removed word.
-fn holds(doc: &Document, o: &Object, removed: &Removed) -> Result<bool, RedactError> {
-    Ok(copy_text(doc, o)?.is_some_and(|text| removed.held_in(&text)))
 }
 
 /// Whether an action (a bookmark's, the opening one), or any action it chains, holds a removed
@@ -279,11 +323,15 @@ fn action_holds(doc: &Document, action: &Object, removed: &Removed, work: &inter
         return Ok(false);
     }
     Ok(match &*doc.resolve(action) {
-        Object::String(_) | Object::Name(_) => holds(doc, action, removed)?,
+        // Held, or not read alike (R6b-57): an action cannot be cleared, so either refuses.
+        Object::String(_) | Object::Name(_) => holds(doc, action, removed, &mut Report::default()),
         Object::Stream(stream) => {
             let data = stream.decoded().map_err(|_| RedactError::Refused(Refusal::CopyNotClearable))?;
             work.charge(data.len() / 64);
-            removed.held_in(&decode_text(&data).ok_or(RedactError::Refused(Refusal::CopyNotClearable))?)
+            match read_text(&data) {
+                Reading::Read(text) => removed.held_in(&text),
+                Reading::Unread => true,
+            }
         }
         Object::Array(items) => {
             let mut held = false;
@@ -415,8 +463,9 @@ pub(crate) fn clear(doc: &mut Document, removed: &Removed, report: &mut Report, 
         work.charge(8);
         spent(work)?;
         let Some(r) = entry.as_ref() else { return Err(RedactError::Refused(Refusal::CopyNotClearable)) };
+        // R6b-57: an outline that loops is a structural failure: refused.
         if !seen.insert(r) {
-            continue;
+            return Err(RedactError::Refused(Refusal::CopyNotClearable));
         }
         if seen.len() > 100_000 {
             return Err(RedactError::TooComplex);
@@ -428,7 +477,7 @@ pub(crate) fn clear(doc: &mut Document, removed: &Removed, report: &mut Report, 
             return Err(RedactError::Refused(Refusal::CopyNotClearable));
         }
         if let Some(title) = item.get(b"Title")
-            && holds(doc, title, removed)?
+            && holds(doc, title, removed, report)
         {
             doc.update_dict(r, |d| d.set(b"Title".to_vec(), Object::String(PdfString::text(REDACTED))))?;
             report.bookmarks_cleared += 1;
@@ -448,7 +497,7 @@ pub(crate) fn clear(doc: &mut Document, removed: &Removed, report: &mut Report, 
         let mut doomed: Vec<&[u8]> = Vec::new();
         for key in [&b"Contents"[..], b"RC", b"T"] {
             if let Some(value) = dict.get(key)
-                && holds(doc, value, removed)?
+                && holds(doc, value, removed, report)
             {
                 doomed.push(key);
             }
@@ -467,7 +516,7 @@ pub(crate) fn clear(doc: &mut Document, removed: &Removed, report: &mut Report, 
         work.charge(4);
         let Some(dict) = doc.get(r).as_dict().cloned() else { continue };
         if let Some(name) = dict.get(b"Name")
-            && holds(doc, name, removed)?
+            && holds(doc, name, removed, report)
         {
             doc.update_dict(r, |d| d.set(b"Name".to_vec(), Object::String(PdfString::text(REDACTED))))?;
             report.layer_names_cleared += 1;
@@ -504,7 +553,7 @@ fn clear_label_prefixes(
             let target = label.as_ref();
             let Some(mut entry) = doc.resolve(label).as_dict().cloned() else { continue };
             if let Some(prefix) = entry.get(b"P")
-                && holds(doc, prefix, removed)?
+                && holds(doc, prefix, removed, report)
             {
                 entry.remove(b"P");
                 report.label_prefixes_cleared += 1;
@@ -537,6 +586,18 @@ fn clear_label_prefixes(
         }
     }
     Ok(())
+}
+
+/// Whether a destination name, as read, holds a removed word (R6b-57: one not read alike is
+/// renamed, counted).
+fn name_held(reading: Reading, removed: &Removed, report: &mut Report) -> bool {
+    match reading {
+        Reading::Read(text) => removed.held_in(&text),
+        Reading::Unread => {
+            report.copies_cleared_unread += 1;
+            true
+        }
+    }
 }
 
 /// A destination name's bytes, whether written as a name or a string (literal or hex).
@@ -579,7 +640,7 @@ fn rename_destinations(doc: &mut Document, removed: &Removed, report: &mut Repor
     if let Some(dict) = dests.as_mut() {
         let mut doomed: Vec<Vec<u8>> = Vec::new();
         for (key, _) in dict.iter() {
-            if removed.held_in(&decode_name(key).ok_or(RedactError::Refused(Refusal::CopyNotClearable))?) {
+            if name_held(read_name(key), removed, report) {
                 doomed.push(key.clone());
             }
         }
@@ -593,7 +654,7 @@ fn rename_destinations(doc: &mut Document, removed: &Removed, report: &mut Repor
     }
     let mut tree_changed = false;
     for (key, _) in &mut tree {
-        if removed.held_in(&decode_text(key).ok_or(RedactError::Refused(Refusal::CopyNotClearable))?) {
+        if name_held(read_text(key), removed, report) {
             let new = renames.get(key).cloned().unwrap_or_else(|| fresh(&mut existing));
             renames.insert(key.clone(), new.clone());
             *key = new;

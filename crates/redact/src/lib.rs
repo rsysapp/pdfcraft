@@ -298,6 +298,10 @@ pub struct Report {
     pub annotation_texts_cleared: usize,
     pub layer_names_cleared: usize,
     pub label_prefixes_cleared: usize,
+    /// Embed build (R6b-57): of the copies cleared, those cleared because they could not be read
+    /// alike by every reader (ambiguous, invalid or disagreeing decodings, an encoding not read,
+    /// a character not folded): cleared as if they held a removed word.
+    pub copies_cleared_unread: usize,
     /// Embed build (R6b-54, N6): the most the cleared pixels of an image reach past the marks,
     /// in user space: the larger side of the largest cleared image pixel (0 without one). Every
     /// pixel a mark reaches is cleared whole, so a coarse image's cleared pixels overhang it.

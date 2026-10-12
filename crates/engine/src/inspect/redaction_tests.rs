@@ -1491,25 +1491,6 @@ fn any_redaction_takes_the_document_information_and_every_xmp_packet() {
 }
 
 #[test]
-fn a_copy_that_cannot_be_decoded_refuses_the_redaction() {
-    // R6b-56: a string where copies are matched that cannot be decoded by its own encoding (an
-    // odd UTF-16 length, an unpaired surrogate, bad UTF-8 after its mark, a PDFDocEncoding byte
-    // no character has) is never skipped, nor guessed at: refused.
-    for title in ["<FEFF0053004500>", "<FEFFD8000041>", "<EFBBBFFF41>", "<41 9F 42>"] {
-        let base = Spec {
-            cat: "/Outlines 6 0 R".into(),
-            extras: vec![
-                b"<< /Type /Outlines /First 7 0 R /Last 7 0 R /Count 1 >>".to_vec(),
-                format!("<< /Title {title} /Parent 6 0 R /Dest [3 0 R /Fit] >>").into_bytes(),
-            ],
-            ..Spec::new(&format!("{LINE}\n{KEEP}"))
-        }
-        .build();
-        assert_eq!(apply(&base, &marked(&base, &[BOX])).map(|_| ()), Err(ApplyError::Refused(Refusal::CopyNotClearable)), "{title}");
-    }
-}
-
-#[test]
 fn an_annotation_s_text_is_matched_whatever_entries_it_has() {
     // R6b-56 (scan item): an annotation without /Type or /Contents whose author (/T) holds the
     // removed word, outside the marks, is cleared.
@@ -1547,34 +1528,52 @@ fn xmp_on_an_appearance_goes_too_and_the_output_keeps_none() {
 fn titled(title: &str) -> Vec<u8> {
     Spec {
         cat: "/Outlines 6 0 R".into(),
-        extras: vec![b"<< /Type /Outlines /First 7 0 R /Last 7 0 R /Count 1 >>".to_vec(), format!("<< /Title {title} /Parent 6 0 R /Dest [3 0 R /Fit] >>").into_bytes()],
+        extras: vec![
+            b"<< /Type /Outlines /First 7 0 R /Last 7 0 R /Count 1 >>".to_vec(),
+            format!("<< /Title {title} /Parent 6 0 R /Dest [3 0 R /Fit] >>").into_bytes(),
+        ],
         ..Spec::new(&format!("BT /F1 12 Tf 20 150 Td (Andi) Tj ET\n{KEEP}"))
     }
     .build()
 }
 
 #[test]
-fn a_bookmark_title_is_read_as_the_viewers_read_it_or_refused() {
-    // Audit (follow-up 9, parser differential): a title is read as pdf.js reads it and as the
-    // standard (PDFium, this file's reader) reads it; where the two agree the copy is matched on
-    // that text, where they disagree the redaction is refused, never matched on a guess.
+fn a_copy_not_read_alike_by_every_reader_is_cleared() {
+    // R6b-57: a candidate whose decoding is ambiguous, invalid, read otherwise by two readers
+    // (pdf.js's rules and the standard's), in an encoding this reader does not decode, or holding
+    // a character the matcher does not fold, counts as holding a removed word: it is cleared
+    // (and counted), never kept and never refused. Here no title holds "Andi" as text.
     let utf16 = |text: &str, le: bool| -> String {
-        let units: Vec<u16> = text.encode_utf16().collect();
-        let bytes: Vec<u8> = units.iter().flat_map(|unit| if le { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect();
+        let bytes: Vec<u8> = text.encode_utf16().flat_map(|unit| if le { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect();
         format!("<{}{}>", if le { "FFFE" } else { "FEFF" }, bytes.iter().map(|byte| format!("{byte:02X}")).collect::<String>())
     };
-    // Agreed: a null and a soft hyphen inside the name are shown as nothing.
-    for title in [utf16("A\u{0}ndi", false), "<41AD6E6469>".to_string()] {
-        let applied = apply(&titled(&title), &marked(&titled(&title), &[BOX])).unwrap_or_else(|error| panic!("{title}: {error:?}"));
-        assert_eq!(applied.facts.bookmarks_cleared, 1, "{title}: {:?}", applied.facts);
-    }
-    // Disagreed: UTF-16 little-endian (pdf.js reads it; the standard reads PDFDocEncoding), an
-    // odd UTF-16 length or an unpaired surrogate (pdf.js falls back to PDFDocEncoding), a byte
-    // the two PDFDocEncoding tables read otherwise (0x9F).
-    for title in [utf16("Andi", true), "<FEFF0041006E0064006900>".to_string(), "<FEFFD800004100>".to_string(), "<41 9F 42>".to_string()] {
+    for (case, title) in [
+        ("an odd UTF-16 length", "<FEFF00410062006300>".to_string()),
+        ("an unpaired surrogate", "<FEFFD800004100620063>".to_string()),
+        ("UTF-16LE, which pdf.js reads and the standard does not", utf16("Abc", true)),
+        ("bad UTF-8 after its mark", "<EFBBBFC3416263>".to_string()),
+        ("UTF-8 without a mark, read as PDFDocEncoding by the standard", "<416263C3A9>".to_string()),
+        ("a PDFDocEncoding gap", "<41629F63>".to_string()),
+        ("an embedded NUL", utf16("Ab\u{0}c", false)),
+        ("an escape that is no language", utf16("\u{1b}xxxxx\u{1b}Abc", false)),
+        ("an escape left open", utf16("Abc\u{1b}en", false)),
+        ("a format character not folded", utf16("Ab\u{fff9}c", false)),
+        ("a private-use character", utf16("Ab\u{e000}c", false)),
+    ] {
         let base = titled(&title);
-        assert_eq!(apply(&base, &marked(&base, &[BOX])).map(|_| ()), Err(ApplyError::Refused(Refusal::CopyNotClearable)), "{title}");
+        let applied = apply(&base, &marked(&base, &[BOX])).unwrap_or_else(|error| panic!("{case}: {error:?}"));
+        assert_eq!((applied.facts.bookmarks_cleared, applied.facts.copies_cleared_unread), (1, 1), "{case}: {:?}", applied.facts);
     }
+    // Read alike, and holding no removed word: kept.
+    for title in ["(Other terms)".to_string(), utf16("\u{1b}en\u{1b}Other", false), utf16("Other", false), "<EFBBBF4F74686572>".to_string()] {
+        let base = titled(&title);
+        let applied = apply(&base, &marked(&base, &[BOX])).unwrap();
+        assert_eq!((applied.facts.bookmarks_cleared, applied.facts.copies_cleared_unread), (0, 0), "{title}: {:?}", applied.facts);
+    }
+    // Read alike and holding it (a null and a soft hyphen viewers show as nothing are no help):
+    // cleared as read.
+    let base = titled("<41AD6E6469>");
+    assert_eq!(apply(&base, &marked(&base, &[BOX])).unwrap().facts.bookmarks_cleared, 1);
 }
 
 #[test]
