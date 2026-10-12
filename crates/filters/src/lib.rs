@@ -222,6 +222,13 @@ fn with_predictor(step: Step, params: &Params, name: &'static str) -> Step {
     }
 }
 
+/// Embed build: where the Flate-encoded data in `data` ends (the rest, if any, is data no
+/// decoder reads), and how many bytes it inflated to (for a caller that charges the work);
+/// `None` when it does not decode to its end within `max` bytes made.
+pub fn flate_end(data: &[u8], max: usize) -> Option<(usize, usize)> {
+    flate::end(data, max)
+}
+
 /// Encodes `data` with `filter`. Supported: Flate (zlib, level 6), LZW, ASCIIHex,
 /// ASCII85, RunLength. For Flate and LZW, `params.predictor >= 2` applies the
 /// predictor first (TIFF 2, PNG 10–15; 15 chooses the per-row optimum).

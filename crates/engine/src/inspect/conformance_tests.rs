@@ -34,10 +34,16 @@ fn page_file(catalog: &str, page: &str, content: &str, resources: &str, objects:
     let mut bodies = vec![
         format!("<< /Type /Catalog /Pages 2 0 R {catalog} >>").into_bytes(),
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 300] >>".to_vec(),
-        format!(
-            "<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> {resources} >> {page} >>"
-        )
-        .into_bytes(),
+        {
+            // One /Font dictionary: `resources` may name fonts of its own.
+            let helvetica = "/F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>";
+            let resources = if resources.contains("/Font <<") {
+                resources.replacen("/Font <<", &format!("/Font << {helvetica}"), 1)
+            } else {
+                format!("/Font << {helvetica} >> {resources}")
+            };
+            format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << {resources} >> {page} >>").into_bytes()
+        },
         stream("", content.as_bytes()),
     ];
     bodies.extend(objects.iter().cloned());

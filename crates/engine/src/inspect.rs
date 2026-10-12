@@ -64,6 +64,13 @@
 //!   object it lists (but for its own cross-reference stream and null objects) is reached from
 //!   the trailer's `/Root` or `/Info` through references, an object stream through what it
 //!   holds (R6b-48);
+//! - every byte a rewrite holds, and every byte an appended update adds, is accounted for
+//!   (R6b-51): the `%PDF-x.y` header alone on its line and a binary marker (a rewrite), listed
+//!   objects each written strictly (one value, dictionaries of names each once, no stray token,
+//!   no comment), object streams holding exactly the objects rows list in them, Flate data ending
+//!   where its stream does, the cross-reference sections with only the writer's trailer entries
+//!   (or, in an update, the base's) and identifier, `startxref` and `%%EOF`; rows are checked
+//!   against the object header they name before anything is loaded;
 //! - the page tree reads alike in every viewer (R6b-51): in both files every page's and node's
 //!   `/Parent` is the node listing it (PDFium and pdf.js inherit through `/Parent`, hayro and this
 //!   reader along the path walked) and the root has none; the nodes' own entries (other than
@@ -771,6 +778,10 @@ fn compare(base: &[u8], edited: &[u8], limits: Limits) -> Result<Inspection, Ins
         ));
     }
     inspection.labels = labels_followed(&before.structure, &after.structure, &pairs, renumbered)?;
+    // Follow-up 8 (R6b-51, I1): labels no page shows hold only what the base's labels held.
+    if !sorted_subset(&after.structure.labels_past_the_end, &before.structure.label_values) {
+        return Err(InspectError::Edited("the page labels name a range past the last page that the base did not have".into()));
+    }
     if before.structure.outline_root != after.structure.outline_root {
         return Err(InspectError::Edited("the outline's root dictionary changed, which this comparison does not report".into()));
     }
@@ -1093,6 +1104,9 @@ fn check_update_read(
         Ok(Ok(base_doc)) => base_doc,
         _ => return Err(Fail::Read("the base could not be read again to check the update".into())),
     };
+    // Follow-up 8 (R6b-51, I1): every byte the update adds is a listed object, written strictly,
+    // or its cross-reference sections.
+    account_bytes(doc, base.len(), Some(base_doc.trailer()), budget)?;
     let section_offsets: BTreeSet<u64> = sections.iter().map(|section| section.offset).collect();
     for num in doc.object_numbers() {
         budget.tick()?;
@@ -1106,6 +1120,130 @@ fn check_update_read(
                 return Err(Fail::Read(format!("the update writes object {num}, which nothing this comparison reports reads")));
             }
             _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Trailer entries a cross-reference section may hold (and those a stream section's dictionary
+/// holds beside them).
+const TRAILER_KEYS: [&[u8]; 5] = [b"Size", b"Root", b"Info", b"ID", b"Prev"];
+const XREF_STREAM_KEYS: [&[u8]; 7] = [b"Type", b"W", b"Index", b"Filter", b"DecodeParms", b"Length", b"DL"];
+/// The length of each string of a file identifier the writer makes.
+const ID_LENGTH: usize = 16;
+
+/// Follow-up 8 (R6b-51, I1, I3): the bytes of `doc` from `from` (0: a rewrite; the base's
+/// length: an appended update, `base_trailer` the base's newest trailer) are accounted for:
+/// - every object listed there starts where its row says (checked before it is loaded, each
+///   charged), is written strictly, and a Flate stream's data ends where its data ends (bytes
+///   after it no decoder reads);
+/// - every object stream listed there holds exactly the objects the cross-reference data puts
+///   in it, at their indexes, and nothing else; every row naming an object in it says so;
+/// - every byte is one of them, a cross-reference section with its `startxref` and `%%EOF`, the
+///   header (rewrite) or whitespace (see `layout`);
+/// - a section's trailer holds only `/Size`, `/Root`, `/Info`, `/ID`, `/Prev` (and a stream's
+///   own entries), or for an update an entry the base's trailer holds with the same value; a
+///   file identifier is two strings of the writer's 16 bytes (an update keeps the base's).
+fn account_bytes(doc: &Document, from: usize, base_trailer: Option<&pdfcraft_cos::Dict>, budget: &mut Budget) -> Result<(), Fail> {
+    let data = doc.bytes().as_slice();
+    let refuse = |what: String| Fail::Read(what);
+    let mut listed = Vec::new();
+    let mut containers: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut stored: Vec<(u32, u32, u32)> = Vec::new();
+    for num in doc.object_numbers() {
+        budget.tick()?;
+        match doc.xref_entry(num) {
+            Some(pdfcraft_cos::XrefEntry::InFile { offset, .. }) => {
+                let offset = usize::try_from(offset).map_err(|_| refuse(format!("object {num} lies past the file")))?;
+                if offset < from {
+                    continue;
+                }
+                // Each listed object is charged, and a row naming another object's place is
+                // refused before anything is loaded (`pdfcraft_cos` would search the whole file
+                // for the number, once per such row).
+                budget.object()?;
+                if layout::object_header(data, offset) != Some(num) {
+                    return Err(refuse(format!("the file lists object {num} where no object {num} starts")));
+                }
+                let found = doc.try_get(num).map_err(|_| refuse(format!("the file holds object {num}, which cannot be read")))?;
+                let stream_length = match &*found {
+                    pdfcraft_cos::Object::Stream(stream) => {
+                        budget.hashed(stream.raw.len())?;
+                        let (tail, made) = stream
+                            .trailing_data(budget.content_room())
+                            .map_err(|_| refuse(format!("stream {num}'s data cannot be read to its end")))?;
+                        budget.content(made)?;
+                        if tail.is_some_and(|tail| tail.iter().any(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n' | b'\x0c' | b'\0'))) {
+                            return Err(refuse(format!("stream {num} holds data after its end, which no decoder reads")));
+                        }
+                        if stream.dict.name(b"Type") == Some(b"ObjStm") {
+                            let (decoded, made) = stream
+                                .decoded_strict_counted(budget.content_room())
+                                .map_err(|_| refuse(format!("object stream {num} cannot be decoded")))?;
+                            budget.content(made)?;
+                            let count = stream.dict.int(b"N").and_then(|count| usize::try_from(count).ok());
+                            let first = stream.dict.int(b"First").and_then(|first| usize::try_from(first).ok());
+                            let (Some(count), Some(first)) = (count, first) else {
+                                return Err(refuse(format!("object stream {num} does not say what it holds")));
+                            };
+                            containers.insert(num, layout::object_stream(&decoded, count, first, budget)?);
+                        }
+                        Some(stream.raw.len())
+                    }
+                    _ => None,
+                };
+                listed.push(layout::ListedObject { offset, stream_length });
+            }
+            Some(pdfcraft_cos::XrefEntry::InStream { stream, index }) => stored.push((num, stream, index)),
+            _ => {}
+        }
+    }
+    // Every object stream listed here holds exactly the objects rows put in it, at their places.
+    let mut placed: HashMap<u32, usize> = HashMap::new();
+    for (num, stream, index) in stored {
+        budget.tick()?;
+        let Some(members) = containers.get(&stream) else {
+            // In an object stream of the base's own bytes (an update): the base's.
+            match doc.xref_entry(stream) {
+                Some(pdfcraft_cos::XrefEntry::InFile { offset, .. }) if usize::try_from(offset).is_ok_and(|offset| offset < from) => continue,
+                _ => return Err(refuse(format!("object {num} is listed in object {stream}, which is no object stream the file lists"))),
+            }
+        };
+        if usize::try_from(index).ok().and_then(|index| members.get(index)) != Some(&num) {
+            return Err(refuse(format!("object {num} is listed in object stream {stream} at a place that holds another")));
+        }
+        *placed.entry(stream).or_default() += 1;
+    }
+    for (stream, members) in &containers {
+        if placed.get(stream).copied().unwrap_or(0) != members.len() {
+            return Err(refuse(format!("object stream {stream} holds an object no cross-reference row lists in it")));
+        }
+    }
+    let sections: Vec<layout::SectionAt> = doc
+        .revisions()
+        .iter()
+        .filter_map(|revision| Some(layout::SectionAt { offset: usize::try_from(revision.xref_offset).ok()?, is_stream: revision.is_stream }))
+        .filter(|section| section.offset >= from)
+        .collect();
+    let keys = layout::check(data, from, &listed, &sections, budget)?;
+    for (section, keys) in sections.iter().zip(keys) {
+        let trailer = structure::trailer_at(data, section.offset as u64, section.is_stream)?;
+        for key in &keys {
+            budget.tick()?;
+            let own = TRAILER_KEYS.contains(&key.as_slice()) || (section.is_stream && XREF_STREAM_KEYS.contains(&key.as_slice()));
+            let kept = base_trailer.is_some_and(|base| base.get(key).is_some() && base.get(key) == trailer.get(key));
+            if !own && !kept {
+                return Err(refuse(format!("a trailer holds /{}, which no fact reports", String::from_utf8_lossy(key))));
+            }
+        }
+        if let Some(id) = trailer.get(b"ID") {
+            let fresh = matches!(id, pdfcraft_cos::Object::Array(items) if items.len() == 2
+                && items.iter().all(|item| item.as_string().is_some_and(|text| text.bytes.len() == ID_LENGTH)));
+            let kept = base_trailer.and_then(|base| base.get(b"ID")).is_some_and(|base| base == id);
+            let base_has_none = base_trailer.is_none_or(|base| base.get(b"ID").is_none());
+            if !(kept || (fresh && base_has_none)) {
+                return Err(refuse("a trailer's /ID is not the writer's (two 16-byte strings, or the base's)".into()));
+            }
         }
     }
     Ok(())
@@ -1125,34 +1263,9 @@ fn check_rewrite_reachable(doc: &Document, sections: &[structure::Section], know
         )));
     }
     let section_offsets: BTreeSet<u64> = sections.iter().map(|section| section.offset).collect();
-    // Follow-up 7 audit (item 4): no bytes but what the cross-reference data lists.
-    let mut listed = Vec::new();
-    for num in doc.object_numbers() {
-        budget.tick()?;
-        if let Some(pdfcraft_cos::XrefEntry::InFile { offset, .. }) = doc.xref_entry(num) {
-            // Follow-up 8 (R6b-51, I3): each listed object is charged, and a row naming another
-            // object's place is refused before anything is loaded (`pdfcraft_cos` would search
-            // the whole file for the number, once per such row).
-            budget.object()?;
-            let offset = usize::try_from(offset).map_err(|_| Fail::Read(format!("object {num} lies past the file")))?;
-            if layout::object_header(doc.bytes().as_slice(), offset) != Some(num) {
-                return Err(Fail::Read(format!("the rewrite lists object {num} where no object {num} starts")));
-            }
-            let found = doc.try_get(num).map_err(|_| Fail::Read(format!("the rewrite holds object {num}, which cannot be read")))?;
-            let stream_length = match &*found {
-                pdfcraft_cos::Object::Stream(stream) => {
-                    budget.hashed(stream.raw.len())?;
-                    Some(stream.raw.len())
-                }
-                _ => None,
-            };
-            listed.push(layout::ListedObject { offset, stream_length });
-        }
-    }
-    let section = sections.first().map(|section| section.offset).unwrap_or_default();
-    let section = usize::try_from(section).map_err(|_| Fail::Read("the cross-reference section lies past the file".into()))?;
-    let is_stream = doc.revisions().first().is_some_and(|revision| revision.is_stream);
-    layout::check(doc.bytes().as_slice(), &listed, (section, is_stream), budget)?;
+    // Follow-up 7 audit (item 4), follow-up 8 (R6b-51, I1): no bytes but what the
+    // cross-reference data lists, each written strictly.
+    account_bytes(doc, 0, None, budget)?;
     let mut reached: BTreeSet<u32> = BTreeSet::new();
     let mut todo: Vec<pdfcraft_cos::Object> = [&b"Root"[..], b"Info"].iter().filter_map(|key| doc.trailer().get(key).cloned()).collect();
     while let Some(object) = todo.pop() {
@@ -1910,6 +2023,8 @@ fn compare_pages(
                 // base page did not draw either (the unredacted original, kept under its old
                 // name or a new one, is not).
                 outside |= !e.unused_resources.is_subset(&b.unused_resources);
+                // Follow-up 8 (R6b-51, I1): an unused standard font holds no data but its name.
+                outside |= !e.unused_standard_fonts.is_subset(&b.offered_resources);
             }
             let mut areas = Areas::new(&boxes);
             // Every removed glyph by its centre, and every image at its own resolution.

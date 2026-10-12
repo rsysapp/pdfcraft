@@ -33,6 +33,38 @@ pub(crate) fn decode(data: &[u8], max: usize) -> Step {
     }
 }
 
+/// Embed build: where the zlib (or raw deflate) data in `data` ends: past the deflate stream
+/// and, after a zlib header, its Adler-32 trailer (as far as it is there). `None` when the data
+/// does not inflate to its end within `max` bytes of output. Also the bytes it inflated to.
+pub(crate) fn end(data: &[u8], max: usize) -> Option<(usize, usize)> {
+    let raw_end = |input: &[u8]| -> Option<(usize, usize)> {
+        let mut d = Decompress::new(false);
+        // Inflated a block at a time and dropped: only how far the input goes is wanted.
+        let mut block = vec![0u8; 64 << 10];
+        loop {
+            let (consumed, made) = (d.total_in(), d.total_out());
+            let status = d.decompress(input.get(usize::try_from(consumed).ok()?..)?, &mut block, FlushDecompress::None).ok()?;
+            if d.total_out() > max as u64 {
+                return None;
+            }
+            if status == Status::StreamEnd {
+                return Some((usize::try_from(d.total_in()).ok()?, usize::try_from(d.total_out()).ok()?));
+            }
+            if d.total_in() == consumed && d.total_out() == made {
+                return None;
+            }
+        }
+    };
+    match zlib_header(data) {
+        Some((_, flg)) if flg & 0x20 != 0 => None,
+        Some(_) => match raw_end(data.get(2..)?) {
+            Some((deflate, made)) => Some((data.len().min(deflate.saturating_add(2).saturating_add(4)), made)),
+            None => raw_end(data),
+        },
+        None => raw_end(data),
+    }
+}
+
 fn inflate_raw(input: &[u8], max: usize) -> Step {
     let mut d = Decompress::new(false);
     let mut out: Vec<u8> = Vec::new();
@@ -82,6 +114,19 @@ mod tests {
 
     fn dec(d: &[u8]) -> Result<Vec<u8>, FilterError> {
         decode(d, 1 << 24).map_err(|f| f.error)
+    }
+
+    #[test]
+    fn where_flate_data_ends() {
+        // Embed build: the data after the zlib stream (its Adler-32 included) is found.
+        let mut data = encode(b"hello hello hello");
+        let len = data.len();
+        assert_eq!(end(&data, 1 << 20), Some((len, 17)));
+        data.extend_from_slice(b"SECRET");
+        assert_eq!(end(&data, 1 << 20).map(|(at, _)| at), Some(len));
+        // Bounded by what it may make, and data that does not end is no end.
+        assert_eq!(end(&encode(&[0; 4096]), 100), None);
+        assert_eq!(end(&data[..len / 2], 1 << 20), None);
     }
 
     #[test]

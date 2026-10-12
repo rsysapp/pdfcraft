@@ -681,16 +681,20 @@ fn page_attributes_the_readers_inherit_differently_are_refused() {
 
 #[test]
 fn every_object_read_parses_alike_in_both_readers() {
-    // Values each parser writes its own way (numbers, escapes, stray tokens between entries)
-    // parse alike: accepted, and compared.
+    // Values each parser writes its own way (numbers, escapes) parse alike: accepted, and
+    // compared. A stray token between entries, which each reader skips, could hold anything:
+    // refused (follow-up 8, R6b-51 I1).
     let base = pages(2, "", false, |_| String::new(), &[]);
-    let body = format!(
-        "<< /Type /Page /Parent 2 0 R /Contents 20 0 R (stray) /Rotate 90 /Resources << /Font << /F1 {HELVETICA} >> >> \
-         /PieceInfo << /A#20B [1. -.5 +3 (a\\(b\\)\\101) <41 42>] >> >>"
-    );
-    let edited = update_objects(&base, &[(10, &body)], 22);
-    let inspection = run(&base, &edited).unwrap();
+    let page_with = |stray: &str| {
+        format!(
+            "<< /Type /Page /Parent 2 0 R /Contents 20 0 R {stray} /Rotate 90 /Resources << /Font << /F1 {HELVETICA} >> >> \
+             /PieceInfo << /A#20B [1. -.5 +3 (a\\(b\\)\\101) <41 42>] >> >>"
+        )
+    };
+    let inspection = run(&base, &update_objects(&base, &[(10, &page_with(""))], 22)).unwrap();
     assert_eq!((inspection.pages.rotated, inspection.content.pages_with_content_changed), (1, 1), "{inspection:?}");
+    let edited = update_objects(&base, &[(10, &page_with("(stray)"))], 22);
+    assert!(refused(run(&base, &edited)).contains("not a name"));
     // What the two readers parse is compared object by object: a value one reader parses
     // otherwise is refused (the shapes as hayro gave them, one changed).
     let doc = pdfcraft_cos::Document::open(Arc::new(edited.clone())).unwrap();
@@ -899,8 +903,12 @@ fn a_forged_relabel_is_refused() {
     let plain = pages(5, "", false, |_| String::new(), &[]);
     refused(run(&plain, &relabelled(&plain, "<< /Nums [0 << /S /D >>] >>", None)));
     // Written otherwise, showing the same on every page: not a change.
-    let same = relabelled(&base, "<< /Nums [0 << /S /r /St 1 >> 2 << /S /D >> 9 << /S /A >>] >>", None);
+    let same = relabelled(&base, "<< /Nums [0 << /S /r /St 1 >> 2 << /S /D >>] >>", None);
     assert_eq!(run(&base, &same).unwrap().labels, PageLabelChanges::default());
+    // A range past the last page labels nothing, yet holds what it holds (follow-up 8, R6b-51
+    // I1): refused unless the base had it.
+    let past = relabelled(&base, "<< /Nums [0 << /S /r >> 2 << /S /D >> 9 << /S /A /P (SECRET X) >>] >>", None);
+    assert!(refused(run(&base, &past)).contains("past the last page"));
 }
 
 #[test]

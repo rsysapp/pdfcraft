@@ -308,6 +308,13 @@ pub(crate) struct PageFacts {
     /// one (it could hold what the rewrite took away, drawn by nothing). The editor's standard
     /// fonts (a name-only Type 1 dictionary of the standard 14) are not counted.
     pub unused_resources: BTreeSet<Digest>,
+    /// Follow-up 8 (R6b-51, I1): the standard fonts (name-only Type 1 dictionaries of the
+    /// standard 14, holding no data) the resources offer and nothing draws, by name, and every
+    /// entry the resources offer, by name and content: an unused standard font may stay only
+    /// under a name the base page's resources had (its name could spell out text), or under
+    /// one of the editor's names.
+    pub unused_standard_fonts: BTreeSet<Digest>,
+    pub offered_resources: BTreeSet<Digest>,
     /// The page dictionary's own entries (not in [`PAGE_OWN_KEYS`], nor `/Type`), by
     /// their values' digests: in a rewrite they must be the same, but for [`PAGE_REMOVABLE`]
     /// ones removed.
@@ -357,6 +364,8 @@ impl PageFacts {
             levels_agree: true,
             levels_unbalanced: false,
             unused_resources: BTreeSet::new(),
+            unused_standard_fonts: BTreeSet::new(),
+            offered_resources: BTreeSet::new(),
             entries: BTreeMap::new(),
             type3: BTreeSet::new(),
             render_risk: None,
@@ -621,6 +630,10 @@ pub(crate) struct Structure {
     /// Follow-up 8 (R6b-51, M5): the page tree nodes' entries but their kids, count, parent and
     /// type (see [`NodeEntries`]). Those no page takes are compared nowhere else.
     pub page_tree_entries: NodeEntries,
+    /// Follow-up 8 (R6b-51, I1): the page labels' ranges starting past the last page (their
+    /// label dictionaries' digests, sorted), which label no page; and every range's.
+    pub labels_past_the_end: Vec<Digest>,
+    pub label_values: Vec<Digest>,
 }
 
 /// The fingerprint pages are matched by: content, resources, images and text.
@@ -891,6 +904,12 @@ pub(crate) fn unit_square(m: &Matrix) -> [f64; 4] {
     if [x0, y0, x1, y1].iter().all(|v| v.is_finite()) { [x0, y0, x1, y1] } else { [f64::NAN; 4] }
 }
 
+/// The names the editor gives the standard fonts it adds (its stamps and overlays).
+const EDITOR_FONTS: [&[u8]; 3] = [b"PCHelv", b"PCTimes", b"PCCour"];
+
+/// The procedure sets a resource dictionary's `/ProcSet` may name (ISO 32000-2 §14.2).
+const PROCEDURE_SETS: [&[u8]; 5] = [b"PDF", b"Text", b"ImageB", b"ImageC", b"ImageI"];
+
 /// The attributes a page inherits from the page tree (ISO 32000-2 §7.7.3.4).
 const INHERITED: [&[u8]; 4] = [b"Resources", b"MediaBox", b"CropBox", b"Rotate"];
 
@@ -942,7 +961,11 @@ struct Drawn {
     /// Embed build (follow-up 7 audit, item 7): the resource entries the page's and its forms'
     /// resource dictionaries hold, and those the drawing looked up (see
     /// [`PageFacts::unused_resources`]).
-    offered: BTreeSet<Digest>,
+    /// Each offered entry: its digest by content (as `used` holds them), and by name and
+    /// content (follow-up 8, R6b-51 I1: a name nothing draws can spell out text too).
+    offered: BTreeSet<(Digest, Digest)>,
+    /// The standard fonts offered (see [`PageFacts::unused_standard_fonts`]), the same way.
+    standard: BTreeSet<(Digest, Digest)>,
     used: BTreeSet<Digest>,
 }
 
@@ -1051,6 +1074,8 @@ struct Reader<'d, 'b> {
     /// An object read for a fact holds a destination that gives its page by number (see
     /// [`Structure::numbered_destinations`]).
     numbered: bool,
+    /// See [`Structure::labels_past_the_end`]: (past the end, all), as read.
+    label_values: (Vec<Digest>, Vec<Digest>),
 }
 
 /// Which stream objects may declare a `/Length` other than their data's (R6b-30, R6b-35).
@@ -2174,17 +2199,23 @@ impl<'d, 'b> Reader<'d, 'b> {
         Ok(())
     }
 
-    /// Note every entry `resources` offers (see [`PageFacts::unused_resources`]).
+    /// Note every entry `resources` offers (see [`PageFacts::unused_resources`]), but the editor's
+    /// standard fonts under its names for them.
     fn offer_resources(&mut self, resources: &Dict, drawn: &mut Drawn) -> Result<(), Fail> {
         for kind in [b"XObject".as_slice(), b"Font", b"ExtGState", b"Pattern", b"Shading", b"Properties", b"ColorSpace"] {
             let Some(entries) = self.dict_of(resources.get(kind), "a resource dictionary")? else { continue };
-            for (_, entry) in entries.iter() {
+            for (name, entry) in entries.iter() {
                 self.budget.tick()?;
+                let digest = self.resource_digest(kind, entry)?;
+                let named = sha256(&[b"named resource", kind, &(name.len() as u64).to_le_bytes(), name, &digest]);
                 if kind == b"Font" && self.standard_font(entry)? {
+                    // The editor's own, under the names it gives them, are not counted.
+                    if !EDITOR_FONTS.contains(&name.as_slice()) {
+                        drawn.standard.insert((digest, named));
+                    }
                     continue;
                 }
-                let digest = self.resource_digest(kind, entry)?;
-                drawn.offered.insert(digest);
+                drawn.offered.insert((digest, named));
             }
         }
         Ok(())
@@ -2237,8 +2268,23 @@ impl<'d, 'b> Reader<'d, 'b> {
     fn note_resources(&mut self, resources: Option<&Object>, drawn: &mut Drawn) -> Result<(), Fail> {
         if let Some(resources) = self.dict_of(resources, "/Resources")? {
             self.note_keys(b"Resources", &resources, drawn)?;
+            // Follow-up 8 (R6b-51, I1): no viewer reads `/ProcSet`; a name other than the
+            // standard procedure sets is data nothing else compares.
+            if drawn.render_risk.is_none() && !self.procedure_sets(&resources)? {
+                drawn.render_risk = Some("a /ProcSet naming other than the standard procedure sets".into());
+            }
         }
         Ok(())
+    }
+
+    /// Whether `resources`' `/ProcSet` (if any) names only standard procedure sets.
+    fn procedure_sets(&mut self, resources: &Dict) -> Result<bool, Fail> {
+        let Some(sets) = resources.get(b"ProcSet") else { return Ok(true) };
+        Ok(match &*self.resolve(sets)? {
+            Object::Array(names) => names.iter().all(|name| name.as_name().is_some_and(|name| PROCEDURE_SETS.contains(&name))),
+            Object::Null => true,
+            _ => false,
+        })
     }
 
     /// Note a knockout transparency group (`/Group << /K true >>`), which hayro draws as an
@@ -2493,6 +2539,9 @@ impl<'d, 'b> Reader<'d, 'b> {
         self.group_risk(&node.dict, &mut drawn)?;
         for level in &chain {
             self.note_keys(b"Resources", level, &mut drawn)?;
+            if drawn.render_risk.is_none() && !self.procedure_sets(level)? {
+                drawn.render_risk = Some("a /ProcSet naming other than the standard procedure sets".into());
+            }
             self.offer_resources(level, &mut drawn)?;
         }
         self.type3_fonts(&chain, &resources, &mut drawn)?;
@@ -2512,7 +2561,9 @@ impl<'d, 'b> Reader<'d, 'b> {
             levels: drawn.levels,
             levels_agree: false,
             levels_unbalanced: drawn.unbalanced,
-            unused_resources: drawn.offered.difference(&drawn.used).copied().collect(),
+            unused_resources: drawn.offered.iter().filter(|(content, _)| !drawn.used.contains(content)).map(|(_, named)| *named).collect(),
+            unused_standard_fonts: drawn.standard.iter().filter(|(content, _)| !drawn.used.contains(content)).map(|(_, named)| *named).collect(),
+            offered_resources: drawn.offered.iter().chain(&drawn.standard).map(|(_, named)| *named).collect(),
             entries,
             image_pixels: drawn.pixels,
             render_risk: drawn.render_risk,
@@ -3353,6 +3404,13 @@ impl Reader<'_, '_> {
         let mut ranges: Vec<(u64, PageLabel)> = Vec::with_capacity(entries.len());
         for (start, value) in entries {
             self.budget.tick()?;
+            // Follow-up 8 (R6b-51, I1): ranges starting past the last page label no page, so
+            // nothing compares them: kept by value.
+            let digest = self.digest(&value)?;
+            self.label_values.1.push(digest);
+            if usize::try_from(start).is_ok_and(|start| start >= pages) {
+                self.label_values.0.push(digest);
+            }
             match self.label_spec(&value)? {
                 Some(label) => ranges.push((start, label)),
                 None => return Ok(PageLabels::Unreadable(digest)),
@@ -3547,19 +3605,24 @@ pub(crate) fn sections(doc: &Document) -> Result<Vec<Section>, Fail> {
     Ok(sections)
 }
 
-/// The trailer of the cross-reference section at `offset`.
-fn section(data: &[u8], offset: u64, is_stream: bool) -> Result<Section, Fail> {
+/// The trailer dictionary of the cross-reference section at `offset` (a stream's dictionary).
+pub(crate) fn trailer_at(data: &[u8], offset: u64, is_stream: bool) -> Result<Dict, Fail> {
     let unreadable = || read_error(format!("the cross-reference section at {offset} cannot be read"));
     let at = usize::try_from(offset).map_err(|_| unreadable())?;
-    let trailer = if is_stream {
+    if is_stream {
         let (_, obj) = parse_indirect(data, at, &|_| None).map_err(|_| unreadable())?;
-        obj.as_dict().cloned().ok_or_else(unreadable)?
+        obj.as_dict().cloned().ok_or_else(unreadable)
     } else {
         let rest = data.get(at..).ok_or_else(unreadable)?;
         let found = rest.windows(7).position(|w| w == b"trailer").ok_or_else(unreadable)?;
         let mut lx = Lexer::new(data, at.saturating_add(found).saturating_add(7));
-        lx.object().ok().and_then(|o| o.as_dict().cloned()).ok_or_else(unreadable)?
-    };
+        lx.object().ok().and_then(|o| o.as_dict().cloned()).ok_or_else(unreadable)
+    }
+}
+
+/// The trailer of the cross-reference section at `offset`.
+fn section(data: &[u8], offset: u64, is_stream: bool) -> Result<Section, Fail> {
+    let trailer = trailer_at(data, offset, is_stream)?;
     let prev = match trailer.get(b"Prev") {
         None => None,
         Some(Object::Int(prev)) if *prev >= 0 => Some(prev.unsigned_abs()),
@@ -4044,6 +4107,7 @@ impl Known {
             misdeclared: std::mem::take(&mut self.misdeclared),
             tolerated: self.tolerated.clone(),
             numbered: self.numbered,
+            label_values: (Vec::new(), Vec::new()),
         }
     }
 
@@ -4204,6 +4268,7 @@ pub(crate) fn read(
         misdeclared: BTreeSet::new(),
         tolerated: tolerated.clone(),
         numbered: false,
+        label_values: (Vec::new(), Vec::new()),
     };
     let Some(root) = doc.root() else { return Err(read_error("the trailer's /Root is not a reference")) };
     let catalog = reader.get(root)?.as_dict().cloned().ok_or_else(|| read_error("the catalog is not a dictionary"))?;
@@ -4225,6 +4290,9 @@ pub(crate) fn read(
     let info = reader.document_information(doc.trailer())?;
     let page_labels_digest = catalog.get(b"PageLabels").map(|labels| reader.digest(labels)).transpose()?;
     let page_labels = reader.page_labels(&catalog, nodes.len(), page_labels_digest)?;
+    let (mut labels_past_the_end, mut label_values) = std::mem::take(&mut reader.label_values);
+    labels_past_the_end.sort_unstable();
+    label_values.sort_unstable();
     let mut entries = BTreeMap::new();
     for (key, value) in catalog.iter() {
         if CATALOG_REPORTED.contains(&key.as_slice()) {
@@ -4286,6 +4354,8 @@ pub(crate) fn read(
             page_labels,
             page_labels_digest,
             page_tree_entries,
+            labels_past_the_end,
+            label_values,
         },
         known,
     ))

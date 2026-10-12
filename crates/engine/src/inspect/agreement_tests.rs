@@ -465,7 +465,12 @@ fn files_both_readers_read_alike_are_not_refused() {
     assert!(message.contains("bytes no cross-reference data lists"), "{message}");
     for (case, file) in [("hybrid, table first", stale_offset_beside_an_object_stream()), ("hybrid, free in table", stale_page_free_in_table())] {
         let message = refused(&file);
-        assert!(message.contains("nothing reaches") || message.contains("no cross-reference data lists"), "{case}: {message}");
+        assert!(
+            message.contains("nothing reaches")
+                || message.contains("no cross-reference data lists")
+                || message.contains("no cross-reference row lists"),
+            "{case}: {message}"
+        );
     }
 }
 
@@ -1578,13 +1583,15 @@ fn objects_the_readers_could_take_differently_fail_closed() {
         out.extend_from_slice(b"\nendobj\n");
         out.extend_from_slice(format!("startxref\n{at9}\n%%EOF\n").as_bytes());
         // Both readers (as PDFium and pdf.js) take the object at the index the cross-reference
-        // data names, not the first header entry naming its number.
-        assert_eq!(info("object stream naming 6 twice", &out), ["Title"]);
+        // data names; the other copy, which no row lists, could hold anything (follow-up 8,
+        // R6b-51 I1).
+        refused("object stream naming 6 twice", &out, "no cross-reference row lists");
     }
-    // A body after the last startxref nobody lists.
+    // A body after the last startxref nobody lists: read by neither, carried all the same
+    // (follow-up 8, R6b-51 I1: every byte an update adds is listed).
     let mut tail = base.clone();
     tail.extend_from_slice(b"6 0 obj\n<< /Title (Tail) >>\nendobj\n");
-    assert!(info("unlisted tail", &tail).is_empty(), "read by neither");
+    refused("unlisted tail", &tail, "no cross-reference data lists");
 }
 
 // ── R6b-48: a rewrite carries nothing nothing reaches ───────────────────────────────────────
@@ -2277,6 +2284,227 @@ fn an_unreadable_object_in_an_object_stream_the_walk_reaches_is_refused() {
         b.out.extend_from_slice(format!("startxref\n{at}\n%%EOF\n").as_bytes());
         b.out
     };
+    // Refused (object streams are now read whole before anything else, follow-up 8 R6b-51 I1;
+    // the walk's refusal stands behind that).
     let message = refused_against(&base, &edited);
-    assert!(message.contains("object 7, which cannot be read"), "{message}");
+    assert!(message.contains("object 7, which cannot be read") || message.contains("object stream"), "{message}");
+}
+
+// ── follow-up 8 (R6b-51, I1): every byte of a rewrite or an update is listed and strict ─────
+
+/// The redacted one-page file ("Alpha", a box where "X" was), objects 1–4 written by `body`
+/// (number → body, given the default) with the header `header` and trailer entries `trailer`.
+fn strictly(header: &str, body: impl Fn(u32, Vec<u8>) -> Vec<u8>, trailer: &str) -> Vec<u8> {
+    let mut b = Builder { out: header.as_bytes().to_vec(), ..Builder::default() };
+    let defaults = [
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 300] >>".to_vec(),
+        format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R {RESOURCES} >>").into_bytes(),
+        stream("", &[text("Alpha"), b"\n".to_vec(), X_BOX.as_bytes().to_vec()].concat()),
+    ];
+    for (num, default) in (1u32..).zip(defaults) {
+        b.object(num, &body(num, default));
+    }
+    let rows = b.offsets.clone();
+    b.finish(5, &rows, trailer)
+}
+
+#[test]
+fn every_byte_of_a_rewrite_is_listed_and_written_strictly() {
+    // Re-review I1: each of these rewrites kept "SECRET" where nothing compares, and was
+    // accepted as a clean redaction.
+    let base = laid_out("", "", X, b"");
+    let same = |_: u32, body: Vec<u8>| body;
+    let clean = strictly("%PDF-1.7\n", same, "");
+    assert_eq!(inspect(&base, &clean, InspectLimits::default()).unwrap().content.pages_changed_outside_redactions, 0);
+    let deflated = |data: &[u8], tail: &[u8]| {
+        let mut raw = pdfcraft_cos::Stream::flate(pdfcraft_cos::Dict::new(), data).raw.as_ref().clone();
+        raw.extend_from_slice(tail);
+        stream("/Filter /FlateDecode", &raw)
+    };
+    let content = [text("Alpha"), b"\n".to_vec(), X_BOX.as_bytes().to_vec()].concat();
+    assert!(
+        inspect(&base, &strictly("%PDF-1.7\n", |num, body| if num == 4 { deflated(&content, b"\n") } else { body }, ""), InspectLimits::default())
+            .is_ok()
+    );
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("the header line", strictly("%PDF-1.7 SECRET the redacted X words here\n", same, "")),
+        ("a comment after the header", strictly("%PDF-1.7\n%SECRET X\n", same, "")),
+        ("a token after a value", strictly("%PDF-1.7\n", |num, body| if num == 3 { [body, b" (SECRET)".to_vec()].concat() } else { body }, "")),
+        (
+            "junk inside a dictionary",
+            strictly("%PDF-1.7\n", |num, body| if num == 1 { b"<< /Type /Catalog (SECRET) /Pages 2 0 R >>".to_vec() } else { body }, ""),
+        ),
+        (
+            "a key written twice",
+            strictly("%PDF-1.7\n", |num, body| if num == 1 { b"<< /Type /Catalog /Pages (SECRET) /Pa#67es 2 0 R >>".to_vec() } else { body }, ""),
+        ),
+        (
+            "a hex string holding text",
+            strictly("%PDF-1.7\n", |num, body| if num == 1 { b"<< /Type /Catalog /Pages 2 0 R /Lang <SECRET> >>".to_vec() } else { body }, ""),
+        ),
+        ("a trailer entry", strictly("%PDF-1.7\n", same, "/Junk (SECRET)")),
+        ("a file identifier", strictly("%PDF-1.7\n", same, "/ID [(SECRET-ONE) (SECRET-TWO)]")),
+        ("data after a Flate stream's end", strictly("%PDF-1.7\n", |num, body| if num == 4 { deflated(&content, b"SECRET X") } else { body }, "")),
+    ];
+    for (case, edited) in cases {
+        match inspect(&base, &edited, InspectLimits::default()) {
+            Err(InspectError::Edited(_)) => {}
+            other => panic!("{case}: {other:?}"),
+        }
+    }
+    // The writer's own identifier is accepted.
+    let id = "/ID [<00112233445566778899AABBCCDDEEFF> <00112233445566778899AABBCCDDEEFF>]";
+    assert!(inspect(&base, &strictly("%PDF-1.7\n", same, id), InspectLimits::default()).is_ok());
+}
+
+#[test]
+fn an_object_stream_holds_exactly_what_rows_list_in_it() {
+    // Re-review I1: an object stream holding an object no row lists, or bytes after its last
+    // object, was accepted.
+    let base = tagged(false, "", &[]);
+    assert!(inspect(&base, &rewrite_with_object_stream(&[]), InspectLimits::default()).is_ok());
+    // An unlisted member: object 9 inside the stream, no row for it.
+    let mut b = Builder::new();
+    b.object(3, format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R {RESOURCES} >>").as_bytes());
+    b.object(4, &stream("", &[text("Alpha"), b"\n0 g 146 14 16 18 re f".to_vec()].concat()));
+    let build = |mut b: Builder, members: &str, header: &str, listed: usize| {
+        b.object(
+            6,
+            &stream(
+                &format!("/Type /ObjStm /N {} /First {}", header.split_whitespace().count() / 2, header.len()),
+                format!("{header}{members}").as_bytes(),
+            ),
+        );
+        let at = b.out.len();
+        let row = |kind: u8, field: usize, extra: u16| {
+            let mut out = vec![kind];
+            out.extend_from_slice(&u32::try_from(field).unwrap().to_be_bytes());
+            out.extend_from_slice(&extra.to_be_bytes());
+            out
+        };
+        let mut entries = row(0, 0, 65535);
+        for num in 1..7u32 {
+            entries.extend(match num {
+                1 | 2 if (num as usize) <= listed => row(2, 6, (num - 1) as u16),
+                5 => row(0, 0, 0),
+                _ => row(1, b.offsets[&num], 0),
+            });
+        }
+        entries.extend(row(1, at, 0));
+        b.object(7, &stream("/Type /XRef /Size 8 /W [1 4 2] /Root 1 0 R", &entries));
+        b.out.extend_from_slice(format!("startxref\n{at}\n%%EOF\n").as_bytes());
+        b.out
+    };
+    let catalog = "<< /Type /Catalog /Pages 2 0 R >> ";
+    let pages = "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 300] >> ";
+    let header = format!("1 0 2 {} ", catalog.len());
+    let good = build(Builder { out: b.out.clone(), offsets: b.offsets.clone() }, &format!("{catalog}{pages}"), &header, 2);
+    assert!(inspect(&base, &good, InspectLimits::default()).is_ok());
+    let secret = "<< /Hidden (SECRET X) >> ";
+    let header3 = format!("1 0 2 {} 9 {} ", catalog.len(), catalog.len() + pages.len());
+    for (case, edited) in [
+        ("an unlisted member", build(Builder { out: b.out.clone(), offsets: b.offsets.clone() }, &format!("{catalog}{pages}{secret}"), &header3, 2)),
+        (
+            "bytes after the last member",
+            build(Builder { out: b.out.clone(), offsets: b.offsets.clone() }, &format!("{catalog}{pages}(SECRET X)"), &header, 2),
+        ),
+    ] {
+        let message = refused_against(&base, &edited);
+        assert!(message.contains("object stream"), "{case}: {message}");
+    }
+}
+
+#[test]
+fn every_byte_an_update_adds_is_listed_and_written_strictly() {
+    // R6b-51 I1: the same accounting for an appended section: every new byte is a listed
+    // object, written strictly, or the section.
+    let base = laid_out("", "", X, b"");
+    let page = format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R {RESOURCES} /Rotate 90 >>");
+    let prev = Some(last_section(&base));
+    let rotated = update_section(&base, &[(3, page.as_bytes())], prev, "");
+    assert_eq!(inspect(&base, &rotated, InspectLimits::default()).unwrap().pages.rotated, 1);
+    let mut tail = rotated.clone();
+    tail.extend_from_slice(b"% SECRET X\n");
+    let mut between = base.clone();
+    between.extend_from_slice(b"(SECRET X)\n");
+    let between = {
+        let mut out = update_section(&between, &[(3, page.as_bytes())], prev, "");
+        // The section's offsets are relative to `between`, which keeps the base's bytes first.
+        out.truncate(out.len());
+        out
+    };
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("a token after a value", update_section(&base, &[(3, format!("{page} (SECRET X)").as_bytes())], prev, "")),
+        ("a key written twice", update_section(&base, &[(3, page.replace("/Rotate 90", "/Rotate (SECRET X) /Rotate 90").as_bytes())], prev, "")),
+        ("a trailer entry", update_section(&base, &[(3, page.as_bytes())], prev, "/Junk (SECRET X)")),
+        ("a comment after the end", tail),
+        ("bytes between the base and the update", between),
+    ];
+    for (case, edited) in cases {
+        let message = refused_against(&base, &edited);
+        assert!(message.contains("lists") || message.contains("trailer"), "{case}: {message}");
+    }
+}
+
+#[test]
+fn the_byte_accounting_is_bounded() {
+    // Follow-up 8 scan (denial of service): a dictionary of many keys was checked for a key
+    // written twice key by key (quadratic), and finding where each Flate stream's data ends
+    // inflated it uncharged. Each is bounded now, without a clock.
+    let base = laid_out("", "", X, b"");
+    let keys: String = (0..150_000).map(|i| format!("/K{i} 0 ")).collect();
+    let edited = strictly(
+        "%PDF-1.7\n",
+        |num, body| if num == 1 { format!("<< /Type /Catalog /Pages 2 0 R /PieceInfo << {keys} >> >>").into_bytes() } else { body },
+        "",
+    );
+    let limits = Limits { deadline: std::time::Duration::from_secs(3_600), ..Limits::default() };
+    let started = std::time::Instant::now();
+    assert!(inspect_with(&base, &edited, limits).is_err());
+    assert!(started.elapsed() < std::time::Duration::from_secs(20), "{:?}", started.elapsed());
+    // Twenty streams of a megabyte each, inflated to find their ends, against eight megabytes.
+    let bomb = pdfcraft_cos::Stream::flate(pdfcraft_cos::Dict::new(), &vec![0u8; 1 << 20]).raw.as_ref().clone();
+    // Objects 10…29, each reached from the catalog.
+    let mut b = Builder::new();
+    let bodies = [
+        format!("<< /Type /Catalog /Pages 2 0 R /PieceInfo << {} >> >>", (0..20).map(|i| format!("/S{i} {} 0 R", 10 + i)).collect::<String>())
+            .into_bytes(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 300] >>".to_vec(),
+        format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R {RESOURCES} >>").into_bytes(),
+        stream("", &[text("Alpha"), b"\n".to_vec(), X_BOX.as_bytes().to_vec()].concat()),
+    ];
+    for (num, body) in (1u32..).zip(bodies) {
+        b.object(num, &body);
+    }
+    for i in 0..20u32 {
+        b.object(10 + i, &stream("/Filter /FlateDecode", &bomb));
+    }
+    let rows = b.offsets.clone();
+    let edited = b.finish(30, &rows, "");
+    let limits = Limits { deadline: std::time::Duration::from_secs(3_600), content_bytes: 8 << 20, ..Limits::default() };
+    assert_eq!(inspect_with(&base, &edited, limits), Err(InspectError::TooComplex));
+}
+
+#[test]
+fn names_nothing_reads_cannot_carry_what_a_rewrite_took_away() {
+    // Re-review I1: `/ProcSet [/PDF /Text /SECRET_X]`, and an unused standard font under the name
+    // /THE_REDACTED_WORD_X (names were not part of the unused-resource digest), were accepted.
+    let base = laid_out("", "", X, b"");
+    let outside = |resources: &str| {
+        inspect(&base, &laid_out("", resources, X_BOX, b""), InspectLimits::default()).unwrap().content.pages_changed_outside_redactions
+    };
+    assert_eq!(outside("/ProcSet [/PDF /Text]"), 0);
+    assert_eq!(outside("/ProcSet [/PDF /Text /SECRET_X]"), 1);
+    let fonts = |name: &str| {
+        format!("/Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> /{name} << /Type /Font /Subtype /Type1 /BaseFont /Courier >> >>")
+    };
+    assert_eq!(outside(&fonts("PCCour")), 0, "the editor's own name");
+    assert_eq!(outside(&fonts("THE_REDACTED_WORD_X")), 1);
+    // One the base had under that name may stay.
+    let base = laid_out("", &fonts("Spare"), X, b"");
+    assert_eq!(
+        inspect(&base, &laid_out("", &fonts("Spare"), X_BOX, b""), InspectLimits::default()).unwrap().content.pages_changed_outside_redactions,
+        0
+    );
 }

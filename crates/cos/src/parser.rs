@@ -254,14 +254,16 @@ impl<'a> Lexer<'a> {
     }
 
     fn dict_body(&mut self, depth: usize) -> Result<Dict, CosError> {
-        let mut d = Dict::new();
+        // Embed build: the entries are gathered, then made a dictionary at once (a later
+        // duplicate key replacing the earlier value, as before) in time linear in their number.
+        let mut d: Vec<(crate::Name, Object)> = Vec::new();
         loop {
             self.skip_ws();
             match self.peek() {
                 None => return Err(self.err("unterminated dictionary")),
                 Some(b'>') if self.data.get(self.pos + 1) == Some(&b'>') => {
                     self.pos += 2;
-                    return Ok(d);
+                    return Ok(d.into_iter().collect());
                 }
                 Some(b'/') => {
                     self.pos += 1;
@@ -270,11 +272,11 @@ impl<'a> Lexer<'a> {
                     // A key directly followed by `>>` has no value: treat as null. (A following
                     // `/` is a name *value*, so it cannot signal a missing value.)
                     if self.peek() == Some(b'>') && self.data.get(self.pos + 1) == Some(&b'>') {
-                        d.set(key, Object::Null);
+                        d.push((key, Object::Null));
                         continue;
                     }
                     let value = self.object_depth(depth + 1)?;
-                    d.set(key, value);
+                    d.push((key, value));
                 }
                 Some(_) => {
                     // Tolerate garbage between entries (seen in damaged files): skip a token.

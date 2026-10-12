@@ -148,11 +148,21 @@ impl Dict {
 
 impl FromIterator<(Name, Object)> for Dict {
     fn from_iter<T: IntoIterator<Item = (Name, Object)>>(iter: T) -> Self {
-        let mut d = Dict::new();
+        // Embed build: a later entry with an earlier key replaces its value in place, as `set`
+        // does, found through an index: building a dictionary of n keys costs n, not n² (a
+        // crafted dictionary of a hundred thousand keys took minutes to parse).
+        let mut entries: Vec<(Name, Object)> = Vec::new();
+        let mut index: std::collections::HashMap<Name, usize> = std::collections::HashMap::new();
         for (k, v) in iter {
-            d.set(k, v);
+            match index.get(&k).and_then(|&at| entries.get_mut(at)) {
+                Some((_, slot)) => *slot = v,
+                None => {
+                    index.insert(k.clone(), entries.len());
+                    entries.push((k, v));
+                }
+            }
         }
-        d
+        Dict { entries }
     }
 }
 
@@ -251,6 +261,16 @@ impl Stream {
                 (Filter::from_name(n), params)
             })
             .collect()
+    }
+
+    /// Embed build: the encoded bytes past where the first filter stops reading (a Flate
+    /// stream's data after its end; `None`: no such filter, or nothing after it), and the bytes
+    /// inflated to find it (for a caller that charges the work). `Err` when the data cannot be
+    /// read to its end within `max` bytes made.
+    pub fn trailing_data(&self, max: usize) -> Result<(Option<&[u8]>, usize), CosError> {
+        let Some((Filter::Flate, _)) = self.filters().first().cloned() else { return Ok((None, 0)) };
+        let (end, made) = pdfcraft_filters::flate_end(&self.raw, max).ok_or_else(|| CosError::Filter("the Flate data does not end".into()))?;
+        Ok((self.raw.get(end..).filter(|rest| !rest.is_empty()), made))
     }
 
     /// Decoded data, tolerating truncated or corrupt encodings the way viewers do (the data
