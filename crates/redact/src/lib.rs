@@ -93,11 +93,15 @@ pub enum Refusal {
     /// The save added an annotation of a kind the host does not count under marks (neither a
     /// stamp nor a drawing) where a mark would remove it.
     AddedAnnotationUnderMark,
+    /// A copy of the removed words elsewhere in the document cannot be cleared (a bookmark's
+    /// or the opening action's URI or JavaScript holds one), or the place copies are read from
+    /// cannot be read whole (a bookmark that is no dictionary).
+    CopyNotClearable,
 }
 
 impl Refusal {
     /// Every refusal, in a fixed order.
-    pub const ALL: [Refusal; 10] = [
+    pub const ALL: [Refusal; 11] = [
         Refusal::PatternOrMaskUnderMark,
         Refusal::ShadingUnderMark,
         Refusal::UnreadableMarkedText,
@@ -108,6 +112,7 @@ impl Refusal {
         Refusal::ContentNotFollowable,
         Refusal::ContentUnreadable,
         Refusal::AddedAnnotationUnderMark,
+        Refusal::CopyNotClearable,
     ];
 
     /// The code a host words (`snake_case`, stable).
@@ -123,6 +128,7 @@ impl Refusal {
             Refusal::ContentNotFollowable => "content_not_followable",
             Refusal::ContentUnreadable => "content_unreadable",
             Refusal::AddedAnnotationUnderMark => "added_annotation_under_mark",
+            Refusal::CopyNotClearable => "copy_not_clearable",
         }
     }
 }

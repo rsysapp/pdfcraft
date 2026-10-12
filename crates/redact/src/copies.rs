@@ -96,14 +96,137 @@ impl Removed {
             || self.phrases.iter().any(|phrase| joined.contains(&format!(" {phrase} ")))
     }
 
-    /// Whether bytes `copy` (as text: UTF-16 with its mark, else Latin-1 and UTF-8 both) hold one.
+    /// Whether bytes `copy` (a name, or a packet's data) hold one, read every way it could be
+    /// meant: as a PDF text string (UTF-16BE or UTF-8 with its mark, else PDFDocEncoding), as
+    /// UTF-8, as UTF-16 little-endian with its mark; XML character references and entities read
+    /// (an XMP packet's `&#83;`).
     fn held_in_bytes(&self, copy: &[u8]) -> bool {
-        self.held_in(&PdfString::literal(copy.to_vec()).to_text()) || self.held_in(&String::from_utf8_lossy(copy))
+        let mut readings = vec![PdfString::literal(copy.to_vec()).to_text(), String::from_utf8_lossy(copy).into_owned()];
+        if let Some(rest) = copy.strip_prefix(&[0xFF, 0xFE]) {
+            let units: Vec<u16> = rest.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
+            readings.push(String::from_utf16_lossy(&units));
+        }
+        let unescaped: Vec<String> = readings.iter().map(|text| xml_unescaped(text)).collect();
+        readings.extend(unescaped);
+        readings.iter().any(|text| self.held_in(&without_language_marks(text)))
+    }
+
+    /// Whether a text string `copy` holds one. Audit (follow-up 9): one that does not decode
+    /// cleanly (a character no encoding gives) counts as holding one, so it is cleared rather
+    /// than kept unread.
+    fn held_in_text(&self, copy: &str) -> bool {
+        copy.contains('\u{fffd}') || self.held_in(&without_language_marks(copy))
     }
 }
 
+/// A text string without its language marks (ISO 32000-2 §7.9.2.2: U+001B, a language code,
+/// U+001B), which viewers do not show: a mark inside a word must not split it.
+fn without_language_marks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut inside = false;
+    for c in text.chars() {
+        if c == '\u{1b}' {
+            inside = !inside;
+        } else if !inside {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// XML character references and the five entities read (`&#83;`, `&#x53;`, `&amp;`, …).
+fn xml_unescaped(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at..];
+        let entity_end = tail.find(';').filter(|end| *end <= 12);
+        let decoded = entity_end.and_then(|end| {
+            let entity = &tail[1..end];
+            match entity {
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                _ => entity
+                    .strip_prefix("#x")
+                    .or_else(|| entity.strip_prefix("#X"))
+                    .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+                    .or_else(|| entity.strip_prefix('#').and_then(|digits| digits.parse::<u32>().ok()))
+                    .and_then(char::from_u32),
+            }
+        });
+        match (decoded, entity_end) {
+            (Some(c), Some(end)) => {
+                out.push(c);
+                rest = &tail[end + 1..];
+            }
+            _ => {
+                out.push('&');
+                rest = &tail[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A copy's text: a string's (as a PDF text string), or a name's bytes read as one.
 fn text_of(doc: &Document, o: &Object) -> Option<String> {
-    doc.resolve(o).as_string().map(PdfString::to_text)
+    match &*doc.resolve(o) {
+        Object::String(s) => Some(s.to_text()),
+        Object::Name(n) => Some(PdfString::literal(n.clone()).to_text()),
+        _ => None,
+    }
+}
+
+/// Audit (follow-up 9): whether an action (a bookmark's, the opening one), or any action it
+/// chains, holds a removed word anywhere (a URI, a file name, JavaScript as a string or a
+/// stream): such a copy cannot be cleared without changing what the action does.
+fn action_holds(doc: &Document, action: &Object, removed: &Removed, work: &interp::Work, depth: usize) -> Result<bool, RedactError> {
+    if depth > 32 {
+        return Err(RedactError::TooComplex);
+    }
+    work.charge(4);
+    if work.spent() {
+        return Err(RedactError::TooComplex);
+    }
+    // A page or a structure element is reached from an action by reference, not text in it.
+    if let Object::Ref(r) = action
+        && doc.get(*r).as_dict().is_some_and(|d| matches!(d.name(b"Type"), Some(b"Page" | b"Pages" | b"StructElem")))
+    {
+        return Ok(false);
+    }
+    Ok(match &*doc.resolve(action) {
+        Object::String(s) => removed.held_in_text(&s.to_text()) || removed.held_in_bytes(&s.bytes),
+        Object::Name(n) => removed.held_in_bytes(n),
+        Object::Stream(stream) => {
+            let data = stream.decoded().map_err(|_| RedactError::Refused(Refusal::CopyNotClearable))?;
+            work.charge(data.len() / 64);
+            removed.held_in_bytes(&data)
+        }
+        Object::Array(items) => {
+            let mut held = false;
+            for item in items {
+                held |= action_holds(doc, item, removed, work, depth + 1)?;
+            }
+            held
+        }
+        Object::Dict(dict) => {
+            let mut held = false;
+            for (key, value) in dict.iter() {
+                // Where a destination goes is followed apart (renamed with its name).
+                if matches!(key.as_slice(), b"D" | b"Dest" | b"Type" | b"S") {
+                    continue;
+                }
+                held |= action_holds(doc, value, removed, work, depth + 1)?;
+            }
+            held
+        }
+        _ => false,
+    })
 }
 
 /// Clear the copies of what was removed (see the module documentation), counting each in
@@ -151,6 +274,12 @@ pub(crate) fn clear(doc: &mut Document, removed: &Removed, report: &mut Report, 
     if removed.is_empty() {
         return Ok(());
     }
+    // Audit (follow-up 9): the opening action holding a removed word cannot be cleared.
+    if let Some(action) = catalog.get(b"OpenAction").filter(|action| !matches!(&*doc.resolve(action), Object::Array(_)))
+        && action_holds(doc, action, removed, work, 0)?
+    {
+        return Err(RedactError::Refused(Refusal::CopyNotClearable));
+    }
     // Bookmarks: depth first, bounded.
     let mut todo: Vec<Object> =
         catalog.get(b"Outlines").and_then(|o| doc.resolve(o).as_dict().and_then(|d| d.get(b"First").cloned())).into_iter().collect();
@@ -158,12 +287,23 @@ pub(crate) fn clear(doc: &mut Document, removed: &Removed, report: &mut Report, 
     while let Some(entry) = todo.pop() {
         work.charge(8);
         spent(work)?;
-        let Some(r) = entry.as_ref() else { continue };
-        if seen.len() > 100_000 || !seen.insert(r) {
+        // Audit (follow-up 9): a walk past its bound, or an entry that is no dictionary, is never
+        // skipped: the redaction is refused.
+        let Some(r) = entry.as_ref() else { return Err(RedactError::Refused(Refusal::CopyNotClearable)) };
+        if !seen.insert(r) {
             continue;
         }
-        let Some(item) = doc.get(r).as_dict().cloned() else { continue };
-        if item.get(b"Title").and_then(|t| text_of(doc, t)).is_some_and(|title| removed.held_in(&title)) {
+        if seen.len() > 100_000 {
+            return Err(RedactError::TooComplex);
+        }
+        let Some(item) = doc.get(r).as_dict().cloned() else { return Err(RedactError::Refused(Refusal::CopyNotClearable)) };
+        // Audit (follow-up 9): a bookmark's action holding a removed word cannot be cleared.
+        if let Some(action) = item.get(b"A")
+            && action_holds(doc, action, removed, work, 0)?
+        {
+            return Err(RedactError::Refused(Refusal::CopyNotClearable));
+        }
+        if item.get(b"Title").and_then(|t| text_of(doc, t)).is_some_and(|title| removed.held_in_text(&title)) {
             doc.update_dict(r, |d| d.set(b"Title".to_vec(), Object::String(PdfString::text(REDACTED))))?;
             report.bookmarks_cleared += 1;
         }
@@ -174,8 +314,11 @@ pub(crate) fn clear(doc: &mut Document, removed: &Removed, report: &mut Report, 
     if let Some(info) = info
         && let Some(dict) = doc.get(info).as_dict().cloned()
     {
-        let doomed: Vec<Vec<u8>> =
-            dict.iter().filter(|(_, value)| text_of(doc, value).is_some_and(|text| removed.held_in(&text))).map(|(key, _)| key.clone()).collect();
+        let doomed: Vec<Vec<u8>> = dict
+            .iter()
+            .filter(|(_, value)| text_of(doc, value).is_some_and(|text| removed.held_in_text(&text)))
+            .map(|(key, _)| key.clone())
+            .collect();
         if !doomed.is_empty() {
             doc.update_dict(info, |d| {
                 for key in &doomed {
@@ -200,9 +343,10 @@ pub(crate) fn clear(doc: &mut Document, removed: &Removed, report: &mut Report, 
         if let Some(Object::Ref(metadata)) = dict.get(b"Metadata")
             && let Object::Stream(packet) = &*doc.get(*metadata)
         {
-            let data = packet.decoded().unwrap_or_default();
-            work.charge(data.len() / 64);
-            if removed.held_in_bytes(&data) {
+            // Audit (follow-up 9): a packet that does not decode is removed, never kept unread.
+            let data = packet.decoded_strict_counted(64 << 20).ok().map(|(data, _)| data);
+            work.charge(data.as_ref().map_or(0, Vec::len) / 64);
+            if data.is_none_or(|data| removed.held_in_bytes(&data)) {
                 doc.update_dict(r, |d| {
                     d.remove(b"Metadata");
                 })?;
@@ -213,7 +357,7 @@ pub(crate) fn clear(doc: &mut Document, removed: &Removed, report: &mut Report, 
         if dict.name(b"Type") == Some(b"Annot") || (dict.contains(b"Subtype") && dict.contains(b"Rect") && dict.contains(b"Contents")) {
             let doomed: Vec<&[u8]> = [&b"Contents"[..], b"RC", b"T"]
                 .into_iter()
-                .filter(|key| dict.get(key).and_then(|v| text_of(doc, v)).is_some_and(|text| removed.held_in(&text)))
+                .filter(|key| dict.get(key).and_then(|v| text_of(doc, v)).is_some_and(|text| removed.held_in_text(&text)))
                 .collect();
             if !doomed.is_empty() && dict.name(b"Subtype") != Some(b"Widget") {
                 doc.update_dict(r, |d| {
@@ -225,7 +369,7 @@ pub(crate) fn clear(doc: &mut Document, removed: &Removed, report: &mut Report, 
             }
         }
         // An optional-content group's name.
-        if dict.name(b"Type") == Some(b"OCG") && dict.get(b"Name").and_then(|v| text_of(doc, v)).is_some_and(|name| removed.held_in(&name)) {
+        if dict.name(b"Type") == Some(b"OCG") && dict.get(b"Name").and_then(|v| text_of(doc, v)).is_some_and(|name| removed.held_in_text(&name)) {
             doc.update_dict(r, |d| d.set(b"Name".to_vec(), Object::String(PdfString::text(REDACTED))))?;
             report.layer_names_cleared += 1;
         }
@@ -246,8 +390,10 @@ fn clear_label_prefixes(
     work: &interp::Work,
     depth: usize,
 ) -> Result<(), RedactError> {
-    if depth > 32 {
-        return Ok(());
+    // Audit (follow-up 9): as deep as the inspector reads a number tree; deeper is refused,
+    // never skipped.
+    if depth > 64 {
+        return Err(RedactError::TooComplex);
     }
     work.charge(4);
     let Some(dict) = doc.resolve(node).as_dict().cloned() else { return Ok(()) };
@@ -258,7 +404,7 @@ fn clear_label_prefixes(
             let Some(label) = pair.get_mut(1) else { continue };
             let target = label.as_ref();
             let Some(mut entry) = doc.resolve(label).as_dict().cloned() else { continue };
-            if entry.get(b"P").and_then(|p| text_of(doc, p)).is_some_and(|prefix| removed.held_in(&prefix)) {
+            if entry.get(b"P").and_then(|p| text_of(doc, p)).is_some_and(|prefix| removed.held_in_text(&prefix)) {
                 entry.remove(b"P");
                 report.label_prefixes_cleared += 1;
                 match target {
@@ -400,7 +546,9 @@ fn rename_destinations(doc: &mut Document, removed: &Removed, report: &mut Repor
 /// Every `/Dest` and `/D` in `value` (dictionaries and arrays written in it) naming a renamed
 /// destination, renamed. Whether any was.
 fn follow(value: &mut Object, renames: &HashMap<Vec<u8>, Vec<u8>>, depth: usize) -> bool {
-    if depth > 32 {
+    // Written deeper than any destination is (the inspector compares every destination it reads
+    // with the base's, so one left naming a renamed name is refused there).
+    if depth > 64 {
         return false;
     }
     let mut changed = false;
@@ -451,7 +599,7 @@ fn collect_tree(
     work: &interp::Work,
     depth: usize,
 ) -> Result<(), RedactError> {
-    if depth > 32 || out.len() > 100_000 {
+    if depth > 64 || out.len() > 100_000 {
         return Err(RedactError::TooComplex);
     }
     if let Some(r) = node.as_ref()

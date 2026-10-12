@@ -103,7 +103,7 @@ impl ApplyError {
     }
 
     /// Every code [`ApplyError::code`] gives.
-    pub const CODES: [&'static str; 13] = [
+    pub const CODES: [&'static str; 14] = [
         "not_an_update",
         "nothing_to_apply",
         "pattern_or_mask_under_mark",
@@ -116,6 +116,7 @@ impl ApplyError {
         "content_not_followable",
         "content_unreadable",
         "added_annotation_under_mark",
+        "copy_not_clearable",
         "self_check_failed",
     ];
 }

@@ -1288,3 +1288,104 @@ fn a_stream_coded_with_a_filter_not_read_to_its_end_is_only_the_base_s() {
     let (base, edited) = stamp(stream("/Type /Metadata /Subtype /XML", b"<x:xmpmeta/>"));
     assert_eq!(inspect(&base, &edited, InspectLimits::default()).unwrap().annotations.stamps, 1);
 }
+
+// ── Audit (follow-up 9, coordinator's scan of copies.rs): copies read every way, walks whole ──
+
+/// "SECRETWORD" in UTF-16BE with its mark, as a hex string.
+const UTF16_SECRET: &str = "<FEFF0053004500430052004500540057004F00520044>";
+
+#[test]
+fn copies_in_every_string_form_are_cleared() {
+    // Audit: a document-level copy is read as a viewer reads it, whatever its string form:
+    // hex, octal escapes, a line continuation, UTF-16BE or UTF-8 with its mark, a name, a
+    // language mark inside the word, a value that does not decode cleanly (cleared, not kept).
+    for (case, value) in [
+        ("hex", "<5345435245545744524F57>".replace("5744524F57", "574F5244")),
+        ("octal", "(\\123ECRETWORD)".to_string()),
+        ("a line continuation", "(SECRET\\\nWORD)".to_string()),
+        ("UTF-16BE", UTF16_SECRET.to_string()),
+        ("UTF-8 with its mark", "<EFBBBF534543524554574F5244>".to_string()),
+        ("a name", "/SECRETWORD".to_string()),
+        ("a language mark inside", "<FEFF00530045001B0065006E001B00430052004500540057004F00520044>".to_string()),
+        ("not decoding cleanly", "<EFBBBFFF53>".to_string()),
+    ] {
+        let base = Spec {
+            trailer: "/Info 6 0 R".into(),
+            extras: vec![format!("<< /Producer (gen) /Custom {value} >>").into_bytes()],
+            ..Spec::new(&format!("{LINE}\n{KEEP}"))
+        }
+        .build();
+        let applied = apply(&base, &marked(&base, &[BOX])).unwrap_or_else(|error| panic!("{case}: {error:?}"));
+        assert_eq!(applied.facts.information_cleared, 1, "{case}: {:?}", applied.facts);
+    }
+}
+
+#[test]
+fn xmp_read_every_way_it_can_be_written() {
+    // Audit: an XMP packet in UTF-16 little-endian, or spelling the word with character
+    // references, holds it too; one that does not decode is removed, never kept unread.
+    let utf16le: Vec<u8> = [0xFF, 0xFE].into_iter().chain("<x:xmpmeta>SECRETWORD</x:xmpmeta>".encode_utf16().flat_map(u16::to_le_bytes)).collect();
+    for (case, packet) in [
+        ("UTF-16LE", stream("/Type /Metadata /Subtype /XML", &utf16le)),
+        ("character references", stream("/Type /Metadata /Subtype /XML", b"<x:xmpmeta>&#83;ECRET&#x57;ORD</x:xmpmeta>")),
+        ("not decoding", stream("/Type /Metadata /Subtype /XML /Filter /FlateDecode", b"not flate data at all")),
+    ] {
+        let pixel = stream("/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Metadata 7 0 R", &[7]);
+        let base = Spec {
+            res: "/XObject << /Im1 6 0 R >>".into(),
+            extras: vec![pixel, packet],
+            ..Spec::new(&format!("{LINE}\nq 10 0 0 10 150 20 cm /Im1 Do Q\n{KEEP}"))
+        }
+        .build();
+        match apply(&base, &marked(&base, &[BOX])) {
+            Ok(applied) => assert!(found(&applied.bytes, "Metadata").is_empty(), "{case}: {:?}", found(&applied.bytes, "Metadata")),
+            Err(error) => panic!("{case}: {error:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_copy_in_an_action_refuses_the_redaction_by_its_reason() {
+    // Audit: a bookmark (or the opening action) whose URI or JavaScript holds a removed word
+    // cannot be cleared without changing what it does: refused, never kept.
+    for (case, catalog, item, extra) in [
+        ("a bookmark's URI", "/Outlines 6 0 R", "/A << /S /URI /URI (https://example.com/SECRETWORD) >>", None),
+        ("a bookmark's JavaScript", "/Outlines 6 0 R", "/A << /S /JavaScript /JS 8 0 R >>", Some(stream("", b"app.alert('SECRETWORD');"))),
+        ("a chained action", "/Outlines 6 0 R", "/A << /S /URI /URI (https://example.com/) /Next << /S /JavaScript /JS (SECRETWORD) >> >>", None),
+        ("the opening action", "/Outlines 6 0 R /OpenAction << /S /JavaScript /JS (var who = 'SECRETWORD';) >>", "", None),
+    ] {
+        let mut extras = vec![
+            b"<< /Type /Outlines /First 7 0 R /Last 7 0 R /Count 1 >>".to_vec(),
+            format!("<< /Title (Clause) /Parent 6 0 R {item} >>").into_bytes(),
+        ];
+        extras.extend(extra);
+        let base = Spec { cat: catalog.into(), extras, ..Spec::new(&format!("{LINE}\n{KEEP}")) }.build();
+        match apply(&base, &marked(&base, &[BOX])) {
+            Err(ApplyError::Refused(Refusal::CopyNotClearable)) => {}
+            // The inspector may refuse the base itself (an action it does not compare).
+            Err(ApplyError::Inspect(_)) => {}
+            other => panic!("{case}: {:?}", other.map(|applied| found(&applied.bytes, SECRET))),
+        }
+    }
+}
+
+#[test]
+fn a_deep_page_label_tree_is_read_whole() {
+    // Audit: a page-label prefix holding a removed word, forty levels down the number tree (the
+    // inspector reads sixty-four), is cleared: no walk stops short and keeps it.
+    let depth = 40;
+    let mut extras: Vec<Vec<u8>> = Vec::new();
+    for level in 0..depth {
+        let num = 6 + level;
+        extras.push(if level + 1 == depth {
+            b"<< /Limits [0 0] /Nums [0 << /S /D /P (SECRETWORD-) >>] >>".to_vec()
+        } else {
+            format!("<< /Limits [0 0] /Kids [{} 0 R] >>", num + 1).into_bytes()
+        });
+    }
+    let base = Spec { cat: "/PageLabels << /Kids [6 0 R] >>".into(), extras, ..Spec::new(&format!("{LINE}\n{KEEP}")) }.build();
+    match apply(&base, &marked(&base, &[BOX])) {
+        Ok(applied) => assert!(found(&applied.bytes, SECRET).is_empty(), "{:?}", found(&applied.bytes, SECRET)),
+        Err(error) => assert!(matches!(error, ApplyError::Inspect(_) | ApplyError::TooComplex), "{error:?}"),
+    }
+}
