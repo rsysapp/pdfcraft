@@ -1090,6 +1090,8 @@ struct Drawn {
     /// The standard fonts offered (see [`PageFacts::unused_standard_fonts`]), the same way.
     standard: BTreeSet<(Digest, Digest)>,
     used: BTreeSet<Digest>,
+    /// Follow-up 9 (inspector re-review N9): the entries looked up, by name and content.
+    used_named: BTreeSet<Digest>,
     /// See [`PageFacts::drawing_resources`].
     drawing: BTreeSet<Digest>,
 }
@@ -2196,13 +2198,13 @@ impl<'d, 'b> Reader<'d, 'b> {
                         // noted as used.
                         _ => {
                             if let Some(entry) = self.resource_entry(chain, b"ColorSpace", name)? {
-                                self.use_resource(b"ColorSpace", &entry, drawn)?;
+                                self.use_resource(b"ColorSpace", name, &entry, drawn)?;
                             }
                             continue;
                         }
                     };
                     if let Some(entry) = self.resource_entry(chain, kind, name)? {
-                        self.use_resource(kind, &entry, drawn)?;
+                        self.use_resource(kind, name, &entry, drawn)?;
                         match &*self.resolve(&entry)? {
                             Object::Dict(dict) => self.note_keys(kind, dict, drawn)?,
                             Object::Stream(stream) => self.note_keys(kind, &stream.dict, drawn)?,
@@ -2214,7 +2216,7 @@ impl<'d, 'b> Reader<'d, 'b> {
                     let found = match list {
                         PropertyList::Named(name) => match self.resource_entry(chain, b"Properties", name)? {
                             Some(entry) => match &*{
-                                self.use_resource(b"Properties", &entry, drawn)?;
+                                self.use_resource(b"Properties", name, &entry, drawn)?;
                                 self.resolve(&entry)?
                             } {
                                 Object::Dict(dict) => Some(dict.clone()),
@@ -2258,7 +2260,7 @@ impl<'d, 'b> Reader<'d, 'b> {
                 }
                 Item::Draw(name) => {
                     let Some(r) = self.xobject(chain, name)? else { continue };
-                    self.use_resource(b"XObject", &Object::Ref(r), drawn)?;
+                    self.use_resource(b"XObject", name, &Object::Ref(r), drawn)?;
                     let obj = self.get(r)?;
                     let Object::Stream(stream) = &*obj else { continue };
                     match stream.dict.name(b"Subtype") {
@@ -2313,7 +2315,7 @@ impl<'d, 'b> Reader<'d, 'b> {
                 }
                 Item::Pattern(name) => {
                     if let Some(entry) = self.resource_entry(chain, b"Pattern", name)? {
-                        self.use_resource(b"Pattern", &entry, drawn)?;
+                        self.use_resource(b"Pattern", name, &entry, drawn)?;
                     }
                     let Some(r) = self.resource(chain, b"Pattern", name)? else { continue };
                     let obj = self.get(r)?;
@@ -2364,7 +2366,7 @@ impl<'d, 'b> Reader<'d, 'b> {
                 }
                 Item::State(name) => {
                     if let Some(entry) = self.resource_entry(chain, b"ExtGState", name)? {
-                        self.use_resource(b"ExtGState", &entry, drawn)?;
+                        self.use_resource(b"ExtGState", name, &entry, drawn)?;
                     }
                     if let Some(entry) = self.resource_entry(chain, b"ExtGState", name)?
                         && let Some(state) = self.dict_of(Some(&entry), "a graphics state")?
@@ -2497,9 +2499,12 @@ impl<'d, 'b> Reader<'d, 'b> {
         Ok(sha256(&parts))
     }
 
-    fn use_resource(&mut self, kind: &[u8], entry: &Object, drawn: &mut Drawn) -> Result<(), Fail> {
+    fn use_resource(&mut self, kind: &[u8], name: &[u8], entry: &Object, drawn: &mut Drawn) -> Result<(), Fail> {
         let digest = self.resource_digest(kind, entry)?;
         drawn.used.insert(digest);
+        // Follow-up 9 (inspector re-review N9): and by name and content: an entry under a name
+        // nothing looks up is unused, though its content is drawn under another name.
+        drawn.used_named.insert(sha256(&[b"named resource", kind, &(name.len() as u64).to_le_bytes(), name, &digest]));
         // Follow-up 8 (R6b-51; the redaction re-review's C2): what a page draws with but forms
         // and images, whose data under the boxes no comparison reads (a pattern's cell, a
         // shading's samples, a colour profile, a font's names and maps): a property list
@@ -2927,8 +2932,8 @@ impl<'d, 'b> Reader<'d, 'b> {
             levels: drawn.levels,
             levels_agree: false,
             levels_unbalanced: drawn.unbalanced,
-            unused_resources: drawn.offered.iter().filter(|(content, _)| !drawn.used.contains(content)).map(|(_, named)| *named).collect(),
-            unused_standard_fonts: drawn.standard.iter().filter(|(content, _)| !drawn.used.contains(content)).map(|(_, named)| *named).collect(),
+            unused_resources: drawn.offered.iter().filter(|(_, named)| !drawn.used_named.contains(named)).map(|(_, named)| *named).collect(),
+            unused_standard_fonts: drawn.standard.iter().filter(|(_, named)| !drawn.used_named.contains(named)).map(|(_, named)| *named).collect(),
             offered_resources: drawn.offered.iter().chain(&drawn.standard).map(|(_, named)| *named).collect(),
             entries,
             image_pixels: drawn.pixels,

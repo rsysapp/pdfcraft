@@ -2512,6 +2512,12 @@ fn names_nothing_reads_cannot_carry_what_a_rewrite_took_away() {
     };
     assert_eq!(outside(&fonts("PCCour")), 0, "the editor's own name");
     assert_eq!(outside(&fonts("THE_REDACTED_WORD_X")), 1);
+    // Follow-up 9 (inspector re-review N9, `e12_std_font_named`): an unused name beside a drawn
+    // font of the same content holds its name as much as one of other content.
+    let same = "/Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> /THE_REDACTED_WORD_X << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >>";
+    assert_eq!(outside(same), 1, "a drawn font's content under another name");
+    let shading = "/Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> /ExtGState << /G1 << /CA 1 >> /SECRET_X << /CA 1 >> >>";
+    assert_eq!(outside(shading), 1, "an unused state of a used one's content");
     // One the base had under that name may stay.
     let base = laid_out("", &fonts("Spare"), X, b"");
     assert_eq!(
