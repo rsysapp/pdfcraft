@@ -278,6 +278,9 @@ pub(crate) struct Scope<'a> {
     /// pattern or soft mask reaching a mark, a shading reaching one that cannot be removed
     /// whole, text that cannot be placed): what a host applying marks requires.
     pub exact: bool,
+    /// Embed build (R6b-54, N6): the boxes (user space) of the image pixels cleared: every pixel
+    /// a region reaches is cleared whole, so these may reach past the regions.
+    pub cleared: Vec<[f64; 4]>,
 }
 
 impl<'a> Scope<'a> {
@@ -296,6 +299,7 @@ impl<'a> Scope<'a> {
             removed_text: String::new(),
             work: Work::new(MAX_WORK, None),
             exact: false,
+            cleared: Vec::new(),
         }
     }
 
@@ -779,6 +783,10 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
                     if scope.hits(b) {
                         if scope.mode == Mode::Verify {
                             out.residue += 1;
+                        } else if scope.exact && !scope.covered(b) {
+                            // Embed build (R6b-54): an inline image partly under a mark is
+                            // never cleared in place; for a host, refused by its reason.
+                            out.refuse(Refusal::ImageNotClearable);
                         } else {
                             scope.report.images_removed += 1;
                             changed = true;
@@ -1044,26 +1052,51 @@ fn xobject(
                 out.residue += 1;
                 return None;
             }
-            match image::clear(doc, s, &gs.ctm, scope.rects) {
+            let role = if matches!(s.dict.get(b"ImageMask"), Some(Object::Bool(true))) { image::Role::Stencil } else { image::Role::Colour };
+            // Embed build (R6b-54): an image partly under a mark that cannot be cleared is, for
+            // a host, refused by its reason (removing it whole would change what shows outside).
+            let cannot = |scope: &mut Scope<'_>, out: &mut Output| {
+                if scope.exact {
+                    out.refuse(Refusal::ImageNotClearable);
+                    return None;
+                }
+                scope.report.images_removed += 1;
+                Some(None)
+            };
+            match image::clear(doc, s, &gs.ctm, scope.rects, role) {
                 Ok(None) => None,
-                Ok(Some(mut new)) => {
-                    // Embed build (R6b-50): its soft mask (and a stencil mask) cleared under the
-                    // regions too, at its own resolution; one that cannot be cleared removes
-                    // the image.
-                    for key in [&b"SMask"[..], b"Mask"] {
-                        let Some(mask_ref) = new.dict.get(key).and_then(Object::as_ref) else { continue };
+                Ok(Some(cleared)) => {
+                    let mut new = cleared.stream;
+                    let mut reach = cleared.pixel;
+                    scope.cleared.push(cleared.bounds);
+                    // Embed build (R6b-50, R6b-54): its soft mask (opaque) and its stencil mask
+                    // (painted) cleared under the regions too, at their own resolution, so the
+                    // cleared pixels show black; one that cannot be cleared is refused (or, on
+                    // the desktop, removes the image). A colour-key mask that would hide the
+                    // black is refused too.
+                    for (key, role) in [(&b"SMask"[..], image::Role::SoftMask), (b"Mask", image::Role::PaintedMask)] {
+                        let Some(entry) = new.dict.get(key).cloned() else { continue };
+                        let Some(mask_ref) = entry.as_ref() else {
+                            if key == b"Mask" && !scope.exact {
+                                continue;
+                            }
+                            if key == b"Mask" {
+                                // A colour key: refused, as a black it would mask cannot be told.
+                                return cannot(scope, out);
+                            }
+                            continue;
+                        };
                         let mask = doc.get(mask_ref);
                         let Object::Stream(mask) = &*mask else { continue };
-                        match image::clear(doc, mask, &gs.ctm, scope.rects) {
+                        match image::clear(doc, mask, &gs.ctm, scope.rects, role) {
                             Ok(None) => {}
-                            Ok(Some(cleared)) => {
-                                let cleared = doc.add(Object::Stream(cleared));
+                            Ok(Some(mask_cleared)) => {
+                                reach = reach.max(mask_cleared.pixel);
+                                scope.cleared.push(mask_cleared.bounds);
+                                let cleared = doc.add(Object::Stream(mask_cleared.stream));
                                 new.dict.set(key.to_vec(), Object::Ref(cleared));
                             }
-                            Err(()) => {
-                                scope.report.images_removed += 1;
-                                return Some(None);
-                            }
+                            Err(()) => return cannot(scope, out),
                         }
                     }
                     let nr = doc.add(Object::Stream(new));
@@ -1071,12 +1104,10 @@ fn xobject(
                     xobjects.set(n.clone(), Object::Ref(nr));
                     out.xobjects.push((n.clone(), nr));
                     scope.report.images_cleared += 1;
+                    scope.report.overhang = scope.report.overhang.max(reach);
                     Some(Some(Op::new("Do", vec![Object::Name(n)])))
                 }
-                Err(()) => {
-                    scope.report.images_removed += 1;
-                    Some(None)
-                }
+                Err(()) => cannot(scope, out),
             }
         }
         Some(b"Form") => {
@@ -1383,6 +1414,7 @@ fn merge(into: &mut Report, from: &Report) {
     into.forms_rewritten += from.forms_rewritten;
     into.forms_removed += from.forms_removed;
     into.tags += from.tags;
+    into.overhang = into.overhang.max(from.overhang);
 }
 
 /// Embed build (R6b-50): set in `resources` what a scope's processing made: its new XObjects,

@@ -329,21 +329,46 @@ fn coding(stream: &Stream) -> Coding {
 
 fn replacement(base: &ImageUse, edited: &ImageUse, files: (&Images, &Images), areas: &mut Areas, budget: &mut Budget) -> Result<Replaced, Fail> {
     let (Some(b), Some(e)) = (&base.image, &edited.image) else { return Ok(under_areas(base, edited, areas)) };
-    if b.meaning != e.meaning || b.width != e.width || b.height != e.height || b.width == 0 || b.height == 0 {
+    // Follow-up 9 (R6b-54, N6): what a redaction takes off a cleared copy may only go.
+    let extras_kept = e.extras.is_none() || e.extras == b.extras;
+    if b.meaning != e.meaning || b.width != e.width || b.height != e.height || b.width == 0 || b.height == 0 || !extras_kept {
         return Ok(under_areas(base, edited, areas));
     }
-    let (Some(b_stream), Some(e_stream)) = (files.0.stream(b.obj.num), files.1.stream(e.obj.num)) else {
+    let Some(mut replaced) = samples(files, (b.obj.num, e.obj.num), &base.matrix, areas, budget)? else {
         return Ok(under_areas(base, edited, areas));
     };
-    let grid = Grid { matrix: base.matrix, width: b.width as usize, height: b.height as usize };
-    let compared = match (coding(&b_stream), coding(&e_stream)) {
+    // Follow-up 9 (R6b-54, N6): its masks, each at its own resolution: present in both or in
+    // neither, and every sample outside the areas as it was.
+    for (b_mask, e_mask) in b.masks.iter().zip(&e.masks) {
+        let compared = match (b_mask, e_mask) {
+            (None, None) => Some(Replaced::Same),
+            (Some(b_mask), Some(e_mask)) => samples(files, (b_mask.num, e_mask.num), &base.matrix, areas, budget)?,
+            _ => None,
+        };
+        replaced = match (replaced, compared) {
+            (_, None) => return Ok(under_areas(base, edited, areas)),
+            (Replaced::Outside, _) | (_, Some(Replaced::Outside)) => Replaced::Outside,
+            (Replaced::Redacted, _) | (_, Some(Replaced::Redacted)) => Replaced::Redacted,
+            (Replaced::Same, Some(Replaced::Same)) => Replaced::Same,
+        };
+    }
+    Ok(replaced)
+}
+
+/// Two images' samples (objects `nums` of the base and the edited file), placed by `matrix`,
+/// compared against `areas` (`None`: not comparable sample by sample).
+fn samples(files: (&Images, &Images), nums: (u32, u32), matrix: &Matrix, areas: &mut Areas, budget: &mut Budget) -> Result<Option<Replaced>, Fail> {
+    let (Some(b_stream), Some(e_stream)) = (files.0.stream(nums.0), files.1.stream(nums.1)) else { return Ok(None) };
+    let side = |stream: &Stream, key: &[u8]| stream.dict.int(key).and_then(|v| usize::try_from(v).ok()).filter(|v| *v > 0);
+    let (Some(width), Some(height)) = (side(&b_stream, b"Width"), side(&b_stream, b"Height")) else { return Ok(None) };
+    if side(&e_stream, b"Width") != Some(width) || side(&e_stream, b"Height") != Some(height) {
+        return Ok(None);
+    }
+    let grid = Grid { matrix: *matrix, width, height };
+    Ok(match (coding(&b_stream), coding(&e_stream)) {
         (Coding::Lossless, Coding::Lossless) => lossless(&b_stream, &e_stream, files.0, &grid, areas, budget)?,
         (Coding::Dct, Coding::Dct) => dct(&b_stream, &e_stream, &grid, areas, budget)?,
         _ => None,
-    };
-    Ok(match compared {
-        Some(replaced) => replaced,
-        None => under_areas(base, edited, areas),
     })
 }
 

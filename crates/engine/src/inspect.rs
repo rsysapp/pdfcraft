@@ -2308,7 +2308,9 @@ fn compare_pages(
             // appearances by their rectangle.
             outside |= !glyphs_inside
                 || !forms_under(b, e, &mut areas, budget).map_err(|fail| fail.of(Role::Edited))?
-                || b.type3 != e.type3
+                // Follow-up 9 (R6b-54, N6): a Type 3 font may go with the last of its glyphs
+                // (each removed glyph is judged above); none may be added or changed.
+                || !e.type3.is_subset(&b.type3)
                 || !appearances_under(b, e, &mut areas, budget).map_err(|fail| fail.of(Role::Edited))?
                 // Which layers show by default changed: not a redaction, whatever the boxes.
                 || layers_changed

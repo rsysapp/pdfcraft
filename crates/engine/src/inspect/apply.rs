@@ -61,6 +61,10 @@ pub struct AppliedFacts {
     pub information_cleared: u32,
     pub metadata_removed: u32,
     pub destinations_renamed: u32,
+    /// Follow-up 9 (R6b-54, N6): the most an image's cleared pixels reach past the marks, in
+    /// points: the larger side of the largest image pixel cleared (0 without one). Every pixel a
+    /// mark reaches is cleared whole; the self-check allows bands filled this far past the marks.
+    pub overhang: f32,
 }
 
 /// Why marks could not be applied. The host keeps the edited file unsaved on every one.
@@ -269,6 +273,7 @@ fn run(base: &[u8], edited: &[u8], limits: InspectLimits) -> Result<Applied, App
         information_cleared: count(report.information_cleared),
         metadata_removed: count(report.metadata_removed),
         destinations_renamed: count(report.destinations_renamed),
+        overhang: report.overhang as f32,
     };
     let mut budget = clock.budget(limits)?;
     self_check(&inspection, &facts, &before, &detail, (removed, fields), &mut budget)?;
@@ -428,7 +433,7 @@ fn self_check(
     for (page, band) in &inspection.filled_areas {
         tick(budget)?;
         let marks = by_page.get(page).map(Vec::as_slice).unwrap_or_default();
-        if !within_marks(band, marks, BAND_SLACK, budget)? {
+        if !within_marks(band, marks, BAND_SLACK + facts.overhang, budget)? {
             return refuse("an area was filled beyond the marks");
         }
     }

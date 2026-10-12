@@ -591,3 +591,196 @@ fn many_marks_finish_or_stop_within_the_deadline() {
     assert_eq!(applied.facts.areas, before.marked_areas);
     assert_eq!(applied.inspection.applied_areas.len(), before.marked_areas.len());
 }
+
+// ── R6b-54 N6, N11: ordinary redactions the server refused, delivered end to end ─────────────
+
+#[test]
+fn content_ending_with_an_unbalanced_save_is_redacted() {
+    // R6b-54 N6 (`unbalanced-tail-*`): the box is drawn after closing every save the content
+    // left open, so it is neither transformed, clipped nor translucent. (A page drawn with a
+    // blend mode other than /Normal stays refused, balanced or not: other viewers may blend it
+    // otherwise than the renders show.)
+    for (case, tail) in [("cm", "2 0 0 2 0 0 cm q"), ("clip", "0 0 10 10 re W n q"), ("alpha", "/G0 gs q"), ("deep", "q q 2 0 0 2 0 0 cm q")] {
+        let base = Spec { res: "/ExtGState << /G0 << /ca 0.05 >> >>".into(), ..Spec::new(&format!("{LINE}\n{KEEP}\n{tail}")) }.build();
+        let applied = apply(&base, &marked(&base, &[BOX])).unwrap_or_else(|error| panic!("{case}: {error:?}"));
+        assert!(found(&applied.bytes, SECRET).is_empty(), "{case}");
+        assert_eq!(applied.inspection.applied_areas.len(), 1, "{case}");
+    }
+}
+
+fn type3_font(widths: &str) -> Vec<u8> {
+    format!(
+        "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs << /a 7 0 R /b 8 0 R >> /Encoding << /Type /Encoding /Differences [97 /a /b] >> /FirstChar 97 /LastChar 98 /Widths [{widths}] >>"
+    )
+    .into_bytes()
+}
+
+#[test]
+fn type3_glyphs_under_a_mark_go_like_any_glyph() {
+    // R6b-54 N6 (`type3-plain`, `type3-only-under`): a Type 3 glyph under a mark is removed;
+    // a Type 3 font then showing nothing leaves the file with its glyph procedures.
+    let procedures =
+        || vec![type3_font("600 600"), stream("", b"600 0 d0 0 0 500 700 re f"), stream("", b"600 0 d0 0 0 300 300 re f 300 300 300 300 re f")];
+    let both = Spec {
+        fonts: "/T3 6 0 R".into(),
+        extras: procedures(),
+        ..Spec::new(&format!("BT /T3 12 Tf 20 150 Td (b) Tj ET\nBT /T3 12 Tf 150 250 Td (a) Tj ET\n{KEEP}"))
+    }
+    .build();
+    let applied = apply(&both, &marked(&both, &[BOX])).unwrap();
+    assert_eq!(applied.facts.glyphs, 1, "{:?}", applied.facts);
+    let only = Spec { fonts: "/T3 6 0 R".into(), extras: procedures(), ..Spec::new(&format!("BT /T3 12 Tf 20 150 Td (b) Tj ET\n{KEEP}")) }.build();
+    let applied = apply(&only, &marked(&only, &[BOX])).unwrap();
+    assert!(found(&applied.bytes, "300 300 300 300").is_empty());
+}
+
+/// A 240 × 40 grey image (its samples spell SECRETWORD) placed at 0,145 on 120 × 20 points, with
+/// `extra` entries and `second` as object 7.
+fn fine_image(extra: &str, second: Option<Vec<u8>>) -> Vec<u8> {
+    let pixels: Vec<u8> = SECRET.bytes().cycle().take(240 * 40).collect();
+    let image = stream(&format!("/Type /XObject /Subtype /Image /Width 240 /Height 40 /ColorSpace /DeviceGray /BitsPerComponent 8 {extra}"), &pixels);
+    let mut extras = vec![image];
+    extras.extend(second);
+    Spec {
+        res: "/XObject << /Im1 6 0 R >>".into(),
+        extras,
+        ..Spec::new(&format!("q 120 0 0 20 0 145 cm /Im1 Do Q\nBT /F1 12 Tf 20 150 Td (Alpha) Tj ET\n{KEEP}"))
+    }
+    .build()
+}
+
+#[test]
+fn masked_images_are_cleared_with_their_masks() {
+    // R6b-54 N6 (`fine-image-*`; redaction re-review I2): an image partly under a mark with a
+    // soft mask, a stencil mask, alternates or XMP is cleared, its mask with it, its copies of
+    // itself and its metadata gone.
+    let grey: Vec<u8> = SECRET.bytes().cycle().take(240 * 40).collect();
+    let soft_mask = stream("/Type /XObject /Subtype /Image /Width 240 /Height 40 /ColorSpace /DeviceGray /BitsPerComponent 8", &grey);
+    let stencil = stream("/Type /XObject /Subtype /Image /Width 240 /Height 40 /ImageMask true /BitsPerComponent 1", &vec![0x55u8; 30 * 40]);
+    let xmp = stream("/Type /Metadata /Subtype /XML", b"<x:xmpmeta>SECRETWORD</x:xmpmeta>");
+    for (case, extra, second) in [
+        ("none", "", None),
+        ("soft mask", "/SMask 7 0 R", Some(soft_mask.clone())),
+        ("stencil mask", "/Mask 7 0 R", Some(stencil)),
+        ("alternates", "/Alternates [<< /Image 7 0 R >>]", Some(soft_mask)),
+        ("metadata", "/Metadata 7 0 R", Some(xmp)),
+    ] {
+        let base = fine_image(extra, second);
+        let applied = apply(&base, &marked(&base, &[BOX])).unwrap_or_else(|error| panic!("{case}: {error:?}"));
+        assert!(applied.facts.images_cleared >= 1, "{case}: {:?}", applied.facts);
+        assert!(found(&applied.bytes, "xmpmeta").is_empty() && found(&applied.bytes, "Alternates").is_empty(), "{case}");
+    }
+}
+
+#[test]
+fn a_coarse_image_is_cleared_by_whole_pixels_and_the_overhang_reported() {
+    // R6b-54 N6 (`image-partly-none`, 6 × 10 pt pixels): every pixel a mark reaches is cleared
+    // whole, so the cleared pixels reach past the mark by less than a pixel; the self-check
+    // allows that much, and reports it.
+    let pixels: Vec<u8> = SECRET.bytes().cycle().take(40).collect();
+    let image = stream("/Type /XObject /Subtype /Image /Width 20 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 8", &pixels);
+    let base =
+        Spec { res: "/XObject << /Im1 6 0 R >>".into(), extras: vec![image], ..Spec::new(&format!("q 120 0 0 20 0 145 cm /Im1 Do Q\n{KEEP}")) }
+            .build();
+    let applied = apply(&base, &marked(&base, &[BOX])).unwrap();
+    assert_eq!(applied.facts.images_cleared, 1, "{:?}", applied.facts);
+    assert!(applied.facts.overhang > 0.0 && applied.facts.overhang <= 10.0, "{:?}", applied.facts);
+    // Every sample a mark reaches is black.
+    let doc = pdfcraft_cos::Document::open(Arc::new(applied.bytes.clone())).unwrap();
+    let cleared: Vec<Vec<u8>> = doc
+        .object_numbers()
+        .into_iter()
+        .filter_map(|num| match &*doc.try_get(num).ok()? {
+            pdfcraft_cos::Object::Stream(s) if s.dict.name(b"Subtype") == Some(b"Image") => s.decoded().ok(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(cleared.len(), 1);
+    // Columns 2–18 (x 6–114 pt) reach the mark (x 16–112); both rows reach it (y 145–165).
+    for row in 0..2 {
+        for column in 0..20 {
+            let black = cleared[0][row * 20 + column] == 0;
+            assert_eq!(black, (2..19).contains(&column), "row {row} column {column}");
+        }
+    }
+}
+
+fn image_in(colour_space: &str, extra: &str, samples: Vec<u8>, width: u32) -> Vec<u8> {
+    let image =
+        stream(&format!("/Type /XObject /Subtype /Image /Width {width} /Height 2 /ColorSpace {colour_space} /BitsPerComponent 8 {extra}"), &samples);
+    Spec { res: "/XObject << /Im1 6 0 R >>".into(), extras: vec![image], ..Spec::new(&format!("q 120 0 0 20 0 145 cm /Im1 Do Q\n{KEEP}")) }.build()
+}
+
+#[test]
+fn cleared_samples_are_the_colour_space_s_black() {
+    // R6b-54 N11: cleared samples are black in the image's colour space: 0 in grey and RGB,
+    // 0 0 0 1 in CMYK, the palette's darkest entry in an indexed space, and through /Decode.
+    let first_cleared = |bytes: &[u8], components: usize| -> Vec<u8> {
+        let doc = pdfcraft_cos::Document::open(Arc::new(bytes.to_vec())).unwrap();
+        for num in doc.object_numbers() {
+            if let Ok(object) = doc.try_get(num)
+                && let pdfcraft_cos::Object::Stream(s) = &*object
+                && s.dict.name(b"Subtype") == Some(b"Image")
+            {
+                let data = s.decoded().unwrap();
+                // Column 10 (x 60 pt) lies under the mark.
+                return data[10 * components..11 * components].to_vec();
+            }
+        }
+        panic!("no image");
+    };
+    let cmyk = image_in("/DeviceCMYK", "", vec![40u8; 20 * 2 * 4], 20);
+    let applied = apply(&cmyk, &marked(&cmyk, &[BOX])).unwrap();
+    assert_eq!(first_cleared(&applied.bytes, 4), vec![0, 0, 0, 255]);
+    let inverted = image_in("/DeviceGray", "/Decode [1 0]", vec![40u8; 20 * 2], 20);
+    let applied = apply(&inverted, &marked(&inverted, &[BOX])).unwrap();
+    assert_eq!(first_cleared(&applied.bytes, 1), vec![255]);
+    let indexed = image_in("[/Indexed /DeviceRGB 2 <FFFFFF 102030 808080>]", "", vec![0u8; 20 * 2], 20);
+    let applied = apply(&indexed, &marked(&indexed, &[BOX])).unwrap();
+    assert_eq!(first_cleared(&applied.bytes, 1), vec![1]);
+    // A space without a black the redactor can write is refused by its reason.
+    let separation = image_in("[/Separation /Spot /DeviceGray << /FunctionType 2 /Domain [0 1] /C0 [1] /C1 [0] /N 1 >>]", "", vec![40u8; 20 * 2], 20);
+    assert_eq!(apply(&separation, &marked(&separation, &[BOX])).map(|_| ()), Err(ApplyError::Refused(Refusal::ImageNotClearable)));
+}
+
+#[test]
+fn a_jpeg_partly_under_a_mark_is_refused_by_its_reason() {
+    // R6b-54 N6 (`jpeg-partly`): the redactor does not re-encode JPEG data, so an image partly
+    // under a mark it cannot clear is refused as such (never removed whole, which would change
+    // what shows outside the mark).
+    let pixels: Vec<u8> = (0..64 * 16).map(|i| (i % 251) as u8).collect();
+    let mut jpeg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 85).encode(&pixels, 64, 16, image::ExtendedColorType::L8).unwrap();
+    let image = stream("/Type /XObject /Subtype /Image /Width 64 /Height 16 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /DCTDecode", &jpeg);
+    let base =
+        Spec { res: "/XObject << /Im1 6 0 R >>".into(), extras: vec![image], ..Spec::new(&format!("q 120 0 0 20 0 145 cm /Im1 Do Q\n{KEEP}")) }
+            .build();
+    assert_eq!(apply(&base, &marked(&base, &[BOX])).map(|_| ()), Err(ApplyError::Refused(Refusal::ImageNotClearable)));
+}
+
+#[test]
+fn tiling_patterns_and_soft_masks_under_a_mark_are_refused_by_their_reason() {
+    // R6b-54 N6 (redaction re-review I1; `hatch-background`, `vignette-softmask`): still
+    // refused, with the reason the host words.
+    let hatch = Spec {
+        res: "/Pattern << /P1 6 0 R >>".into(),
+        extras: vec![stream("/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 10 10] /XStep 10 /YStep 10", b"0.9 g 0 0 5 5 re f")],
+        ..Spec::new(&format!("q /Pattern cs /P1 scn 0 0 200 300 re f Q\n{LINE}\n{KEEP}"))
+    }
+    .build();
+    assert_eq!(apply(&hatch, &marked(&hatch, &[BOX])).map(|_| ()), Err(ApplyError::Refused(Refusal::PatternOrMaskUnderMark)));
+    let vignette = Spec {
+        res: "/ExtGState << /GS1 << /SMask << /S /Luminosity /G 6 0 R >> >> >>".into(),
+        extras: vec![stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 200 300] /Group << /S /Transparency /CS /DeviceGray >>",
+            b"0.5 g 0 0 200 300 re f",
+        )],
+        ..Spec::new(&format!("q /GS1 gs 0 0 1 rg 0 0 200 300 re f Q\n{LINE}\n{KEEP}"))
+    }
+    .build();
+    assert_eq!(apply(&vignette, &marked(&vignette, &[BOX])).map(|_| ()), Err(ApplyError::Refused(Refusal::PatternOrMaskUnderMark)));
+    // Every reason has its own stable code, and the list is closed.
+    let codes: std::collections::BTreeSet<&str> = Refusal::ALL.iter().map(|refusal| refusal.code()).collect();
+    assert_eq!(codes.len(), Refusal::ALL.len());
+    assert!(codes.iter().all(|code| ApplyError::CODES.contains(code)));
+}

@@ -281,6 +281,10 @@ pub struct Report {
     /// Embed build (R6b-55): the form fields removed whole (a widget under a mark), by full
     /// name.
     pub removed_fields: Vec<String>,
+    /// Embed build (R6b-54, N6): the most the cleared pixels of an image reach past the marks,
+    /// in user space: the larger side of the largest cleared image pixel (0 without one). Every
+    /// pixel a mark reaches is cleared whole, so a coarse image's cleared pixels overhang it.
+    pub overhang: f64,
 }
 
 /// Embed build (P6-33, R6b-50): how marks are applied.
@@ -507,6 +511,8 @@ fn apply_chosen(doc: &mut Document, chosen_by: &dyn Fn(&Mark) -> bool, options: 
     // The pages as they are before any is changed: each page is changed only while it is the
     // one being redacted, so its dictionary here is current then.
     let pages_before = pdfcraft_model::pages(doc);
+    // Embed build (R6b-54, N6): boxes over cleared image pixels reaching past the marks.
+    let mut overhang_boxes: Vec<(usize, [f64; 4])> = Vec::new();
 
     for &pi in &by_page {
         let Some(page) = pages_before.get(pi).cloned() else { return Err(RedactError::Unreadable(pi + 1)) };
@@ -522,6 +528,15 @@ fn apply_chosen(doc: &mut Document, chosen_by: &dyn Fn(&Mark) -> bool, options: 
             scope.exact = options.exact;
             let out = process(doc, &mut scope, &data, &resources, pdfcraft_content::Matrix::IDENTITY);
             removed_text.push_str(&scope.removed_text);
+            // Embed build (R6b-54, N6): for a host, the cleared pixels reaching past the marks
+            // are boxed too, black whatever the image's colour space renders its black as.
+            if options.black {
+                for bounds in std::mem::take(&mut scope.cleared) {
+                    if bounds.iter().all(|v| v.is_finite()) && !rects.iter().any(|r| pdfcraft_content::contains(*r, bounds, 0.01)) {
+                        overhang_boxes.push((pi, bounds));
+                    }
+                }
+            }
             (out, scope.exhausted())
         };
         // Embed build (follow-up 8 audit): past the work bound, or nested too deep.
@@ -719,7 +734,19 @@ fn apply_chosen(doc: &mut Document, chosen_by: &dyn Fn(&Mark) -> bool, options: 
     // 4. The boxes.
     for &pi in &by_page {
         let page_marks: Vec<&Mark> = chosen.iter().copied().filter(|m| m.page == pi).collect();
-        let content = overlay_content(&page_marks);
+        let mut content = overlay_content(&page_marks);
+        let extra: Vec<[f64; 4]> = overhang_boxes.iter().filter(|(on, _)| *on == pi).map(|(_, bounds)| *bounds).collect();
+        if !extra.is_empty() {
+            let mut box_ops =
+                vec![pdfcraft_content::Op::new("q", vec![]), pdfcraft_content::Op::new("rg", vec![Object::Int(0), Object::Int(0), Object::Int(0)])];
+            for r in &extra {
+                box_ops
+                    .push(pdfcraft_content::Op::new("re", [r[0], r[1], r[2] - r[0], r[3] - r[1]].into_iter().map(pdfcraft_content::num).collect()));
+                box_ops.push(pdfcraft_content::Op::new("f", vec![]));
+            }
+            box_ops.push(pdfcraft_content::Op::new("Q", vec![]));
+            content.extend_from_slice(&pdfcraft_content::serialize_ops(&box_ops));
+        }
         if !content.is_empty() {
             pdfcraft_edit::stamp(doc, pi, "Redaction", content)?;
         }

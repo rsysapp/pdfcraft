@@ -343,10 +343,41 @@ fn place_tagged(doc: &mut Document, page: &pdfcraft_model::Page, tag: &str, cont
             list.insert(split, open);
             list.push(close);
         }
+        // Embed build (R6b-54, N6): content that leaves saves open (a trailing `q`, common in
+        // the wild) would have the wrapper's `Q` pop its own save, and the mark drawn
+        // transformed, clipped or translucent: every save left open is closed before it.
+        let open = open_saves(doc, &list);
+        if open > 0 {
+            let closing = b"Q\n".repeat(open);
+            list.push(Object::Ref(doc.add(Object::Stream(Stream::from_raw(tagged("Wrap"), closing)))));
+        }
         list.push(mark);
     }
     doc.update_dict(page.obj, |d| d.set(b"Contents".to_vec(), Object::Array(list)))?;
     Ok(())
+}
+
+/// Embed build (R6b-54, N6): how many graphics-state saves (`q`) the content streams `list`
+/// leave open, read as one stream (a `Q` with nothing saved restores nothing).
+fn open_saves(doc: &Document, list: &[Object]) -> usize {
+    let mut joined = Vec::new();
+    for item in list {
+        if let Object::Stream(stream) = &*doc.resolve(item)
+            && let Ok(data) = stream.decoded()
+        {
+            joined.extend_from_slice(&data);
+            joined.push(b'\n');
+        }
+    }
+    let mut depth = 0usize;
+    for op in pdfcraft_content::parse(&joined).ops {
+        if op.is("q") {
+            depth += 1;
+        } else if op.is("Q") {
+            depth = depth.saturating_sub(1);
+        }
+    }
+    depth
 }
 
 /// Draw `content` on top of a page (0-based) as permanent page content, with standard Helvetica

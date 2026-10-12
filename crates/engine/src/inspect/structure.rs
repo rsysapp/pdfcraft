@@ -559,11 +559,22 @@ pub(crate) struct ImageUse {
 #[derive(Debug)]
 pub(crate) struct ImageInfo {
     pub obj: ObjRef,
-    /// The dictionary without its filters, decode parameters and length: what the samples mean.
+    /// The dictionary without its filters, decode parameters and length, its masks (compared
+    /// sample by sample on their own) and what a redaction takes off a cleared copy (follow-up
+    /// 9, R6b-54: compared as [`ImageInfo::extras`]): what the samples mean.
     pub meaning: Digest,
     pub width: u32,
     pub height: u32,
+    /// Follow-up 9 (R6b-54, N6): its soft mask (`/SMask`) and its stencil mask (`/Mask`, an
+    /// image mask), by object; a colour-key `/Mask` is part of `meaning`.
+    pub masks: [Option<ObjRef>; 2],
+    /// Follow-up 9 (R6b-54, N6): its alternates, XMP packet, private and prepress data, which a
+    /// redaction may only take away (`None`: it has none).
+    pub extras: Option<Digest>,
 }
+
+/// Follow-up 9 (R6b-54, N6): what a redaction takes off a cleared image's copy.
+pub(crate) const IMAGE_EXTRAS: [&[u8]; 5] = [b"Alternates", b"Metadata", b"PieceInfo", b"LastModified", b"OPI"];
 
 /// An image as both readers name it: an image XObject by its object, or an inline image (which
 /// the two readers delimit each their own way: counted, not identified).
@@ -2418,8 +2429,40 @@ impl<'d, 'b> Reader<'d, 'b> {
 
     /// Embed build (follow-up 7 audit, item 7): a resource entry by its category and content.
     fn resource_digest(&mut self, kind: &[u8], entry: &Object) -> Result<Digest, Fail> {
-        let digest = self.digest(entry)?;
+        let digest = if kind == b"Font" { self.font_digest(entry)? } else { self.digest(entry)? };
         Ok(sha256(&[b"resource", kind, &digest]))
+    }
+
+    /// Follow-up 9 (R6b-54, N6): a font by its content. A Type 3 font's glyph procedures are
+    /// content streams, keyed by their data as `pdfcraft_cos` decodes them strictly, whether or
+    /// not hayro drew a glyph of them in this file: a redaction that removes a font's last
+    /// glyph drawn from one procedure leaves that procedure undrawn, and its key may not change
+    /// for that (where hayro draws one, the readers' decodings are compared elsewhere). Any
+    /// other font, by [`Reader::digest`].
+    fn font_digest(&mut self, entry: &Object) -> Result<Digest, Fail> {
+        let resolved = self.resolve(entry)?;
+        let Object::Dict(font) = &*resolved else { return self.digest(entry) };
+        if font.name(b"Subtype") != Some(b"Type3") {
+            return self.digest(entry);
+        }
+        let mut parts = vec![b"type3 font".to_vec(), self.digest_without(font, &[b"CharProcs"])?.to_vec()];
+        let procedures = self.dict_of(font.get(b"CharProcs"), "/CharProcs")?.unwrap_or_default();
+        let mut names: Vec<(&Vec<u8>, &Object)> = procedures.iter().collect();
+        names.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, procedure) in names {
+            self.budget.tick()?;
+            let Object::Ref(r) = procedure else { return Err(read_error("a Type 3 glyph procedure is not a stream")) };
+            let obj = self.get(*r)?;
+            let Object::Stream(stream) = &*obj else { return Err(read_error("a Type 3 glyph procedure is not a stream")) };
+            let kept: Dict =
+                stream.dict.iter().filter(|(key, _)| !CODING_KEYS.contains(&key.as_slice())).map(|(k, v)| (k.clone(), v.clone())).collect();
+            parts.push((name.len() as u64).to_le_bytes().to_vec());
+            parts.push(name.clone());
+            parts.push(self.digest(&Object::Dict(kept))?.to_vec());
+            parts.push(self.decoded_digest(*r, stream)?.to_vec());
+        }
+        let parts: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+        Ok(sha256(&parts))
     }
 
     fn use_resource(&mut self, kind: &[u8], entry: &Object, drawn: &mut Drawn) -> Result<(), Fail> {
@@ -2613,7 +2656,7 @@ impl<'d, 'b> Reader<'d, 'b> {
         if dict.name(b"Subtype") != Some(b"Type3") {
             return Ok(None);
         }
-        let font_digest = self.digest(font)?;
+        let font_digest = self.font_digest(font)?;
         if let Some(found) = self.type3.get(&(font_digest, *key)) {
             return Ok(Some(*found));
         }
@@ -2738,8 +2781,17 @@ impl<'d, 'b> Reader<'d, 'b> {
         let side = |value: Option<i64>| u32::try_from(value.unwrap_or(0).max(0)).unwrap_or(u32::MAX);
         let width = side(self.int_of(dict.get(b"Width"))?);
         let height = side(self.int_of(dict.get(b"Height"))?);
-        let meaning = self.digest_without(dict, &[b"Filter", b"DecodeParms", b"Length", b"DL"])?;
-        let info = Arc::new(ImageInfo { obj: r, meaning, width, height });
+        let stream_mask = matches!(dict.get(b"Mask"), Some(Object::Ref(_)));
+        let mut left_out: Vec<&[u8]> = vec![b"Filter", b"DecodeParms", b"Length", b"DL", b"SMask"];
+        if stream_mask {
+            left_out.push(b"Mask");
+        }
+        left_out.extend(IMAGE_EXTRAS);
+        let meaning = self.digest_without(dict, &left_out)?;
+        let masks = [dict.get(b"SMask").and_then(Object::as_ref), if stream_mask { dict.get(b"Mask").and_then(Object::as_ref) } else { None }];
+        let extras: Dict = dict.iter().filter(|(key, _)| IMAGE_EXTRAS.contains(&key.as_slice())).map(|(k, v)| (k.clone(), v.clone())).collect();
+        let extras = if extras.is_empty() { None } else { Some(self.digest(&Object::Dict(extras))?) };
+        let info = Arc::new(ImageInfo { obj: r, meaning, width, height, masks, extras });
         self.images.insert(r, info.clone());
         Ok(info)
     }
