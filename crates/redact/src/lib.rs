@@ -329,11 +329,6 @@ pub struct Options {
 /// Embed build (R6b-50): what ends a run of removed glyphs in the removed text.
 pub(crate) const RUN_END: char = '\u{1}';
 
-fn rect_of(doc: &Document, o: Option<&Object>) -> Option<[f64; 4]> {
-    let v: Vec<f64> = doc.resolve(o?).as_array()?.iter().filter_map(|x| doc.resolve(x).as_f64()).collect();
-    (v.len() == 4 && v.iter().all(|x| x.is_finite())).then(|| [v[0].min(v[2]), v[1].min(v[3]), v[0].max(v[2]), v[1].max(v[3])])
-}
-
 /// Embed build (follow-up 9 audit): `/Rect` as the inspector reads it: an array of exactly four
 /// finite numbers written in place, normalised.
 fn strict_rect(doc: &Document, o: Option<&Object>) -> Option<[f64; 4]> {
