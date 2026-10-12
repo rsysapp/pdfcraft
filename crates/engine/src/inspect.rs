@@ -1631,6 +1631,40 @@ fn plain_entry(key: &[u8], value: &pdfcraft_cos::Object) -> bool {
     }
 }
 
+/// R6b-48: every object reached from the trailer's `/Root` and `/Info` through references,
+/// each read (one that cannot be read is refused, never passed over: what it holds is each
+/// reader's guess), and none that no fact read (`was_read`) holding text or data.
+pub(crate) fn reached_objects(doc: &Document, was_read: &dyn Fn(u32) -> bool, budget: &mut Budget) -> Result<BTreeSet<u32>, Fail> {
+    let mut reached: BTreeSet<u32> = BTreeSet::new();
+    let mut todo: Vec<pdfcraft_cos::Object> = [&b"Root"[..], b"Info"].iter().filter_map(|key| doc.trailer().get(key).cloned()).collect();
+    while let Some(object) = todo.pop() {
+        budget.tick()?;
+        match object {
+            pdfcraft_cos::Object::Ref(r) => {
+                if !reached.insert(r.num) {
+                    continue;
+                }
+                budget.object()?;
+                // Follow-up 7 audit (item 5): an object reached that cannot be read is not
+                // passed over: what it holds is each reader's guess.
+                let found = doc.try_get(r.num).map_err(|_| Fail::Read(format!("the rewrite holds object {}, which cannot be read", r.num)))?;
+                // Follow-up 7 audit (item 4): reached is not compared. An object reached that no
+                // fact read (only through an entry no comparison reads) may hold nothing but
+                // references, or it could carry what the rewrite took away.
+                if !was_read(r.num) && carries_data(&found, budget)? {
+                    return Err(Fail::Read(format!("the rewrite holds object {}, which no comparison reads and which holds text or data", r.num)));
+                }
+                todo.push((*found).clone());
+            }
+            pdfcraft_cos::Object::Array(items) => todo.extend(items),
+            pdfcraft_cos::Object::Dict(dict) => todo.extend(dict.iter().map(|(_, value)| value.clone())),
+            pdfcraft_cos::Object::Stream(stream) => todo.extend(stream.dict.iter().map(|(_, value)| value.clone())),
+            _ => {}
+        }
+    }
+    Ok(reached)
+}
+
 /// R6b-48: every object a rewrite holds must be reachable from the trailer's `/Root` or `/Info`
 /// through references (an object stream through the objects stored in it), but for its own
 /// cross-reference streams and objects that are null; and a rewrite has one cross-reference section, so no earlier
@@ -1658,33 +1692,7 @@ fn check_rewrite_reachable(
         _ => return Err(Fail::Read("the base could not be read again to check the rewrite".into())),
     };
     account_bytes(doc, 0, None, &base_doc, budget)?;
-    let mut reached: BTreeSet<u32> = BTreeSet::new();
-    let mut todo: Vec<pdfcraft_cos::Object> = [&b"Root"[..], b"Info"].iter().filter_map(|key| doc.trailer().get(key).cloned()).collect();
-    while let Some(object) = todo.pop() {
-        budget.tick()?;
-        match object {
-            pdfcraft_cos::Object::Ref(r) => {
-                if !reached.insert(r.num) {
-                    continue;
-                }
-                budget.object()?;
-                // Follow-up 7 audit (item 5): an object reached that cannot be read is not
-                // passed over: what it holds is each reader's guess.
-                let found = doc.try_get(r.num).map_err(|_| Fail::Read(format!("the rewrite holds object {}, which cannot be read", r.num)))?;
-                // Follow-up 7 audit (item 4): reached is not compared. An object reached that no
-                // fact read (only through an entry no comparison reads) may hold nothing but
-                // references, or it could carry what the rewrite took away.
-                if !known.was_read(r.num) && carries_data(&found, budget)? {
-                    return Err(Fail::Read(format!("the rewrite holds object {}, which no comparison reads and which holds text or data", r.num)));
-                }
-                todo.push((*found).clone());
-            }
-            pdfcraft_cos::Object::Array(items) => todo.extend(items),
-            pdfcraft_cos::Object::Dict(dict) => todo.extend(dict.iter().map(|(_, value)| value.clone())),
-            pdfcraft_cos::Object::Stream(stream) => todo.extend(stream.dict.iter().map(|(_, value)| value.clone())),
-            _ => {}
-        }
-    }
+    let reached = reached_objects(doc, &|num| known.was_read(num), budget)?;
     // Object streams holding a reached object are reached through it.
     let mut containers: BTreeSet<u32> = BTreeSet::new();
     for num in doc.object_numbers() {

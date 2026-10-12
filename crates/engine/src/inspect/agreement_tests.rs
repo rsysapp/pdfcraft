@@ -2299,6 +2299,32 @@ fn an_unreadable_object_in_an_object_stream_the_walk_reaches_is_refused() {
     // the walk's refusal stands behind that).
     let message = refused_against(&base, &edited);
     assert!(message.contains("object 7, which cannot be read") || message.contains("object stream"), "{message}");
+    // Follow-up 9 (R6b-55, M2): the byte accounting reads every listed object strictly (in the
+    // file and in object streams) before the walk, so no object the walk reaches is unreadable
+    // through `inspect`; the walk's own refusal is pinned on its own below.
+}
+
+#[test]
+fn the_walk_refuses_an_object_it_cannot_read() {
+    // Follow-up 9 (R6b-55, M2): the reachability walk, given an object it cannot read, refuses
+    // it rather than passing over it (a mutant turning the refusal into `continue` fails here).
+    let mut b = Builder::new();
+    b.object(1, b"<< /Type /Catalog /Pages 2 0 R /Extra 3 0 R >>");
+    b.object(2, b"<< /Type /Pages /Kids [] /Count 0 >>");
+    b.object(3, b"<< /Hidden (SECRET X >>");
+    let at = b.out.len();
+    b.out.extend_from_slice(
+        format!("xref\n0 4\n0000000000 65535 f \n{:010} 00000 n \n{:010} 00000 n \n{:010} 00000 n \n", b.offsets[&1], b.offsets[&2], b.offsets[&3])
+            .as_bytes(),
+    );
+    b.out.extend_from_slice(format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{at}\n%%EOF\n").as_bytes());
+    let doc = pdfcraft_cos::Document::open(std::sync::Arc::new(b.out)).unwrap();
+    assert!(doc.try_get(3).is_err(), "the fixture's object 3 must not read");
+    let mut budget = Budget::new(Limits::default());
+    match super::reached_objects(&doc, &|_| true, &mut budget) {
+        Err(Fail::Read(message)) => assert!(message.contains("object 3, which cannot be read"), "{message}"),
+        other => panic!("{other:?}"),
+    }
 }
 
 // ── follow-up 8 (R6b-51, I1): every byte of a rewrite or an update is listed and strict ─────
