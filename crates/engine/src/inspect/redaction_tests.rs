@@ -1543,23 +1543,38 @@ fn xmp_on_an_appearance_goes_too_and_the_output_keeps_none() {
     assert_eq!(applied.facts.metadata_removed, 1, "{:?}", applied.facts);
 }
 
-#[test]
-fn a_bookmark_title_read_as_a_viewer_reads_it_is_matched() {
-    // Audit (follow-up 9, parser differential): a title in UTF-16 little-endian with its mark,
-    // which pdf.js shows as text, is read as such, never as PDFDocEncoding bytes that hold no
-    // word: the copy is cleared.
-    let title = format!("<FFFE{}>", "Andi".encode_utf16().flat_map(u16::to_le_bytes).map(|byte| format!("{byte:02X}")).collect::<String>());
-    let base = Spec {
+/// A page showing "Andi" under the mark, with one bookmark titled `title` (written as is).
+fn titled(title: &str) -> Vec<u8> {
+    Spec {
         cat: "/Outlines 6 0 R".into(),
-        extras: vec![
-            b"<< /Type /Outlines /First 7 0 R /Last 7 0 R /Count 1 >>".to_vec(),
-            format!("<< /Title {title} /Parent 6 0 R /Dest [3 0 R /Fit] >>").into_bytes(),
-        ],
+        extras: vec![b"<< /Type /Outlines /First 7 0 R /Last 7 0 R /Count 1 >>".to_vec(), format!("<< /Title {title} /Parent 6 0 R /Dest [3 0 R /Fit] >>").into_bytes()],
         ..Spec::new(&format!("BT /F1 12 Tf 20 150 Td (Andi) Tj ET\n{KEEP}"))
     }
-    .build();
-    let applied = apply(&base, &marked(&base, &[BOX])).unwrap();
-    assert_eq!(applied.facts.bookmarks_cleared, 1, "{:?}", applied.facts);
+    .build()
+}
+
+#[test]
+fn a_bookmark_title_is_read_as_the_viewers_read_it_or_refused() {
+    // Audit (follow-up 9, parser differential): a title is read as pdf.js reads it and as the
+    // standard (PDFium, this file's reader) reads it; where the two agree the copy is matched on
+    // that text, where they disagree the redaction is refused, never matched on a guess.
+    let utf16 = |text: &str, le: bool| -> String {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let bytes: Vec<u8> = units.iter().flat_map(|unit| if le { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect();
+        format!("<{}{}>", if le { "FFFE" } else { "FEFF" }, bytes.iter().map(|byte| format!("{byte:02X}")).collect::<String>())
+    };
+    // Agreed: a null and a soft hyphen inside the name are shown as nothing.
+    for title in [utf16("A\u{0}ndi", false), "<41AD6E6469>".to_string()] {
+        let applied = apply(&titled(&title), &marked(&titled(&title), &[BOX])).unwrap_or_else(|error| panic!("{title}: {error:?}"));
+        assert_eq!(applied.facts.bookmarks_cleared, 1, "{title}: {:?}", applied.facts);
+    }
+    // Disagreed: UTF-16 little-endian (pdf.js reads it; the standard reads PDFDocEncoding), an
+    // odd UTF-16 length or an unpaired surrogate (pdf.js falls back to PDFDocEncoding), a byte
+    // the two PDFDocEncoding tables read otherwise (0x9F).
+    for title in [utf16("Andi", true), "<FEFF0041006E0064006900>".to_string(), "<FEFFD800004100>".to_string(), "<41 9F 42>".to_string()] {
+        let base = titled(&title);
+        assert_eq!(apply(&base, &marked(&base, &[BOX])).map(|_| ()), Err(ApplyError::Refused(Refusal::CopyNotClearable)), "{title}");
+    }
 }
 
 #[test]

@@ -51,38 +51,18 @@ const STOP_WORDS: [&str; 46] = [
 /// lower case; capitalised, a name, matched like any token.
 const NAME_LIKE: [&str; 3] = ["dan", "ada", "may"];
 
-/// Characters a viewer does not show, which must not split a word: the soft hyphen, zero-width
-/// spaces and joiners, directional marks, the word joiner and its kin, the byte-order mark.
+/// Characters a viewer does not show, which must not split a word: control characters (a null
+/// in a UTF-16 string among them; not the white space a viewer shows), the soft hyphen,
+/// zero-width spaces and joiners, directional marks, the word joiner and its kin, the byte-order
+/// mark.
 fn invisible(c: char) -> bool {
-    matches!(c, '\u{ad}' | '\u{34f}' | '\u{180e}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206f}' | '\u{feff}')
+    (c.is_control() && !matches!(c, '\t' | '\n' | '\r' | '\u{c}'))
+        || matches!(c, '\u{ad}' | '\u{34f}' | '\u{180e}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206f}' | '\u{feff}')
 }
 
-/// R6b-56: a PDF text string decoded by its own encoding (UTF-16BE, UTF-16LE or UTF-8 after their marks,
-/// else PDFDocEncoding), its language marks (U+001B, a code, U+001B, which viewers do not show)
-/// taken out. `None` when it cannot be: an odd UTF-16 length or an unpaired surrogate, bad
-/// UTF-8, or a byte PDFDocEncoding gives no character (0x7F, 0x9F, 0xAD).
-pub(crate) fn decode_text(bytes: &[u8]) -> Option<String> {
-    let text = if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
-        if rest.len() % 2 != 0 {
-            return None;
-        }
-        let units = rest.as_chunks::<2>().0.iter().map(|pair| u16::from_be_bytes(*pair));
-        char::decode_utf16(units).collect::<Result<String, _>>().ok()?
-    } else if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
-        // Audit (follow-up 9): UTF-16 little-endian with its mark, which pdf.js shows as text.
-        if rest.len() % 2 != 0 {
-            return None;
-        }
-        let units = rest.as_chunks::<2>().0.iter().map(|pair| u16::from_le_bytes(*pair));
-        char::decode_utf16(units).collect::<Result<String, _>>().ok()?
-    } else if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
-        String::from_utf8(rest.to_vec()).ok()?
-    } else {
-        if bytes.iter().any(|byte| matches!(byte, 0x7F | 0x9F | 0xAD)) {
-            return None;
-        }
-        PdfString::literal(bytes.to_vec()).to_text()
-    };
+/// The language escapes of a text string (U+001B, a code, U+001B) taken out, as pdf.js takes
+/// them (`\x1b[^\x1b]*(?:\x1b|$)`: one left open runs to the end).
+fn without_escapes(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut inside = false;
     for c in text.chars() {
@@ -92,10 +72,57 @@ pub(crate) fn decode_text(bytes: &[u8]) -> Option<String> {
             out.push(c);
         }
     }
-    if inside {
-        return None;
+    out
+}
+
+/// A text string as pdf.js reads it (`stringToPDFString`): after a UTF-16BE, UTF-16LE or UTF-8
+/// mark, decoded strictly, falling back to its PDFDocEncoding table when that fails; its
+/// table leaves bytes it does not translate (0x9F) as they are.
+fn as_pdf_js_reads(bytes: &[u8]) -> String {
+    let marked: Option<Option<String>> = if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        Some(
+            (rest.len() % 2 == 0)
+                .then(|| char::decode_utf16(rest.as_chunks::<2>().0.iter().map(|p| u16::from_be_bytes(*p))).collect::<Result<String, _>>().ok())
+                .flatten(),
+        )
+    } else if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        Some(
+            (rest.len() % 2 == 0)
+                .then(|| char::decode_utf16(rest.as_chunks::<2>().0.iter().map(|p| u16::from_le_bytes(*p))).collect::<Result<String, _>>().ok())
+                .flatten(),
+        )
+    } else if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        Some(String::from_utf8(rest.to_vec()).ok())
+    } else {
+        None
+    };
+    if let Some(Some(text)) = marked {
+        return without_escapes(&text);
     }
-    Some(out)
+    let text: String = bytes
+        .iter()
+        .map(|&byte| match PdfString::literal(vec![byte]).to_text().chars().next() {
+            Some('\u{fffd}') | None => char::from(byte),
+            Some(c) => c,
+        })
+        .collect();
+    without_escapes(&text)
+}
+
+/// A text string as the standard reads it (ISO 32000-2 §7.9.2.2; PDFium and this file's own
+/// reader): UTF-16BE or UTF-8 after its mark, else PDFDocEncoding, bad sequences replaced.
+fn as_the_standard_reads(bytes: &[u8]) -> String {
+    without_escapes(&PdfString::literal(bytes.to_vec()).to_text())
+}
+
+/// R6b-56, audit (follow-up 9): a PDF text string decoded as viewers decode it: as pdf.js reads
+/// it and as the standard reads it (see above). `None` when the two read it otherwise (an odd
+/// UTF-16 length, an unpaired surrogate, bad UTF-8 after its mark, UTF-16LE, a byte the two
+/// PDFDocEncoding tables read otherwise): what a viewer shows cannot be known, so the redaction is
+/// refused rather than matched on a guess.
+pub(crate) fn decode_text(bytes: &[u8]) -> Option<String> {
+    let (pdf_js, standard) = (as_pdf_js_reads(bytes), as_the_standard_reads(bytes));
+    (pdf_js == standard).then_some(standard)
 }
 
 /// A name's bytes as text (destination names): UTF-8 when they are, else as a text string.
