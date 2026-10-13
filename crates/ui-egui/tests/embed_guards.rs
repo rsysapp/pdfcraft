@@ -110,7 +110,7 @@ use pdfcraft_ui_egui::{Dialog, LinkOrigin, OsEvent, PdfCraftApp, SaveTarget};
 /// The commands view mode runs (the embed module's own list, as the contract states it).
 const ALLOWED: &[&str] = &[
     "edit.find",
-    "view.layout.continuous",
+    "view.continuous",
     "view.layout.single",
     "view.layout.two_up",
     "view.layout.cover",

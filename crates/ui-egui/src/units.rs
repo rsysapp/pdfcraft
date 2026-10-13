@@ -68,6 +68,8 @@ impl Unit {
 
 /// The unit for a locale tag's region: `en_US.UTF-8`, `en-US`, `bg-BG`, `zh-Hans-CN`, `en_GB@euro`.
 /// `None` without a region (`C`, `POSIX`, `en`).
+// Embed build: unused on wasm32 (the wasm32 clippy gate).
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) fn unit_for_tag(tag: &str) -> Option<Unit> {
     let tag = tag.split(['.', '@']).next().unwrap_or_default();
     let region = tag.split(['-', '_']).skip(1).filter(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_alphabetic())).last()?;

@@ -245,6 +245,8 @@ struct AtomicRenderStats {
 }
 
 impl AtomicRenderStats {
+    // Embed build: unused on wasm32 (the wasm32 clippy gate).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     fn record_request(&self, req: RenderRequest) {
         self.render_requests.fetch_add(1, Ordering::Relaxed);
         if req.tile.is_some() {

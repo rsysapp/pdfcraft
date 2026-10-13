@@ -62,15 +62,16 @@ pub fn embedded() -> (Harness<'static, PdfCraftApp>, HostBridge) {
 pub fn embedded_with(prepared: bool) -> (Harness<'static, PdfCraftApp>, HostBridge) {
     let bridge = HostBridge::default();
     let app_bridge = bridge.clone();
-    let h = Harness::builder().with_size(egui::vec2(900.0, 700.0)).with_step_dt(1.0 / 60.0).build_eframe(move |cc| {
-        // Shortcut tooltips name the platform's keys ("Zoom in (⌘+)"): one platform for every
-        // test machine.
-        cc.egui_ctx.set_os(egui::os::OperatingSystem::Mac);
-        if prepared {
-            pdfcraft_ui_egui::embed::prepare_context(&cc.egui_ctx);
-        }
-        PdfCraftApp::embedded(app_bridge)
-    });
+    // Shortcut tooltips name the platform's keys ("Zoom in (⌘+)"): one platform for every test
+    // machine (kittest reports Nix unless told otherwise).
+    let h = Harness::builder().with_size(egui::vec2(900.0, 700.0)).with_step_dt(1.0 / 60.0).with_os(egui::os::OperatingSystem::Mac).build_eframe(
+        move |cc| {
+            if prepared {
+                pdfcraft_ui_egui::embed::prepare_context(&cc.egui_ctx);
+            }
+            PdfCraftApp::embedded(app_bridge)
+        },
+    );
     (h, bridge)
 }
 

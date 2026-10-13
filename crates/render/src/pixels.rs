@@ -26,6 +26,8 @@ impl Pixels {
     }
 
     /// Bytes the buffer holds allocated (its capacity), for memory budgets.
+    // Embed build: unused on wasm32 (the wasm32 clippy gate).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) fn byte_capacity(&self) -> usize {
         self.0.capacity().saturating_mul(4)
     }
