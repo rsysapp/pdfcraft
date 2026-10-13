@@ -43,6 +43,12 @@ pub const BRAND_LICENCE: &str = "LicenseRef-Storyteller-Trademark";
 
 pub const ADOBE_DATA_ALLOWED: &[(&str, &str)] = &[("hayro-cmap", "assets/cmaps.brotli"), ("hayro-interpret", "src/font/generated/metrics.rs")];
 
+/// First-party files on that same closed list: generated tables of Adobe-authored non-visual
+/// technical data we hold ourselves rather than through a dependency. Each still needs an
+/// `[[asset]]` entry with `adobe_data = true`, so its SHA-256 is checked and any change to the
+/// table has to be re-attested deliberately.
+pub const ADOBE_DATA_FILES: &[&str] = &["crates/fonts/src/std14.rs"];
+
 /// File extensions that count as assets wherever they appear in the repository.
 const ASSET_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "svg", "ico", "icns", "webp", "bmp", "tif", "tiff", "avif", "heic", "ttf", "otf", "ttc", "woff", "woff2", "pfb",
@@ -245,7 +251,7 @@ pub fn check(root: &Path, m: &Manifest, repo_files: &[String], lock: &BTreeSet<(
         if visual(&a.kind) && (mentions_adobe(&a.author) || mentions_adobe(&a.source) || mentions_adobe(&a.title)) {
             problems.push(format!("{}: {} from Adobe is forbidden (AGENTS.md §1.1)", a.path, a.kind));
         }
-        if a.adobe_data {
+        if a.adobe_data && !(ADOBE_DATA_FILES.contains(&a.path.as_str()) && a.kind == "data") {
             problems.push(format!("{}: adobe_data is only allowed for the closed list in AGENTS.md §1.1", a.path));
         }
         match std::fs::read(root.join(&a.path)) {
@@ -336,7 +342,8 @@ fn fetch_verified(url: &str, path: &Path, sha256: &str) -> Result<()> {
 }
 
 /// `cargo xtask models [DIR]`: fetch the OCR models (`kind = "model"`) into `assets/models/` (git-ignored),
-/// where the app and tests look for them.
+/// where the app and tests look for them. Each comes with its licence (`<file>.LICENCE.txt`), and
+/// `ATTRIBUTION.txt` credits them all, so the release packages can ship the directory as it is.
 pub fn models(args: &[String]) -> Result<()> {
     let root = root();
     let m = load(&root)?;
@@ -344,7 +351,21 @@ pub fn models(args: &[String]) -> Result<()> {
     for p in fetch_all(&m, &dir, "model")? {
         println!("models: {}", p.display());
     }
+    std::fs::write(dir.join("ATTRIBUTION.txt"), models_attribution(&m))?;
     Ok(())
+}
+
+/// The credits shipped beside the models (their licences require attribution).
+fn models_attribution(m: &Manifest) -> String {
+    let mut s = String::from("PdfCraft's text recognition (Scan & OCR) uses these models, unmodified.\n");
+    for f in m.fetched.iter().filter(|f| f.kind == "model") {
+        let _ = write!(
+            s,
+            "\n{}\n  {}\n  by {}\n  from {}\n  licence: {} ({}; full text in {}.LICENCE.txt)\n",
+            f.file, f.title, f.author, f.source, f.licence, f.licence_url, f.file
+        );
+    }
+    s
 }
 
 /// ATTRIBUTION.md, generated from the manifest.
@@ -416,6 +437,18 @@ pub fn render_markdown(m: &Manifest) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The release packages ship assets/models as fetched (#103): every model is credited there.
+    #[test]
+    fn models_attribution_credits_every_model() {
+        let m = load(&root()).unwrap();
+        let text = models_attribution(&m);
+        let models: Vec<_> = m.fetched.iter().filter(|f| f.kind == "model").collect();
+        assert!(!models.is_empty());
+        for f in models {
+            assert!(text.contains(&f.file) && text.contains(&f.author) && text.contains(&f.licence), "{}", f.file);
+        }
+    }
 
     fn asset(path: &str, author: &str, kind: &str, licence: &str) -> Asset {
         Asset {
@@ -541,6 +574,28 @@ mod tests {
         assert!(check(&root(), &sneaky, &[], &l).iter().any(|p| p.contains("closed list")));
         let font = Manifest { bundled: vec![bundled("hayro-cmap", "assets/cmaps.brotli", "Adobe", "font", true)], ..Default::default() };
         assert!(check(&root(), &font, &[], &l).iter().any(|p| p.contains("forbidden")));
+    }
+
+    #[test]
+    fn first_party_adobe_data_only_on_the_closed_list() {
+        let l = lock(&[]);
+        // The generated standard-14 table is on the list, as `kind = "data"`.
+        let mut ok = asset("crates/fonts/src/std14.rs", "Adobe (Core14 AFM metrics); tables by the PdfCraft contributors", "data", "MIT");
+        ok.adobe_data = true;
+        let m = Manifest { asset: vec![ok], ..Default::default() };
+        assert!(check(&root(), &m, &[], &l).is_empty(), "{:?}", check(&root(), &m, &[], &l));
+
+        // Any other first-party file claiming it is refused.
+        let mut sneaky = asset("Cargo.toml", "Adobe", "data", "MIT");
+        sneaky.adobe_data = true;
+        let m = Manifest { asset: vec![sneaky], ..Default::default() };
+        assert!(check(&root(), &m, &[], &l).iter().any(|p| p.contains("closed list")));
+
+        // Even on the list, it may only be data — never a typeface.
+        let mut wrong_kind = asset("crates/fonts/src/std14.rs", "Adobe", "font", "MIT");
+        wrong_kind.adobe_data = true;
+        let m = Manifest { asset: vec![wrong_kind], ..Default::default() };
+        assert!(!check(&root(), &m, &[], &l).is_empty());
     }
 
     #[test]

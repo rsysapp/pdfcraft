@@ -38,10 +38,22 @@ fn listed_tools(flags: &[&str]) -> Vec<String> {
 }
 
 #[test]
+fn mcp_rejects_unknown_options_before_starting_the_server() {
+    for option in ["--totally-bogus-flag", "--rot", "--root=."] {
+        let out = Command::new(env!("CARGO_BIN_EXE_pdfcraft-cli")).args(["mcp", option]).output().expect("run CLI");
+
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "mcp {option} unexpectedly succeeded");
+        assert!(stderr.contains("unknown option") && stderr.contains(option), "mcp {option}: {stderr}");
+        assert!(!stderr.contains("MCP server on stdio"), "server started despite invalid option: {stderr}");
+    }
+}
+
+#[test]
 fn compact_flag_shortens_the_tool_list() {
     let full = listed_tools(&[]);
     let compact = listed_tools(&["--compact"]);
-    assert_eq!(compact.len(), 12, "{compact:?}");
+    assert_eq!(compact.len(), 17, "{compact:?}");
     assert!(compact.iter().any(|n| n == "tool_search") && compact.iter().any(|n| n == "tool_call"));
     assert!(compact.iter().all(|n| full.contains(n) || n == "tool_search" || n == "tool_call"));
     assert!(full.len() > 100 && !full.iter().any(|n| n == "tool_search"), "{} tools", full.len());

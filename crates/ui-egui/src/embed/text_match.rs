@@ -141,7 +141,13 @@ mod tests {
                 for (k, ch) in word.chars().enumerate() {
                     let x = text.glyphs.len() as f32 * 7.0;
                     let y = line as f32 * 20.0;
-                    text.glyphs.push(TextGlyph { text: ch.to_string(), rect: [x, y, x + 6.0, y + 12.0] });
+                    let (x1, y1) = (x + 6.0, y + 12.0);
+                    text.glyphs.push(TextGlyph {
+                        text: ch.to_string(),
+                        rect: [x, y, x1, y1],
+                        quad: [[x, y1], [x1, y1], [x1, y], [x, y]],
+                        direction: [1.0, 0.0],
+                    });
                     text.line_of.push(line as u32);
                     text.space_before.push(w > 0 && k == 0);
                 }

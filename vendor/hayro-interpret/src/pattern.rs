@@ -248,14 +248,13 @@ impl<'a> TilingPattern<'a> {
             self.nesting_depth,
         );
 
+        // PdfCraft patch: see `context::MAX_PAGE_CONTENT`.
         // Embed build: the cell's decoded content is logged, and a cell that cannot be decoded
-        // is recorded as a content stream not read (`hayro_syntax::resolved`).
-        let decoded = match self.stream.decoded() {
-            Ok(decoded) => decoded,
-            Err(_) => {
-                hayro_syntax::resolved::content_stopped();
-                return None;
-            }
+        // (or that the page's content budget refuses) is recorded as a content stream not read
+        // (`hayro_syntax::resolved`).
+        let Some(decoded) = crate::context::decode_content(&self.stream) else {
+            hayro_syntax::resolved::content_stopped();
+            return None;
         };
         hayro_syntax::resolved::content(
             self.stream

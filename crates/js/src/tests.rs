@@ -94,6 +94,124 @@ fn util_printf_printd_and_printx() {
     assert_eq!(o.value, "1,234,567.89|00042|hi|FF|1.234,50|Jan 5, 2024 09:07|Friday|(555) 123-4567|ABC");
 }
 
+fn assert_printf_error(script: &str, message: &str) {
+    let o = go(script, &Event::doc("Open"));
+    assert!(o.error.as_deref().is_some_and(|e| e.starts_with(message)), "{script}: {:?}", o.error);
+    let o = xfa::run_xfa(
+        script,
+        &xfa::XfaEvent { activity: "initialize".into(), target: "form1[0]".into(), ..Default::default() },
+        &xfa::XfaDoc::default(),
+        &xfa_model::form(),
+        Limits::default(),
+    );
+    assert!(o.error.as_deref().is_some_and(|e| e.starts_with(message)), "XFA: {script}: {:?}", o.error);
+}
+
+#[test]
+fn util_printf_rejects_large_width() {
+    assert_printf_error("util.printf('%99999999999d', 1)", "TypeError: util.printf width or precision exceeds 4096");
+}
+
+#[test]
+fn util_printf_rejects_large_precision() {
+    assert_printf_error("util.printf('%.99999999999f', 1)", "TypeError: util.printf width or precision exceeds 4096");
+}
+
+#[test]
+fn util_printf_rejects_overflowing_width() {
+    assert_printf_error("util.printf('%9999999999999999999999999999999999999999d', 1)", "TypeError: util.printf width or precision exceeds 4096");
+}
+
+#[test]
+fn util_printf_rejects_overflowing_precision() {
+    assert_printf_error("util.printf('%.9999999999999999999999999999999999999999f', 1)", "TypeError: util.printf width or precision exceeds 4096");
+}
+
+#[test]
+fn util_printf_rejects_limits_for_all_conversions() {
+    for conv in ['d', 'f', 's', 'x'] {
+        for spec in ["4097", ".4097", "99999999999", ".99999999999"] {
+            assert_printf_error(&format!("util.printf('%{spec}{conv}', 1)"), "TypeError: util.printf width or precision exceeds 4096");
+        }
+    }
+}
+
+#[test]
+fn util_printf_bounds_total_output() {
+    for script in [
+        "util.printf('%4096d'.repeat(300), 1)",
+        "util.printf('%04096d'.repeat(300), -1)",
+        "util.printf('aa'.repeat(524288) + 'a')",
+        "util.printf('é'.repeat(524289))",
+        "util.printf('%%%%'.repeat(524288) + '%%')",
+        "util.printf('%s', 'aa'.repeat(524288) + 'a')",
+        "util.printf('%s%s', 'aa'.repeat(524288), 'b')",
+    ] {
+        assert_printf_error(script, "TypeError: util.printf output exceeds 1048576 bytes");
+    }
+}
+
+#[test]
+fn util_printf_accepts_limits_and_preserves_formats() {
+    let o = go(
+        "event.value = [util.printf('%4096d', 1).length, util.printf('%04096d', -1).length, \
+         util.printf('%.4096f', 1).length, util.printf('%.4096s', 'a'.repeat(4097)).length, \
+         util.printf('%4096x', 255).length, util.printf('%.4096x', 255), \
+         util.printf('%4096d'.repeat(255) + '%4095d', 1).length, util.printf('%4096d'.repeat(256), 1).length, \
+         util.printf('é'.repeat(524288)).length, util.printf('a%%b:%+06d|%4s|%.2s|%x', 42, 'é', 'é界a', 255)].join('|');",
+        &Event::field("Calculate", "total", ""),
+    );
+    assert_eq!(o.error, None);
+    assert_eq!(o.value, "4096|4096|4098|4096|4096|FF|1048575|1048576|524288|a%b:+00042|   é|é界|FF");
+}
+
+fn assert_array_error(script: &str) {
+    let o = go(script, &Event::field("Calculate", "total", ""));
+    assert!(o.error.as_deref().is_some_and(|e| e.starts_with("TypeError: array length exceeds 1048576")), "{script}: {:?}", o.error);
+    assert!(o.requests.is_empty() && o.changed.is_empty(), "{script}");
+}
+
+#[test]
+fn reset_form_and_field_setters_refuse_huge_arrays() {
+    for script in [
+        "this.resetForm(new Array(4294967295))",
+        "getField('total').value = new Array(4294967295)",
+        "event.target.value = new Array(4294967295)",
+        "getField('total').textColor = new Array(4294967295)",
+        "getField('total').fillColor = new Array(4294967295)",
+    ] {
+        assert_array_error(script);
+    }
+}
+
+#[test]
+fn reset_form_and_field_setters_take_arrays_up_to_the_limit() {
+    let o = go("this.resetForm(new Array(1 << 20)); getField('total').value = new Array(1 << 20);", &Event::field("Calculate", "total", ""));
+    assert_eq!(o.error, None);
+    assert!(matches!(&o.requests[..], [Request::Reset(names)] if names.len() == 1 << 20 && names.iter().all(String::is_empty)));
+    assert_eq!(o.changed.iter().find(|f| f.name == "total").unwrap().value, [""]);
+    assert_array_error("this.resetForm(new Array((1 << 20) + 1))");
+    assert_array_error("getField('total').value = new Array((1 << 20) + 1)");
+}
+
+#[test]
+fn reset_form_and_field_setters_still_read_short_arrays() {
+    let mut f = fields();
+    f.push(FieldState::new("pick", FieldType::ListBox, vec![]));
+    let o = run(
+        "this.resetForm(['a', 'b']); getField('pick').value = ['x', 'y', 'z']; getField('total').value = ['x', 'y', 'z'];",
+        &Event::field("Calculate", "total", ""),
+        &doc(),
+        &f,
+        &[],
+        Limits::default(),
+    );
+    assert_eq!(o.error, None);
+    assert_eq!(o.requests, [Request::Reset(vec!["a".into(), "b".into()])]);
+    assert_eq!(o.changed.iter().find(|f| f.name == "pick").unwrap().value, ["x", "y", "z"]);
+    assert_eq!(o.changed.iter().find(|f| f.name == "total").unwrap().value, ["x"]);
+}
+
 #[test]
 fn document_requests_and_console() {
     let o = go(
@@ -425,6 +543,37 @@ mod xfa_model {
         // Long messages are cut.
         let o = go("xfa.host.messageBox(new Array(100000).join('x'));", "form1[0].page1[0]", "click");
         assert!(matches!(&o.effects[0], XfaEffect::MessageBox(m) if m.chars().count() <= 4_097));
+    }
+
+    #[test]
+    fn a_slow_engine_start_does_not_count_against_the_script() {
+        let ms = std::time::Duration::from_millis;
+        // On a busy machine the engine can take longer to start than a script may run: the
+        // script still runs (abandoning it would turn the form's scripts off).
+        let o = run_within_limits("test", ms(10_000), ms(500), move |started| {
+            std::thread::sleep(ms(1_500));
+            started();
+            XfaOutcome { result: Some("ran".into()), ..Default::default() }
+        });
+        assert!(!o.abandoned, "{o:?}");
+        assert_eq!(o.result.as_deref(), Some("ran"));
+        // The script's own time counts from then.
+        let o = run_within_limits("test", ms(10_000), ms(200), move |started| {
+            started();
+            std::thread::sleep(ms(2_000));
+            XfaOutcome::default()
+        });
+        assert!(o.abandoned && o.error.as_deref().is_some_and(|e| e.contains("ran longer")), "{o:?}");
+        // Start-up has a limit of its own, so nobody waits forever for an engine.
+        let o = run_within_limits("test", ms(200), ms(10_000), move |started| {
+            std::thread::sleep(ms(2_000));
+            started();
+            XfaOutcome::default()
+        });
+        assert!(o.abandoned && o.error.as_deref().is_some_and(|e| e.contains("to start")), "{o:?}");
+        // A script that finishes without saying it started (refused at once) isn't abandoned.
+        let o = run_within_limits("test", ms(10_000), ms(200), |_| XfaOutcome { error: Some("refused".into()), ..Default::default() });
+        assert!(!o.abandoned && o.error.as_deref() == Some("refused"), "{o:?}");
     }
 }
 
@@ -829,5 +978,104 @@ $host.gotoURL("https://example.org")"#,
             std::time::Duration::from_millis(200),
         );
         assert!(o.abandoned || o.error.is_some(), "{o:?}");
+    }
+}
+
+mod session {
+    use super::xfa_model::form;
+    use crate::Limits;
+    use crate::xfa::*;
+    use crate::xfa_session::{Script, XfaSession};
+
+    fn script(source: &str, formcalc: bool, target: &str, activity: &str) -> Script {
+        Script {
+            source: source.into(),
+            formcalc,
+            event: XfaEvent { activity: activity.into(), target: target.into(), ..Default::default() },
+            root: form(),
+            limits: Limits::default(),
+            timeout: std::time::Duration::from_secs(3),
+        }
+    }
+
+    #[test]
+    fn scripts_of_one_event_run_on_one_thread_each_on_the_form_the_caller_sends() {
+        let mut s = XfaSession::new(XfaDoc { page_count: 3, ..Default::default() });
+        assert_eq!(s.dead(), None);
+        // JavaScript, then FormCalc, on the same thread.
+        let o = s.run(script("qty.rawValue = 10; qty.rawValue", false, "form1[0].page1[0].total[0]", "calculate"));
+        assert_eq!(o.error, None, "{o:?}");
+        assert_eq!(o.effects.len(), 1);
+        assert_eq!(o.result.as_deref(), Some("10"));
+        // The next script sees the form the caller sends, not what the last script did on
+        // its copy: nothing a script changed leaks past the caller.
+        let o = s.run(script("qty * price", true, "form1[0].page1[0].total[0]", "calculate"));
+        assert_eq!(o.result.as_deref(), Some("10"), "{o:?}");
+        let mut with = script("qty * price", true, "form1[0].page1[0].total[0]", "calculate");
+        with.root.children[0].children[0].value = "10".into();
+        assert_eq!(s.run(with).result.as_deref(), Some("25"));
+        // Nor do variables, globals, prototype changes or kept objects.
+        s.run(script("leak = 5; String.prototype.trim = function () { return 'P' }; kept = qty; 1", false, "form1[0].page1[0].qty[0]", "calculate"));
+        let o = s.run(script("typeof leak + ':' + ' x '.trim() + ':' + typeof kept", false, "form1[0].page1[0].qty[0]", "calculate"));
+        assert_eq!(o.result.as_deref(), Some("undefined:x:undefined"));
+        s.run(script("Object.freeze(globalThis); 1", false, "form1[0].page1[0].qty[0]", "calculate"));
+        let o = s.run(script("xfa.host.numPages", false, "form1[0].page1[0].qty[0]", "calculate"));
+        assert_eq!(o.result.as_deref(), Some("3"), "{o:?}");
+        // `this` and `event` follow each script's target.
+        let o = s.run(script("this.name + ':' + xfa.event.name", false, "form1[0].page1[0].price[0]", "change"));
+        assert_eq!(o.result.as_deref(), Some("price:change"));
+        // A failing script doesn't end the session.
+        let o = s.run(script("throw new Error('no')", false, "form1[0].page1[0].go[0]", "click"));
+        assert!(o.error.is_some() && !o.abandoned);
+        assert_eq!(s.run(script("1 + 1", true, "form1[0].page1[0].go[0]", "click")).result.as_deref(), Some("2"));
+        // Hundreds of scripts on the one thread.
+        let started = std::time::Instant::now();
+        for i in 0..300 {
+            let o = s.run(script(&format!("{i} + qty.rawValue"), i % 2 == 0, "form1[0].page1[0].total[0]", "calculate"));
+            assert_eq!(o.error, None, "{o:?}");
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn a_scripts_time_starts_when_its_context_is_ready() {
+        // The engine made slow to be ready (300 ms) under a 50 ms script limit: the script is
+        // not abandoned, its time starting only when the engine says it is ready.
+        use crate::xfa_session::START_DELAY_MS;
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut s = XfaSession::new(XfaDoc::default());
+        START_DELAY_MS.store(300, Relaxed);
+        let mut quick = script("1", false, "form1[0].page1[0].go[0]", "click");
+        quick.timeout = std::time::Duration::from_millis(50);
+        let js = s.run(quick);
+        let mut quick = script("1", true, "form1[0].page1[0].go[0]", "click");
+        quick.timeout = std::time::Duration::from_millis(50);
+        let fc = s.run(quick);
+        START_DELAY_MS.store(0, Relaxed);
+        assert!(!js.abandoned && js.result.as_deref() == Some("1"), "{js:?}");
+        assert!(!fc.abandoned && fc.result.as_deref() == Some("1"), "{fc:?}");
+        assert_eq!(s.dead(), None);
+    }
+
+    #[test]
+    fn a_script_past_its_time_is_abandoned_and_the_session_is_dead_after_it() {
+        let mut s = XfaSession::new(XfaDoc::default());
+        let mut slow = script("while (true) {}", false, "form1[0].page1[0].go[0]", "click");
+        slow.limits = Limits { loop_iterations: u64::MAX, recursion: 32 };
+        slow.timeout = std::time::Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let o = s.run(slow);
+        assert!(o.abandoned, "{o:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(s.dead().is_some_and(|w| w.contains("abandoned")));
+        let o = s.run(script("1", false, "form1[0].page1[0].go[0]", "click"));
+        assert!(o.abandoned && o.result.is_none(), "nothing more runs: {o:?}");
+        // FormCalc past its time too (it stops itself at the deadline and is reported).
+        let mut s = XfaSession::new(XfaDoc::default());
+        let mut slow = script("while (1) do endwhile", true, "form1[0].page1[0].go[0]", "click");
+        slow.limits = Limits { loop_iterations: u64::MAX, recursion: 32 };
+        slow.timeout = std::time::Duration::from_millis(200);
+        let o = s.run(slow);
+        assert!(o.abandoned || o.error.as_deref().is_some_and(|e| e.contains("too long")), "{o:?}");
     }
 }

@@ -270,6 +270,13 @@ path = "LICENSE-MIT"
 checksum = "cd7032ea33b71427f188e34ffb4aee9d6868a57fd196037c5c8b2be03a2a0352"
 license = "MIT"
 
+[pdfcraft-audit.clarify]
+license = "MIT OR Apache-2.0"
+[[pdfcraft-audit.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "cd7032ea33b71427f188e34ffb4aee9d6868a57fd196037c5c8b2be03a2a0352"
+license = "MIT"
+
 [pdfcraft-compare.clarify]
 license = "MIT OR Apache-2.0"
 [[pdfcraft-compare.clarify.git]]
@@ -350,6 +357,13 @@ license = "MIT"
 [pdfcraft-forms.clarify]
 license = "MIT OR Apache-2.0"
 [[pdfcraft-forms.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "cd7032ea33b71427f188e34ffb4aee9d6868a57fd196037c5c8b2be03a2a0352"
+license = "MIT"
+
+[pdfcraft-geom.clarify]
+license = "MIT OR Apache-2.0"
+[[pdfcraft-geom.clarify.git]]
 path = "LICENSE-MIT"
 checksum = "cd7032ea33b71427f188e34ffb4aee9d6868a57fd196037c5c8b2be03a2a0352"
 license = "MIT"
@@ -510,3 +524,19 @@ checksum = "fd80a26fbb3f644af1fa994134446702932968519797227e07a1368dea80f0bc"
 license = "MIT"
 start = "Permission is hereby granted"
 
+
+# Git dependencies (craft-libs, pinned by revision in Cargo.toml): the licence files sit at the
+# repository's root, two folders above each crate; the crates themselves carry none.
+[craft-ui.clarify]
+license = "MIT OR Apache-2.0"
+[[craft-ui.clarify.files]]
+path = "../../LICENSE-MIT"
+checksum = "2f42c0cafc8ad394d91373fe1f342aee5453850b151a51405c68cae9ada86d26"
+license = "MIT"
+
+[craft-print.clarify]
+license = "MIT OR Apache-2.0"
+[[craft-print.clarify.files]]
+path = "../../LICENSE-MIT"
+checksum = "2f42c0cafc8ad394d91373fe1f342aee5453850b151a51405c68cae9ada86d26"
+license = "MIT"

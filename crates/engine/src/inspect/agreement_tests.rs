@@ -2355,7 +2355,7 @@ fn every_byte_of_a_rewrite_is_listed_and_written_strictly() {
     let clean = strictly("%PDF-1.7\n", same, "");
     assert_eq!(inspect(&base, &clean, InspectLimits::default()).unwrap().content.pages_changed_outside_redactions, 0);
     let deflated = |data: &[u8], tail: &[u8]| {
-        let mut raw = pdfcraft_cos::Stream::flate(pdfcraft_cos::Dict::new(), data).raw.as_ref().clone();
+        let mut raw = pdfcraft_cos::Stream::flate(pdfcraft_cos::Dict::new(), data).raw.to_vec();
         raw.extend_from_slice(tail);
         stream("/Filter /FlateDecode", &raw)
     };
@@ -2501,7 +2501,7 @@ fn the_byte_accounting_is_bounded() {
     assert!(inspect_with(&base, &edited, limits).is_err());
     assert!(started.elapsed() < std::time::Duration::from_secs(20), "{:?}", started.elapsed());
     // Twenty streams of a megabyte each, inflated to find their ends, against eight megabytes.
-    let bomb = pdfcraft_cos::Stream::flate(pdfcraft_cos::Dict::new(), &vec![0u8; 1 << 20]).raw.as_ref().clone();
+    let bomb = pdfcraft_cos::Stream::flate(pdfcraft_cos::Dict::new(), &vec![0u8; 1 << 20]).raw.to_vec();
     // Objects 10…29, each reached from the catalog.
     let mut b = Builder::new();
     let bodies = [
@@ -2560,7 +2560,7 @@ fn what_a_stream_holds_past_its_end_or_beside_what_it_says_is_refused() {
     let base = laid_out("", "", X, b"");
     let content = [text("Alpha"), b"\n".to_vec(), X_BOX.as_bytes().to_vec()].concat();
     let encoded = |filter: &str, raw: Vec<u8>| strictly("%PDF-1.7\n", move |num, body| if num == 4 { stream(filter, &raw) } else { body }, "");
-    let deflated = pdfcraft_cos::Stream::flate(pdfcraft_cos::Dict::new(), &content).raw.as_ref().clone();
+    let deflated = pdfcraft_cos::Stream::flate(pdfcraft_cos::Dict::new(), &content).raw.to_vec();
     assert!(inspect(&base, &encoded("/Filter /FlateDecode", deflated.clone()), InspectLimits::default()).is_ok());
     let mut wrong_sum = deflated.clone();
     let last = wrong_sum.len() - 4;

@@ -10,9 +10,9 @@ use pdfcraft_render::{Annotation, DocInfo};
 
 use crate::canvas::DocView;
 use crate::comments::{CommentPrefs, CommentTool, SortBy, color32, status_badge};
-use crate::icons;
 use crate::panels::Nav;
 use crate::theme::{self, Tokens};
+use crate::{icons, widgets};
 
 /// Accent bar of the selected card (11-visual-spec §3: `#0165DD`).
 const CARD_ACCENT: Color32 = Color32::from_rgb(0x01, 0x65, 0xDD);
@@ -90,8 +90,13 @@ pub fn count(info: &DocInfo) -> usize {
 }
 
 fn matches(a: &Annotation, q: &str) -> bool {
-    let q = q.to_lowercase();
-    [a.author.as_deref(), a.contents.as_deref(), Some(kind_label(a))].into_iter().flatten().any(|s| s.to_lowercase().contains(&q))
+    any_contains([a.author.as_deref(), a.contents.as_deref(), Some(kind_label(a))].into_iter().flatten(), q)
+}
+
+/// Whether one of `fields` contains `q` in any case, Turkish dotted and dotless i included.
+fn any_contains<'a>(fields: impl IntoIterator<Item = &'a str>, q: &str) -> bool {
+    let q = pdfcraft_render::text::fold_case(q);
+    fields.into_iter().any(|s| pdfcraft_render::text::fold_case(s).contains(&q))
 }
 
 /// Draw the panel body. Returns an edit to apply (posting, replying, deleting…).
@@ -104,10 +109,11 @@ pub(crate) fn show(
     allowed: bool,
     nav: &mut Option<Nav>,
 ) -> Option<Edit> {
+    crate::widgets::begin_dialog(ui);
     let mut edit = None;
     // Search (the header's magnifier toggles it).
     if let Some(q) = view.comments.search.as_mut() {
-        let r = ui.add(egui::TextEdit::singleline(q).hint_text(tl!("Search comments")).desired_width(f32::INFINITY).id_salt("comment-search"));
+        let r = ui.add(crate::widgets::line(q).hint_text(tl!("Search comments")).desired_width(f32::INFINITY).id_salt("comment-search"));
         if view.comments.search_focus {
             r.request_focus();
             view.comments.search_focus = false;
@@ -117,11 +123,7 @@ pub(crate) fn show(
     // "Add a comment": a sticky note on the current page, near its top-right corner.
     if allowed {
         let r = ui.add(
-            egui::TextEdit::singleline(&mut view.comments.add_box)
-                .hint_text(tl!("Add a comment"))
-                .desired_width(f32::INFINITY)
-                .margin(egui::Margin::symmetric(8, 6))
-                .id_salt("comment-add-box"),
+            crate::widgets::line(&mut view.comments.add_box).hint_text(tl!("Add a comment")).desired_width(f32::INFINITY).id_salt("comment-add-box"),
         );
         if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !view.comments.add_box.trim().is_empty() {
             let page = view.current.min(info.pages.len().saturating_sub(1));
@@ -205,7 +207,8 @@ pub(crate) fn show(
             if g.is_some() && g != group {
                 ui.add_space(6.0);
                 let title = g.clone().unwrap_or_default();
-                let shown = if sort == SortBy::Author && a.author.is_some() { title.as_str() } else { tl!(&title) };
+                // Catalog labels are already in display order; an author's name is put in it here.
+                let shown = if sort == SortBy::Author && a.author.is_some() { crate::bidi::visual_auto(&title) } else { tl!(&title).into() };
                 ui.label(egui::RichText::new(shown).font(theme::semibold(12.5)).color(t.text_muted));
                 group = g;
             }
@@ -263,7 +266,8 @@ fn card(
             let mut buttons_left = f32::INFINITY;
             let head = ui.horizontal(|ui| {
                 avatar(ui, t, Some(subtype_icon(&a.subtype)), None, color);
-                ui.label(egui::RichText::new(a.author.as_deref().unwrap_or_else(|| tl!("Unknown author"))).font(theme::semibold(12.5)).color(t.text));
+                let author = a.author.as_deref().map_or_else(|| tl!("Unknown author").into(), crate::bidi::visual_auto);
+                ui.label(egui::RichText::new(author).font(theme::semibold(12.5)).color(t.text));
                 if let Some(m) = &a.modified {
                     ui.add(egui::Label::new(egui::RichText::new(m).font(theme::regular(11.0)).color(t.text_faint)).truncate());
                 }
@@ -291,7 +295,7 @@ fn card(
             egui::Frame::NONE.inner_margin(egui::Margin { left: 34, right: 0, top: 4, bottom: 0 }).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 if editing && let Some((_, _, text)) = view.comments.editing.as_mut() {
-                    let r = ui.add(egui::TextEdit::multiline(text).desired_rows(2).desired_width(f32::INFINITY).id_salt(("comment-edit", key)));
+                    let r = ui.add(crate::widgets::block(text).desired_rows(2).desired_width(f32::INFINITY).id_salt(("comment-edit", key)));
                     if !r.has_focus() && !ui.memory(|m| m.focused().is_some()) {
                         r.request_focus();
                     }
@@ -309,16 +313,16 @@ fn card(
                     });
                 } else {
                     let body = a.contents.as_deref().unwrap_or("");
-                    let text = if body.is_empty() {
-                        egui::RichText::new(tl!(kind_label(a))).italics().color(t.text_faint)
+                    if body.is_empty() {
+                        let text = egui::RichText::new(tl!(kind_label(a))).italics().color(t.text_faint).font(theme::regular(13.0));
+                        let mut label = egui::Label::new(text).wrap();
+                        if !selected {
+                            label = label.truncate();
+                        }
+                        ui.add(label);
                     } else {
-                        egui::RichText::new(body).color(t.text)
-                    };
-                    let mut label = egui::Label::new(text.font(theme::regular(13.0))).wrap();
-                    if !selected {
-                        label = label.truncate();
+                        widgets::wrapped_text(ui, body, theme::regular(13.0), t.text, !selected);
                     }
-                    ui.add(label);
                 }
                 if let Some((icon, label, c)) = status.and_then(status_badge) {
                     ui.add_space(4.0);
@@ -336,15 +340,13 @@ fn card(
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 2.0;
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(r.author.as_deref().unwrap_or_else(|| tl!("Reply"))).font(theme::semibold(12.0)));
+                            let author = r.author.as_deref().map_or_else(|| tl!("Reply").into(), crate::bidi::visual_auto);
+                            ui.label(egui::RichText::new(author).font(theme::semibold(12.0)));
                             if let Some(m) = &r.modified {
                                 ui.add(egui::Label::new(egui::RichText::new(m).font(theme::regular(11.0)).color(t.text_faint)).truncate());
                             }
                         });
-                        ui.add(
-                            egui::Label::new(egui::RichText::new(r.contents.as_deref().unwrap_or("")).font(theme::regular(12.5)).color(t.text))
-                                .wrap(),
-                        );
+                        widgets::wrapped_text(ui, r.contents.as_deref().unwrap_or(""), theme::regular(12.5), t.text, false);
                     });
                 });
                 let x = resp.response.rect.left() + 12.0;
@@ -353,20 +355,23 @@ fn card(
             if selected && allowed {
                 ui.add_space(8.0);
                 egui::Frame::NONE.inner_margin(egui::Margin { left: 34, right: 0, top: 0, bottom: 0 }).show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let r = ui.add(
-                            egui::TextEdit::singleline(&mut view.comments.reply)
-                                .hint_text(tl!("Add a reply"))
-                                .desired_width(ui.available_width() - 56.0)
-                                .id_salt(("comment-reply", key)),
-                        );
-                        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                        let ok = !view.comments.reply.trim().is_empty();
-                        if (ui.add_enabled(ok, egui::Button::new(tl!("Post")).corner_radius(12)).clicked() || enter) && ok {
-                            let text = std::mem::take(&mut view.comments.reply).trim().to_string();
-                            edit = Some(Edit::ReplyToAnnotation { page: a.page, index: a.index, text, author: prefs.author.clone() });
-                        }
-                    });
+                    // The field fills its line and Post sits right-aligned under it: a field sized
+                    // around the button can't fit every language's "Post" exactly, and any overflow
+                    // would widen the resizable panel again on every repaint.
+                    let r = ui.add(
+                        crate::widgets::line(&mut view.comments.reply)
+                            .hint_text(tl!("Add a reply"))
+                            .desired_width(f32::INFINITY)
+                            .id_salt(("comment-reply", key)),
+                    );
+                    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let ok = !view.comments.reply.trim().is_empty();
+                    let post =
+                        ui.with_layout(Layout::right_to_left(Align::Min), |ui| ui.add_enabled(ok, egui::Button::new(tl!("Post")).corner_radius(12)));
+                    if (post.inner.clicked() || enter) && ok {
+                        let text = std::mem::take(&mut view.comments.reply).trim().to_string();
+                        edit = Some(Edit::ReplyToAnnotation { page: a.page, index: a.index, text, author: prefs.author.clone() });
+                    }
                 });
             }
             // The header selects the card, except where its buttons are.
@@ -505,7 +510,7 @@ pub(crate) fn header_controls(ui: &mut egui::Ui, info: &DocInfo, view: &mut DocV
             (SortBy::Type, tl!("Type")),
             (SortBy::Color, tl!("Colour")),
         ] {
-            if ui.radio(cv.sort == s, label).clicked() {
+            if ui.add(widgets::radio(cv.sort == s, label)).clicked() {
                 cv.sort = s;
                 ui.close();
             }
@@ -528,7 +533,7 @@ pub(crate) fn header_controls(ui: &mut egui::Ui, info: &DocInfo, view: &mut DocV
         ui.set_min_width(200.0);
         let toggle = |ui: &mut egui::Ui, list: &mut Vec<String>, value: &str, label: &str| {
             let mut shown = !list.iter().any(|x| x == value);
-            if ui.checkbox(&mut shown, label).changed() {
+            if ui.add(widgets::checkbox(&mut shown, label)).changed() {
                 if shown {
                     list.retain(|x| x != value);
                 } else {
@@ -543,7 +548,8 @@ pub(crate) fn header_controls(ui: &mut egui::Ui, info: &DocInfo, view: &mut DocV
         ui.separator();
         ui.label(egui::RichText::new(tl!("Author")).small());
         for a in &authors {
-            toggle(ui, &mut cv.hidden_authors, a, if a.is_empty() { tl!("Unknown author") } else { a });
+            let name = crate::bidi::visual_auto(a);
+            toggle(ui, &mut cv.hidden_authors, a, if a.is_empty() { tl!("Unknown author") } else { &name });
         }
         ui.separator();
         ui.label(egui::RichText::new(tl!("Status")).small());
@@ -584,4 +590,18 @@ pub(crate) fn header_controls(ui: &mut egui::Ui, info: &DocInfo, view: &mut DocV
         }
     });
     command
+}
+
+#[cfg(test)]
+mod filter {
+    use super::any_contains;
+
+    #[test]
+    fn comments_match_in_any_case_with_turkish_i() {
+        assert!(any_contains(["Ayşe Yılmaz", "Lütfen İMZALAYIN"], "imzalayın"));
+        assert!(any_contains(["Ayşe Yılmaz"], "YILMAZ"));
+        assert!(any_contains(["IRMAK"], "ırmak"));
+        assert!(any_contains(["Note"], "NOTE"));
+        assert!(!any_contains(["Ayşe Yılmaz"], "mehmet"));
+    }
 }

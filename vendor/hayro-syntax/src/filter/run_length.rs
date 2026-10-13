@@ -2,7 +2,9 @@ use crate::reader::Reader;
 use alloc::vec;
 use alloc::vec::Vec;
 
-pub(crate) fn decode(data: &[u8]) -> Option<Vec<u8>> {
+/// PdfCraft patch: `limit` is the most bytes produced (see `filter::decode_limit`); a run of 128
+/// copies costs two input bytes, so a few megabytes could ask for gigabytes.
+pub(crate) fn decode(data: &[u8], limit: usize) -> Option<Vec<u8>> {
     let mut reader = Reader::new(data);
     let mut decoded = vec![];
     // Embed build: at most what the decode budget leaves (`budget`).
@@ -12,6 +14,10 @@ pub(crate) fn decode(data: &[u8]) -> Option<Vec<u8>> {
         if decoded.len() > room {
             crate::budget::exceed();
             return None;
+        }
+        let left = limit.saturating_sub(decoded.len());
+        if left == 0 {
+            break;
         }
         let length = reader.read_byte()?;
 
@@ -23,15 +29,25 @@ pub(crate) fn decode(data: &[u8]) -> Option<Vec<u8>> {
                     break;
                 };
 
-                decoded.extend(bytes);
+                decoded.extend(bytes.iter().take(left));
             }
             _ => {
-                let length = 257 - length as usize;
-                decoded.extend([reader.read_byte()?].repeat(length));
+                let length = (257 - length as usize).min(left);
+                let byte = reader.read_byte()?;
+                decoded.extend(core::iter::repeat_n(byte, length));
             }
         }
     }
 
+    // Embed build: the last run may not take the output past the decode budget either.
+    if decoded.len() > room {
+        crate::budget::exceed();
+        return None;
+    }
+    // PdfCraft patch: output cut at the limit is reported, never dropped silently.
+    if decoded.len() >= limit {
+        warn!("run-length stream stopped at its decode limit of {limit} bytes");
+    }
     Some(decoded)
 }
 
@@ -43,7 +59,7 @@ mod tests {
     fn run_length() {
         let input = vec![4, 10, 11, 12, 13, 14, 253, 3, 128];
         assert_eq!(
-            decode(&input).unwrap(),
+            decode(&input, usize::MAX).unwrap(),
             vec![10, 11, 12, 13, 14, 3, 3, 3, 3]
         );
     }

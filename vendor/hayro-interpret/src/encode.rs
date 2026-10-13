@@ -47,15 +47,21 @@ const MAX_MESH_TRIANGLES: u64 = 500_000;
 impl ShadingPattern {
     /// Encode the shading pattern.
     pub fn encode(&self) -> EncodedShadingPattern {
-        // Never `None` without an area: nothing is charged.
-        self.encode_with(None).unwrap_or_else(|| self.dummy())
+        self.encode_within(None)
     }
 
-    /// Embed build: encode the shading for sampling inside `area` (device space) only, charging
-    /// the work and allocations of meshes (`crate::spend_work`) before doing them. `None` when
+    /// PdfCraft patch: encode the shading pattern for drawing inside `area` (device space) only.
+    /// Mesh shadings are sampled pixel by pixel, and only there (see `TriangleSampler`).
+    pub fn encode_within(&self, area: Option<kurbo::Rect>) -> EncodedShadingPattern {
+        // Never `None` uncharged.
+        self.encode_with(area, false).unwrap_or_else(|| self.dummy())
+    }
+
+    /// Embed build: [`ShadingPattern::encode_within`] `area`, charging the work and allocations
+    /// of meshes (`crate::spend_work`, `crate::spend_allocation`) before doing them. `None` when
     /// the work budget refuses them.
-    pub fn encode_within(&self, area: kurbo::Rect) -> Option<EncodedShadingPattern> {
-        self.encode_with(Some(area))
+    pub fn encode_charged(&self, area: kurbo::Rect) -> Option<EncodedShadingPattern> {
+        self.encode_with(Some(area), true)
     }
 
     /// Embed build: the cost of one sample, in function evaluations' operators (see
@@ -81,7 +87,10 @@ impl ShadingPattern {
         }
     }
 
-    fn encode_with(&self, area: Option<kurbo::Rect>) -> Option<EncodedShadingPattern> {
+    // Embed build: `encode_within`'s former body; `charged` charges meshes first (`charge_mesh`).
+    fn encode_with(&self, area: Option<kurbo::Rect>, charged: bool) -> Option<EncodedShadingPattern> {
+        // Embed build: charging needs the area meshes are sampled in.
+        let charge_area = if charged { area } else { None };
         let base_transform;
 
         let shading_type = match self.shading.shading_type.as_ref() {
@@ -112,7 +121,12 @@ impl ShadingPattern {
                 function,
             } => {
                 let full_transform = self.matrix;
-                let samples = sample_triangles(triangles, full_transform, area)?;
+                if let Some(area) = charge_area {
+                    charge_mesh(triangles, full_transform, area)?;
+                }
+                let mut sampler = TriangleSampler::new(area);
+                sampler.sample(triangles, full_transform);
+                let samples = sampler.map;
 
                 base_transform = Affine::IDENTITY;
 
@@ -122,17 +136,35 @@ impl ShadingPattern {
                 }
             }
             ShadingType::CoonsPatchMesh { patches, function } => {
-                // Embed build: the triangles a patch mesh becomes are counted before being built.
-                if area.is_some() && !mesh_size_ok(patches.len().saturating_mul(PATCH_TRIANGLES)) {
-                    return None;
-                }
-                let mut triangles = vec![];
-                for patch in patches {
-                    patch.to_triangles(&mut triangles);
-                }
-
+                // PdfCraft patch: one patch's triangles at a time (each is 722); collecting all
+                // of them first held 150 KB per patch before any limit applied.
                 let full_transform = self.matrix;
-                let samples = sample_triangles(&triangles, full_transform, area)?;
+                let mut sampler = TriangleSampler::new(area);
+                let mut triangles = vec![];
+                if let Some(area) = charge_area {
+                    // Embed build: the triangles a patch mesh becomes are counted before being
+                    // built, and all of them are charged before any is sampled.
+                    if !mesh_size_ok(patches.len().saturating_mul(PATCH_TRIANGLES)) {
+                        return None;
+                    }
+                    for patch in patches {
+                        patch.to_triangles(&mut triangles);
+                    }
+                    charge_mesh(&triangles, full_transform, area)?;
+                    sampler.sample(&triangles, full_transform);
+                } else {
+                    for patch in patches {
+                        if !mesh_budget_left() {
+                            break;
+                        }
+                        triangles.clear();
+                        patch.to_triangles(&mut triangles);
+                        if !sampler.sample(&triangles, full_transform) {
+                            break;
+                        }
+                    }
+                }
+                let samples = sampler.map;
 
                 base_transform = Affine::IDENTITY;
 
@@ -142,17 +174,34 @@ impl ShadingPattern {
                 }
             }
             ShadingType::TensorProductPatchMesh { patches, function } => {
-                // Embed build: the triangles a patch mesh becomes are counted before being built.
-                if area.is_some() && !mesh_size_ok(patches.len().saturating_mul(PATCH_TRIANGLES)) {
-                    return None;
-                }
-                let mut triangles = vec![];
-                for patch in patches {
-                    patch.to_triangles(&mut triangles);
-                }
-
+                // PdfCraft patch: one patch's triangles at a time, as for Coons patches.
                 let full_transform = self.matrix;
-                let samples = sample_triangles(&triangles, full_transform, area)?;
+                let mut sampler = TriangleSampler::new(area);
+                let mut triangles = vec![];
+                if let Some(area) = charge_area {
+                    // Embed build: the triangles a patch mesh becomes are counted before being
+                    // built, and all of them are charged before any is sampled.
+                    if !mesh_size_ok(patches.len().saturating_mul(PATCH_TRIANGLES)) {
+                        return None;
+                    }
+                    for patch in patches {
+                        patch.to_triangles(&mut triangles);
+                    }
+                    charge_mesh(&triangles, full_transform, area)?;
+                    sampler.sample(&triangles, full_transform);
+                } else {
+                    for patch in patches {
+                        if !mesh_budget_left() {
+                            break;
+                        }
+                        triangles.clear();
+                        patch.to_triangles(&mut triangles);
+                        if !sampler.sample(&triangles, full_transform) {
+                            break;
+                        }
+                    }
+                }
+                let samples = sampler.map;
 
                 base_transform = Affine::IDENTITY;
 
@@ -195,6 +244,28 @@ const PATCH_TRIANGLES: usize = 19 * 19 * 2;
 fn mesh_size_ok(triangles: usize) -> bool {
     let triangles = u64::try_from(triangles).unwrap_or(u64::MAX);
     triangles <= MAX_MESH_TRIANGLES && crate::spend_work(triangles)
+}
+
+/// Embed build: charge sampling `triangles` inside `area` (device space, the pixels a texture of
+/// that area reads) before anything is sampled: the triangles, the pixels walked and the map's
+/// size. `None`: refused by the budget.
+fn charge_mesh(triangles: &[Triangle], transform: Affine, area: kurbo::Rect) -> Option<()> {
+    if !mesh_size_ok(triangles.len()) {
+        return None;
+    }
+    let mut pixels = 0f64;
+    for t in triangles {
+        let placed = kurbo::Rect::from_points(transform * t.p0.point, transform * t.p1.point).union_pt(transform * t.p2.point);
+        let covered = placed.intersect(area);
+        pixels += if covered.is_finite() { covered.area().max(0.0) } else { 0.0 };
+    }
+    // About 14 ns a pixel walked; a map entry takes up to about 128 bytes as the map grows
+    // (measured), one per pixel at most.
+    let entries = pixels.min(area.area().max(0.0));
+    if !crate::spend_allocation((entries * 128.0).min(u64::MAX as f64) as u64) || !crate::spend_work((pixels / 32.0).min(u64::MAX as f64) as u64) {
+        return None;
+    }
+    Some(())
 }
 
 fn encode_axial_shading(
@@ -241,75 +312,110 @@ fn encode_axial_shading(
     )
 }
 
-/// Embed build: `area` (device space) limits the sampling to the pixels a texture of that area
-/// reads, so a triangle far larger than the page is not walked; the triangles, the pixels walked
-/// and the map's size are charged before anything is sampled. `None`: refused by the budget.
-fn sample_triangles(
-    triangles: &[Triangle],
-    transform: Affine,
-    area: Option<kurbo::Rect>,
-) -> Option<FxHashMap<(u16, u16), ColorComponents>> {
-    let mut map = FxHashMap::default();
-    // Pixel centres up to one pixel past the area are read.
-    let area = area.map(|a| a.inflate(1.0, 1.0));
-    let placed = |t: &Triangle| {
-        let p0 = transform * t.p0.point;
-        let p1 = transform * t.p1.point;
-        let p2 = transform * t.p2.point;
-        kurbo::Rect::from_points(p0, p1).union_pt(p2)
-    };
-    if let Some(area) = area {
-        if !mesh_size_ok(triangles.len()) {
-            return None;
-        }
-        let mut pixels = 0f64;
-        for t in triangles {
-            let covered = placed(t).intersect(area);
-            pixels += if covered.is_finite() { covered.area().max(0.0) } else { 0.0 };
-        }
-        // About 14 ns a pixel walked; a map entry takes up to about 128 bytes as the map grows
-        // (measured), one per pixel at most.
-        let entries = pixels.min(area.area().max(0.0));
-        if !crate::spend_allocation((entries * 128.0).min(u64::MAX as f64) as u64) || !crate::spend_work((pixels / 32.0).min(u64::MAX as f64) as u64) {
-            return None;
+/// PdfCraft patch: pixel visits one mesh shading may make, per pixel of the area it is drawn in
+/// and per triangle. Sampling walks each triangle's bounding box (rounded out to whole pixels),
+/// so triangles far off the page (a fuzzed patch decoded onto ±40000) asked for 65536 × 65536
+/// samples, and many triangles covering the same pixels repeat the work. A triangle's box is
+/// about twice its area, and a sub-pixel triangle's box is at most 2 × 2 pixels.
+const MESH_VISITS_PER_PIXEL: u64 = 8;
+const MESH_VISITS_PER_TRIANGLE: u64 = 4;
+
+/// PdfCraft patch: the visits allowed when no area is given (the public `encode`).
+const MESH_VISITS_WITHOUT_AREA: u64 = 1 << 24;
+
+/// PdfCraft patch: mesh triangles one page may sample in all, across every shading painted on
+/// it. A shading is triangulated again each time it is painted (2^16 patches are 47 million
+/// triangles, several seconds), so painting one a thousand times took hours. A 200 × 200
+/// gradient mesh is 29 million triangles.
+const MAX_PAGE_MESH_TRIANGLES: u64 = 1 << 25;
+
+std::thread_local! {
+    static MESH_TRIANGLES_LEFT: core::cell::Cell<u64> =
+        const { core::cell::Cell::new(MAX_PAGE_MESH_TRIANGLES) };
+}
+
+/// PdfCraft patch: a page starts with a fresh mesh triangle budget (called from
+/// `Context::new`).
+pub(crate) fn reset_mesh_budget() {
+    MESH_TRIANGLES_LEFT.with(|n| n.set(MAX_PAGE_MESH_TRIANGLES));
+}
+
+/// PdfCraft patch: `false` once this page's mesh triangle budget is spent.
+fn mesh_budget_left() -> bool {
+    MESH_TRIANGLES_LEFT.with(|n| n.get() > 0)
+}
+
+/// PdfCraft patch: samples mesh triangles into a map with one entry per pixel, only inside
+/// `area` (device space), within the visit budget above.
+struct TriangleSampler {
+    map: FxHashMap<(u16, u16), ColorComponents>,
+    area: kurbo::Rect,
+    visits_left: u64,
+}
+
+impl TriangleSampler {
+    fn new(area: Option<kurbo::Rect>) -> Self {
+        let visits_left = match area {
+            Some(a) => (a.width().max(0.0).ceil() as u64)
+                .saturating_mul(a.height().max(0.0).ceil() as u64)
+                .saturating_mul(MESH_VISITS_PER_PIXEL),
+            None => MESH_VISITS_WITHOUT_AREA,
+        };
+        Self {
+            map: FxHashMap::default(),
+            area: area.unwrap_or(kurbo::Rect::new(0.0, 0.0, 65536.0, 65536.0)),
+            visits_left,
         }
     }
 
-    for t in triangles {
-        let t = {
-            let p0 = transform * t.p0.point;
-            let p1 = transform * t.p1.point;
-            let p2 = transform * t.p2.point;
-
-            let mut v0 = t.p0.clone();
-            v0.point = p0;
-            let mut v1 = t.p1.clone();
-            v1.point = p1;
-            let mut v2 = t.p2.clone();
-            v2.point = p2;
-
-            Triangle::new(v0, v1, v2)
-        };
-
-        let bbox = match area {
-            Some(area) => t.bounding_box().intersect(area),
-            None => t.bounding_box(),
-        };
-        if !(bbox.width() > 0.0 && bbox.height() > 0.0) {
-            continue;
+    /// Sample `triangles`; `false` once a budget is spent (the rest is left unsampled).
+    fn sample(&mut self, triangles: &[Triangle], transform: Affine) -> bool {
+        let page_left = MESH_TRIANGLES_LEFT.with(core::cell::Cell::get);
+        if page_left < triangles.len() as u64 {
+            MESH_TRIANGLES_LEFT.with(|n| n.set(0));
+            warn!("page mesh triangle budget exceeded; the rest of the shading is not drawn");
+            return false;
         }
+        MESH_TRIANGLES_LEFT.with(|n| n.set(page_left - triangles.len() as u64));
+        for t in triangles {
+            let t = {
+                let p0 = transform * t.p0.point;
+                let p1 = transform * t.p1.point;
+                let p2 = transform * t.p2.point;
 
-        for y in (bbox.y0.floor() as u16)..(bbox.y1.ceil() as u16) {
-            for x in (bbox.x0.floor() as u16)..(bbox.x1.ceil() as u16) {
-                let point = Point::new(x as f64, y as f64);
-                if t.contains_point(point) {
-                    map.insert((x, y), t.interpolate(point));
+                let mut v0 = t.p0.clone();
+                v0.point = p0;
+                let mut v1 = t.p1.clone();
+                v1.point = p1;
+                let mut v2 = t.p2.clone();
+                v2.point = p2;
+
+                Triangle::new(v0, v1, v2)
+            };
+
+            // Only the part of the triangle inside `area`; only such triangles add visits.
+            let bbox = t.bounding_box().intersect(self.area);
+            if bbox.width() <= 0.0 || bbox.height() <= 0.0 {
+                continue;
+            }
+            self.visits_left = self.visits_left.saturating_add(MESH_VISITS_PER_TRIANGLE);
+
+            for y in (bbox.y0.floor() as u16)..(bbox.y1.ceil() as u16) {
+                for x in (bbox.x0.floor() as u16)..(bbox.x1.ceil() as u16) {
+                    if self.visits_left == 0 {
+                        warn!("mesh shading visit budget exceeded; the rest is not drawn");
+                        return false;
+                    }
+                    self.visits_left -= 1;
+                    let point = Point::new(x as f64, y as f64);
+                    if t.contains_point(point) {
+                        self.map.insert((x, y), t.interpolate(point));
+                    }
                 }
             }
         }
+        true
     }
-
-    Some(map)
 }
 
 fn encode_function_shading(domain: &[f32; 4], function: &ShadingFunction) -> EncodedShadingType {

@@ -260,7 +260,7 @@ impl Renumber {
 
 /// Every (key, value) of the name tree under `node`, in tree order. A tree that loops, runs too
 /// deep or holds a key that is not a string is refused: what it names could not be followed.
-fn tree_entries(
+pub(crate) fn tree_entries(
     doc: &Document,
     node: &Object,
     out: &mut Vec<(Vec<u8>, Object)>,

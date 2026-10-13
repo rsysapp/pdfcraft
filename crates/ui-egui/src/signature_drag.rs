@@ -17,6 +17,8 @@ pub(crate) struct SignatureDrag {
 struct Layers {
     image: TextureHandle,
     opacity: f32,
+    /// The page /Rotate the PDF draws the image turned back by.
+    turn: i64,
     renderer: RenderPool,
     background: Option<TextureHandle>,
     tag: Option<u64>,
@@ -37,9 +39,13 @@ impl SignatureDrag {
                 && let Ok(Some(preview)) = doc.image_signature_preview(page, index)
             {
                 let [width, height] = preview.image.size();
-                self.aspect_ratio = Some(width as f32 / height as f32);
+                let ratio = width as f32 / height as f32;
+                // As displayed, the image is turned by the page's rotation less the turn it is drawn back by.
+                let shown = doc.info.pages.get(page).map_or(0, |p| i64::from(p.rotation)) - preview.turn;
+                self.aspect_ratio = Some(if shown.rem_euclid(180) == 0 { ratio } else { ratio.recip() });
                 self.layers = Some(Layers {
                     opacity: preview.opacity,
+                    turn: preview.turn,
                     image: ctx.load_texture(
                         "signature-drag-image",
                         ColorImage::from_rgba_unmultiplied(preview.image.size(), preview.image.rgba()),
@@ -54,12 +60,13 @@ impl SignatureDrag {
             }
         }
         let (Some((_, page, _)), Some(layers)) = (self.key, self.layers.as_mut()) else { return };
-        // The image stays sharp at every zoom; bound the extra background raster to 2048².
+        // The image stays sharp at every zoom. The background matches the page view up to one
+        // whole-page texture; past that the view tiles and this preview stays at that cap.
         let Some(p) = doc.info.pages.get(page) else { return };
-        let scale = scale.min(2048.0 / p.width.max(p.height).max(1.0));
+        let scale = scale.min(crate::canvas::BASE_SIDE / p.width.max(p.height).max(1.0));
         let tag = (scale * 1000.0) as u64;
         if layers.tag != Some(tag) {
-            layers.renderer.set_queue(vec![RenderRequest { page, scale, tag, ..Default::default() }]);
+            layers.renderer.set_queue(vec![RenderRequest { page, scale, tag, preview: true, ..Default::default() }]);
             layers.tag = Some(tag);
         }
         if let Some(out) = layers.renderer.try_recv()
@@ -87,7 +94,8 @@ impl SignatureDrag {
         self.key.is_some_and(|(_, p, i)| (p, i) == (page, index)) && self.layers.is_some()
     }
 
-    /// Use the embedded image's proportions, even after an edge handle stretched its rectangle.
+    /// Use the embedded image's proportions, even after an edge handle stretched its rectangle: its
+    /// width over its height as the page is displayed (before the view's own rotation).
     pub fn aspect_ratio(&self, page: usize, index: usize) -> Option<f32> {
         self.key.filter(|(_, p, i)| (*p, *i) == (page, index)).and(self.aspect_ratio)
     }
@@ -116,7 +124,7 @@ impl SignatureDrag {
 
     pub fn paint(&self, painter: &egui::Painter, cx: &PageCx<'_>, cv: &CommentView, pending: Option<&Edit>) {
         let (Some((_, page, index)), Some(layers)) = (self.key, &self.layers) else { return };
-        if page != cx.page || cx.tool != QuickTool::Select || cx.hidden {
+        if page != cx.page || !matches!(cx.tool, QuickTool::Select | QuickTool::Fill(_)) || cx.hidden {
             return;
         }
         let dragging = matches!(cv.gesture, Some(Gesture::Move { page: p, index: i, .. } | Gesture::Resize { page: p, index: i, .. }) if (p, i) == (page, index));
@@ -124,7 +132,7 @@ impl SignatureDrag {
         if !(dragging || released || layers.settling) {
             return;
         }
-        let (Some(background), Some(a)) = (&layers.background, cx.get(index)) else { return };
+        let (Some(background), Some(a), Some(p)) = (&layers.background, cx.get(index), cx.info.pages.get(page)) else { return };
         let rect = cx.adjusted_rect(a, cv.gesture.as_ref(), painter.ctx().input(|i| i.pointer.hover_pos()), pending);
         let rect = cx.rect_to_user(rect);
         let painter = painter.with_clip_rect(painter.clip_rect().intersect(cx.xf.rect));
@@ -132,9 +140,9 @@ impl SignatureDrag {
         cx.xf.paint_user_image(
             &painter,
             layers.image.id(),
-            cx.info,
-            page,
+            p,
             rect,
+            layers.turn,
             egui::Color32::from_white_alpha((layers.opacity * 255.0).round() as u8),
         );
     }

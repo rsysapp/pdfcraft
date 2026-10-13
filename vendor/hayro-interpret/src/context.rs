@@ -1,4 +1,4 @@
-use crate::cache::{Cache, CacheKey};
+use crate::cache::{Cache, CacheKey, DecodedImageCache};
 use crate::color::ColorSpace;
 use crate::convert::convert_transform;
 use crate::font::{Font, StandardFont};
@@ -9,9 +9,11 @@ use crate::{ClipPath, Device, FillRule, InterpreterSettings, StrokeProps};
 use hayro_syntax::content::ops::Transform;
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::Name;
+use hayro_syntax::object::Stream;
 use hayro_syntax::page::Resources;
 use hayro_syntax::xref::XRef;
 use kurbo::{Affine, BezPath, PathEl, Point, Rect, Shape};
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -38,6 +40,10 @@ std::thread_local! {
     static WORK_BUDGET: core::cell::Cell<u64> = const { core::cell::Cell::new(u64::MAX) };
     static WORK_SINK: RefCell<Option<crate::WarningSinkFn>> = const { RefCell::new(None) };
     static ALLOCATED: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+    static CONTENT_LEFT: core::cell::Cell<usize> = const { core::cell::Cell::new(MAX_PAGE_CONTENT) };
+    // PdfCraft patch (18): whether this page's content budget ran out, reported as
+    // `InterpreterWarning::ContentTruncated`.
+    static CONTENT_TRUNCATED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
 
 /// Embed build: the most bytes of buffers (decoded images, shading textures, mesh samples,
@@ -120,6 +126,63 @@ pub(crate) fn paint_work(context: &Context<'_>, area: Rect) -> u64 {
     3 + (pixels / 256.0).min(u64::MAX as f64 / 2.0) as u64
 }
 
+/// PdfCraft patch: decoded content-stream bytes one page may hold at once: its contents, and
+/// the forms, tiling patterns and Type 3 glyph procedures being painted. Each stream already
+/// stops at `MAX_DECODED_STREAM`, but forms nest fifty deep and every level keeps its content
+/// while the next one runs: a form painting itself around a stream that inflates to 256 MiB
+/// would have held over 12 GB. A level gives its bytes back when it finishes, so content
+/// painted again and again doesn't use the budget up. Ordinary pages hold a few megabytes.
+pub(crate) const MAX_PAGE_CONTENT: usize = 512 << 20;
+
+/// PdfCraft patch: a content stream decoded within the page's [`MAX_PAGE_CONTENT`]. The bytes
+/// it decoded count against the budget until it is dropped; a stream without filters is
+/// borrowed from the file and costs nothing.
+pub(crate) struct DecodedContent<'a> {
+    data: Cow<'a, [u8]>,
+    held: usize,
+}
+
+impl AsRef<[u8]> for DecodedContent<'_> {
+    fn as_ref(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+impl Drop for DecodedContent<'_> {
+    fn drop(&mut self) {
+        let held = self.held;
+        CONTENT_LEFT.with(|c| c.set(c.get().saturating_add(held).min(MAX_PAGE_CONTENT)));
+    }
+}
+
+/// PdfCraft patch: decode a content stream within what is left of this page's
+/// [`MAX_PAGE_CONTENT`]. `None` once the budget is spent (the content is skipped).
+pub(crate) fn decode_content<'a>(stream: &Stream<'a>) -> Option<DecodedContent<'a>> {
+    let left = CONTENT_LEFT.with(core::cell::Cell::get);
+    if left == 0 {
+        CONTENT_TRUNCATED.with(|truncated| truncated.set(true));
+        warn!("page content budget exceeded");
+        return None;
+    }
+    let data = stream.decoded_within(left).ok()?;
+    let held = match &data {
+        Cow::Owned(v) => v.len(),
+        Cow::Borrowed(_) => 0,
+    };
+    charge_content(held);
+    Some(DecodedContent { data, held })
+}
+
+/// PdfCraft patch: count `len` bytes held for the rest of the page (its own contents).
+pub(crate) fn charge_content(len: usize) {
+    CONTENT_LEFT.with(|c| c.set(c.get().saturating_sub(len)));
+}
+
+/// PdfCraft patch (18): whether content was skipped because the page's budget ran out.
+pub(crate) fn content_was_truncated() -> bool {
+    CONTENT_TRUNCATED.with(core::cell::Cell::get)
+}
+
 /// PdfCraft patch: count a paint at `depth` (top-level ones are free); `false` once this
 /// page's budget is spent, and the paint is skipped.
 pub(crate) fn take_nested_paint(depth: u32) -> bool {
@@ -144,6 +207,9 @@ pub(crate) fn take_nested_paint(depth: u32) -> bool {
 pub struct InterpreterCache<'a> {
     pub(crate) font_cache: Rc<RefCell<HashMap<u128, Option<Font<'a>>>>>,
     pub(crate) object_cache: Cache,
+    /// PdfCraft patch: decoded images, shared by every render through this cache so a tile
+    /// no longer decodes its page's images again.
+    pub(crate) decoded_cache: DecodedImageCache,
 }
 
 impl<'a> Default for InterpreterCache<'a> {
@@ -158,6 +224,7 @@ impl<'a> InterpreterCache<'a> {
         Self {
             font_cache: Rc::new(RefCell::new(HashMap::new())),
             object_cache: Cache::new(),
+            decoded_cache: DecodedImageCache::new(),
         }
     }
 }
@@ -188,7 +255,7 @@ impl<'a> Context<'a> {
         settings: InterpreterSettings,
     ) -> Self {
         let state = State::new(initial_transform);
-        // PdfCraft patch: a page (or other top-level content) starts with a fresh budget.
+        // PdfCraft patch: a page (or other top-level content) starts with fresh budgets.
         NESTED_PAINTS.with(|n| n.set(0));
         // Embed build: and with no work done, under this interpretation's budget.
         WORK.with(|w| w.set(0));
@@ -204,6 +271,9 @@ impl<'a> Context<'a> {
         } else {
             hayro_syntax::budget::set_decode_budget(MAX_DECODED, MAX_CODEC_WORK);
         }
+        CONTENT_LEFT.with(|c| c.set(MAX_PAGE_CONTENT));
+        CONTENT_TRUNCATED.with(|truncated| truncated.set(false));
+        crate::encode::reset_mesh_budget();
 
         Self::new_with(initial_transform, bbox, cache, xref, settings, state, 0)
     }

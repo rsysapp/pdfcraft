@@ -144,7 +144,12 @@ fn elements(doc: &Document) -> (Vec<Element>, HashMap<ObjRef, ObjRef>) {
                 if !seen.insert(r) || seen.len() > 2_000_000 {
                     continue;
                 }
-                let Some(d) = doc.get(r).as_dict().cloned() else { continue };
+                let object = doc.get(r);
+                if let Object::Array(a) = &*object {
+                    todo.extend(a.iter().cloned().map(|x| (x, pg, parent)));
+                    continue;
+                }
+                let Some(d) = object.as_dict().cloned() else { continue };
                 if !d.contains(b"S") {
                     continue;
                 }
@@ -152,9 +157,11 @@ fn elements(doc: &Document) -> (Vec<Element>, HashMap<ObjRef, ObjRef>) {
                     parents.insert(r, parent);
                 }
                 let pg = d.get(b"Pg").and_then(Object::as_ref).or(pg);
-                let kids: Vec<Object> = match d.get(b"K") {
-                    Some(Object::Array(a)) => a.clone(),
-                    Some(o) => vec![o.clone()],
+                let kids: Vec<Object> = match d.get(b"K").map(|k| doc.resolve(k)) {
+                    Some(o) => match &*o {
+                        Object::Array(a) => a.clone(),
+                        _ => d.get(b"K").cloned().into_iter().collect(),
+                    },
                     None => Vec::new(),
                 };
                 todo.extend(kids.into_iter().map(|x| (x, pg, Some(r))));
@@ -169,9 +176,10 @@ fn elements(doc: &Document) -> (Vec<Element>, HashMap<ObjRef, ObjRef>) {
 /// An element's kids, each resolved (Embed build: a marked-content reference may be an object of
 /// its own).
 fn kids_of(doc: &Document, element: &Dict) -> Vec<(Object, Object)> {
-    let kids: Vec<Object> = match element.get(b"K") {
+    // Upstream (#1351): `/K` may be an indirect array.
+    let kids: Vec<Object> = match element.get(b"K").map(|k| doc.resolve(k)).as_deref() {
         Some(Object::Array(a)) => a.clone(),
-        Some(o) => vec![o.clone()],
+        Some(_) => element.get(b"K").cloned().into_iter().collect(),
         None => Vec::new(),
     };
     kids.into_iter()
@@ -285,6 +293,10 @@ pub(crate) fn clean_forms(doc: &mut Document, page: ObjRef, forms: &[crate::inte
                 continue;
             }
             reference.set(b"Stm".to_vec(), Object::Ref(form.new));
+            // Upstream (#1351): an owner named as the original form (`/StmOwn`) follows it too.
+            if reference.get(b"StmOwn").and_then(Object::as_ref) == Some(form.old) {
+                reference.set(b"StmOwn".to_vec(), Object::Ref(form.new));
+            }
             match written {
                 Object::Ref(r) => {
                     doc.set(r, Object::Dict(reference));

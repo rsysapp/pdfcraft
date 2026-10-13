@@ -4575,7 +4575,7 @@ impl Known {
                 let read = reader.get(r);
                 let theirs = start.checked_add(*length).and_then(|end| data.get(*start..end));
                 let same = match (&read, theirs) {
-                    (Ok(obj), Some(theirs)) => matches!(&**obj, Object::Stream(stream) if stream.raw.as_slice() == theirs),
+                    (Ok(obj), Some(theirs)) => matches!(&**obj, Object::Stream(stream) if stream.raw[..] == *theirs),
                     _ => false,
                 };
                 if let Err(fail) = reader.budget.hashed(*length) {

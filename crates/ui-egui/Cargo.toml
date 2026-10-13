@@ -4,6 +4,7 @@ description = "The egui shell of PdfCraft"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version = "1.95"
 
 [lints]
 workspace = true
@@ -14,16 +15,21 @@ default = ["brand"]
 brand = []
 
 [dependencies]
+craft-ui = { workspace = true }
 pdfcraft-fonts = { workspace = true }
 pdfcraft-engine = { workspace = true }
+pdfcraft-cos = { workspace = true }
 pdfcraft-render = { workspace = true }
+pdfcraft-model = { workspace = true }
 pdfcraft-platform = { workspace = true }
-egui = { workspace = true }
+egui = { workspace = true, features = ["bytemuck"] }
 egui_extras = { workspace = true }
 eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit", "persistence", "links"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
+# Hands rendered rasters to egui as its pixels, without copying; already in the tree through egui and wgpu.
+bytemuck = { version = "1", features = ["extern_crate_alloc"] }
 
 rfd = { workspace = true }
 png = "0.18"
@@ -49,22 +55,25 @@ skrifa = "0.44"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSEvent", "NSScreen"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSGeometry"] }
+# A plain fsync where a volume refuses the full flush `sync_all` asks for (SMB, FUSE); already in
+# the tree through pdfcraft-cli.
+rustix = { version = "1", features = ["fs"] }
 
 [target.'cfg(windows)'.dependencies]
 # Auto interface language: the Windows display language, without starting a process.
 sys-locale = "0.3"
+# Region ▸ Measurement system for the default Units, read from the registry without starting reg.exe.
+winsafe = { version = "0.0.29", default-features = false, features = ["advapi"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 rfd = { workspace = true, features = ["file-handle-inner"] }
 wasm-bindgen-futures = "0.4"
 wasm-bindgen = "0.2"
 js-sys = "0.3"
-web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlElement", "HtmlAnchorElement", "Blob", "BlobPropertyBag", "Url"] }
+web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlElement", "HtmlAnchorElement", "Blob", "BlobPropertyBag", "Url", "HtmlIFrameElement", "HtmlImageElement", "HtmlCollection", "Node", "EventTarget"] }
 
 [dev-dependencies]
 pdfcraft-xfa = { workspace = true }
-pdfcraft-cos = { workspace = true }
-pdfcraft-model = { workspace = true }
 egui_kittest = { workspace = true, features = ["eframe", "wgpu"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 # Glyph-coverage test of the interface fonts; the same skrifa pdfcraft-fonts already uses.

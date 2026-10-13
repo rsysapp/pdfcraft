@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Check the compiled MSI's install scope, publisher, shortcuts and native UI, without installing it.
+  Check the compiled MSI's install scope, publisher, shortcuts, native UI and OCR models, without installing it.
 .EXAMPLE
   pwsh packaging/windows/test-msi.ps1 dist/release/pdfcraft-0.2.1-windows-x64.msi
 #>
@@ -74,7 +74,7 @@ Assert-Equal $status[0] 'Please wait while setup completes.' 'Persistent progres
 Assert-NoRow 'SELECT `Event` FROM `EventMapping` WHERE `Dialog_` = ''InstallProgress'' AND `Control_` = ''Status''' 'progress text subscription'
 
 # Plain (non-advertised) shortcuts to pdfcraft.exe, each in its own component; the desktop one is
-# gated by INSTALLDESKTOPSHORTCUT, which defaults to 1 and is secure so the UI choice reaches the
+# gated by INSTALLDESKTOPSHORTCUT, which is secure so the UI choice reaches the
 # elevated install.
 foreach ($entry in @(@('StartMenuShortcut', 'ProgramMenuFolder', 'PdfcraftStartMenuShortcut', ''),
                      @('DesktopShortcut', 'DesktopFolder', 'PdfcraftDesktopShortcut', 'INSTALLDESKTOPSHORTCUT = 1'))) {
@@ -88,8 +88,33 @@ foreach ($entry in @(@('StartMenuShortcut', 'ProgramMenuFolder', 'PdfcraftStartM
   Assert-Equal $component[0] $entry[1] "$($entry[2]) directory"
   Assert-Equal $component[1] $entry[3] "$($entry[2]) condition"
 }
-$default = Read-Row 'SELECT `Value` FROM `Property` WHERE `Property` = ''INSTALLDESKTOPSHORTCUT''' 1
-Assert-Equal $default[0] '1' 'Desktop shortcut default'
+# No static default (#1058): a SetProperty after AppSearch turns it on for a first install, and for an
+# update only while the old shortcut is still on the desktop; a command-line value is left alone.
+Assert-NoRow 'SELECT `Value` FROM `Property` WHERE `Property` = ''INSTALLDESKTOPSHORTCUT''' 'desktop shortcut static default'
+$setDesktop = Read-Row 'SELECT `Action`, `Target` FROM `CustomAction` WHERE `Source` = ''INSTALLDESKTOPSHORTCUT''' 2
+Assert-Equal $setDesktop[1] '1' 'Desktop shortcut default value'
+foreach ($sequence in @('InstallUISequence', 'InstallExecuteSequence')) {
+  $search = Read-Row ('SELECT `Sequence` FROM `' + $sequence + '` WHERE `Action` = ''AppSearch''') 1
+  $set = Read-Row ('SELECT `Sequence`, `Condition` FROM `' + $sequence + '` WHERE `Action` = ''' + $setDesktop[0] + '''') 2
+  if ([int] $set[0] -le [int] $search[0]) { throw "$sequence must set the desktop shortcut default after AppSearch" }
+}
+$session = $null
+try {
+  $session = $Installer.OpenPackage((Resolve-Path -LiteralPath $Path).Path, 1)
+  foreach ($case in @(
+      @('first install', '', '', '', 1),
+      @('first install, INSTALLDESKTOPSHORTCUT=0', '0', '', '', 0),
+      @('update, shortcut still there', '', '{00000000-0000-0000-0000-000000000000}', 'C:\Users\Public\Desktop\PdfCraft.lnk', 1),
+      @('update, shortcut deleted', '', '{00000000-0000-0000-0000-000000000000}', '', 0),
+      @('update, INSTALLDESKTOPSHORTCUT=0', '0', '{00000000-0000-0000-0000-000000000000}', 'C:\Users\Public\Desktop\PdfCraft.lnk', 0))) {
+    $session.Property('INSTALLDESKTOPSHORTCUT') = $case[1]
+    $session.Property('WIX_UPGRADE_DETECTED') = $case[2]
+    $session.Property('EXISTINGDESKTOPSHORTCUT') = $case[3]
+    Assert-Equal ($session.EvaluateCondition($set[1])) $case[4] "Desktop shortcut default: $($case[0])"
+  }
+} finally {
+  if ($session) { [void] [Runtime.InteropServices.Marshal]::FinalReleaseComObject($session) }
+}
 $secure = Read-Row 'SELECT `Value` FROM `Property` WHERE `Property` = ''SecureCustomProperties''' 1
 if (($secure[0] -split ';') -notcontains 'INSTALLDESKTOPSHORTCUT') { throw "INSTALLDESKTOPSHORTCUT is not secure: '$($secure[0])'" }
 $checkbox = Read-Row 'SELECT `Type`, `Property`, `Text` FROM `Control` WHERE `Dialog_` = ''InstallWelcome'' AND `Control` = ''DesktopShortcut''' 3
@@ -117,6 +142,38 @@ foreach ($ext in @('png', 'jpg', 'jpeg', 'tif', 'tiff', 'gif', 'bmp', 'jp2', 'j2
   Assert-Equal $selection[0] 'Single' "$ext context menu selection"
 }
 
+# PDF context menu (#682): "Edit with PdfCraft" opens the file in PdfCraft. Its own component, gated
+# by INSTALLPDFCONTEXTMENU (default 1, secure, welcome checkbox), with its menu value as key path so
+# uninstall removes it. Several selected PDFs each start pdfcraft.exe "%1" (Document), which the
+# single-instance hand-off opens as tabs. The .pdf default is never set, so the user's default app
+# stays.
+$pdfKey = 'Software\Classes\SystemFileAssociations\.pdf\shell\PdfCraft.Edit'
+$pdfMenu = Read-Row ('SELECT `Registry`, `Value`, `Component_`, `Root` FROM `Registry` WHERE `Key` = ''' + $pdfKey + ''' AND `Name` IS NULL') 4
+Assert-Equal $pdfMenu[1] 'Edit with PdfCraft' 'PDF context menu label'
+Assert-Equal $pdfMenu[2] 'PdfcraftPdfContextMenu' 'PDF context menu component'
+Assert-Equal $pdfMenu[3] '2' 'PDF context menu HKLM root'
+foreach ($value in @(@('Icon', '"[#PdfcraftExe]",0'), @('MultiSelectModel', 'Document'))) {
+  $row = Read-Row ('SELECT `Value`, `Component_` FROM `Registry` WHERE `Key` = ''' + $pdfKey + ''' AND `Name` = ''' + $value[0] + '''') 2
+  Assert-Equal $row[0] $value[1] "PDF context menu $($value[0])"
+  Assert-Equal $row[1] 'PdfcraftPdfContextMenu' "PDF context menu $($value[0]) component"
+}
+$pdfCommand = Read-Row ('SELECT `Value`, `Component_` FROM `Registry` WHERE `Key` = ''' + $pdfKey + '\command''') 2
+Assert-Equal $pdfCommand[0] '"[#PdfcraftExe]" "%1"' 'PDF context menu command'
+Assert-Equal $pdfCommand[1] 'PdfcraftPdfContextMenu' 'PDF context menu command component'
+$pdfComponent = Read-Row 'SELECT `Condition`, `KeyPath` FROM `Component` WHERE `Component` = ''PdfcraftPdfContextMenu''' 2
+Assert-Equal $pdfComponent[0] 'INSTALLPDFCONTEXTMENU = 1' 'PDF context menu condition'
+Assert-Equal $pdfComponent[1] $pdfMenu[0] 'PDF context menu key path'
+$pdfDefault = Read-Row 'SELECT `Value` FROM `Property` WHERE `Property` = ''INSTALLPDFCONTEXTMENU''' 1
+Assert-Equal $pdfDefault[0] '1' 'PDF context menu default'
+if (($secure[0] -split ';') -notcontains 'INSTALLPDFCONTEXTMENU') { throw "INSTALLPDFCONTEXTMENU is not secure: '$($secure[0])'" }
+$pdfCheckbox = Read-Row 'SELECT `Type`, `Property`, `Text` FROM `Control` WHERE `Dialog_` = ''InstallWelcome'' AND `Control` = ''PdfContextMenu''' 3
+Assert-Equal $pdfCheckbox[0] 'CheckBox' 'Welcome PDF context-menu control'
+Assert-Equal $pdfCheckbox[1] 'INSTALLPDFCONTEXTMENU' 'Welcome PDF context-menu property'
+if ($pdfCheckbox[2] -notmatch 'Edit with PdfCraft') { throw "Welcome PDF context-menu label: '$($pdfCheckbox[2])'" }
+$pdfChecked = Read-Row 'SELECT `Value` FROM `CheckBox` WHERE `Property` = ''INSTALLPDFCONTEXTMENU''' 1
+Assert-Equal $pdfChecked[0] '1' 'Welcome PDF context-menu value'
+Assert-NoRow 'SELECT `Registry` FROM `Registry` WHERE `Key` = ''Software\Classes\.pdf'' AND `Name` IS NULL' '.pdf default app'
+
 # Negative sequences are Windows Installer's success/user-exit/failure paths. Only full UI
 # shows these dialogs: an unattended /qn or /qb install must never wait for a Finish click.
 foreach ($exit in @(@('InstallComplete', '-1'), @('InstallCancelled', '-2'), @('InstallFailed', '-3'))) {
@@ -131,8 +188,20 @@ foreach ($exit in @(@('InstallComplete', '-1'), @('InstallCancelled', '-2'), @('
 }
 $title = Read-Row 'SELECT `Text` FROM `Control` WHERE `Dialog_` = ''InstallComplete'' AND `Control` = ''Title''' 1
 if ($title[0] -notmatch 'completed successfully') { throw 'Success dialog does not confirm completion' }
+# OCR models (#103): installed into models\ beside pdfcraft.exe, where the app looks for them.
+$modelsDir = Read-Row 'SELECT `Directory_Parent`, `DefaultDir` FROM `Directory` WHERE `Directory` = ''ModelsFolder''' 2
+Assert-Equal $modelsDir[0] 'INSTALLFOLDER' 'OCR models folder parent'
+# DefaultDir is `models`, or `SHORT|models` with a generated 8.3 name.
+if ($modelsDir[1] -notmatch '(^|\|)models$') { throw "OCR models folder name: '$($modelsDir[1])'" }
+$modelFiles = 0
+$view = $Database.OpenView('SELECT `File`.`FileName` FROM `File`, `Component` WHERE `File`.`Component_` = `Component`.`Component` AND `Component`.`Directory_` = ''ModelsFolder''')
+try {
+  [void] $view.Execute()
+  while ($record = $view.Fetch()) { if ($record.StringData(1) -match '\.rten$') { $modelFiles++ } }
+} finally { [void] $view.Close() }
+if ($modelFiles -lt 2) { throw "expected the OCR models (*.rten) in models\, found $modelFiles" }
 $rm = Read-Row 'SELECT `Dialog` FROM `Dialog` WHERE `Dialog` = ''MsiRMFilesInUse''' 1
 Assert-Equal $rm[0] 'MsiRMFilesInUse' 'Files-in-use dialog'
 [void] [Runtime.InteropServices.Marshal]::FinalReleaseComObject($Database)
 [void] [Runtime.InteropServices.Marshal]::FinalReleaseComObject($Installer)
-Write-Output 'ok MSI: per-machine scope guard, publisher, persistent progress text, Start Menu shortcut, optional desktop shortcut (default on, checkbox), icon/key path, full-UI success/cancel/error and Finish controls, files-in-use dialog'
+Write-Output 'ok MSI: per-machine scope guard, publisher, persistent progress text, Start Menu shortcut, optional desktop shortcut (on for a first install, kept on update only while present, checkbox), optional PDF context menu (default on, checkbox), icon/key path, full-UI success/cancel/error and Finish controls, files-in-use dialog, OCR models'

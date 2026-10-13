@@ -253,10 +253,20 @@ fn check_tools(name: &str, bytes: &[u8]) -> String {
         ("ink", Shape::Ink { strokes: vec![vec![[20.0, 20.0], [60.0, 40.0], [90.0, 25.0]]] }),
         ("a rectangle", Shape::Rectangle { rect: [20.0, 20.0, 80.0, 60.0] }),
         ("an oval", Shape::Oval { rect: [20.0, 20.0, 80.0, 60.0] }),
-        ("a line", Shape::Line { from: [20.0, 20.0], to: [90.0, 60.0], arrow: true }),
+        (
+            "a line",
+            Shape::Line { from: [20.0, 20.0], to: [90.0, 60.0], start: pdfcraft_annot::LineEnding::None, end: pdfcraft_annot::LineEnding::OpenArrow },
+        ),
         ("a polygon", Shape::Polygon { vertices: vec![[20.0, 20.0], [80.0, 20.0], [50.0, 70.0]], cloud: false }),
         ("a cloud", Shape::Polygon { vertices: vec![[20.0, 20.0], [80.0, 20.0], [50.0, 70.0]], cloud: true }),
-        ("a polyline", Shape::PolyLine { vertices: vec![[20.0, 20.0], [50.0, 50.0], [80.0, 20.0]] }),
+        (
+            "a polyline",
+            Shape::PolyLine {
+                vertices: vec![[20.0, 20.0], [50.0, 50.0], [80.0, 20.0]],
+                start: pdfcraft_annot::LineEnding::None,
+                end: pdfcraft_annot::LineEnding::None,
+            },
+        ),
     ] {
         only(case, &added(vec![shape(0, drawing)]), AnnotationChanges { drawings: 1, ..AnnotationChanges::default() }, same);
     }

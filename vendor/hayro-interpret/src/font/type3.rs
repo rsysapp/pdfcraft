@@ -141,14 +141,13 @@ impl<'a> Type3<'a> {
 
         let name = self.glyph_simulator.glyph_to_string(glyph.glyph_id)?;
         let program = self.char_procs.get(&name)?;
+        // PdfCraft patch: see `context::MAX_PAGE_CONTENT`.
         // Embed build: the procedure's decoded content is logged, and one that cannot be decoded
-        // is recorded as a content stream not read (`hayro_syntax::resolved`).
-        let decoded = match program.decoded() {
-            Ok(decoded) => decoded,
-            Err(_) => {
-                hayro_syntax::resolved::content_stopped();
-                return None;
-            }
+        // (or that the page's content budget refuses) is recorded as a content stream not read
+        // (`hayro_syntax::resolved`).
+        let Some(decoded) = crate::context::decode_content(program) else {
+            hayro_syntax::resolved::content_stopped();
+            return None;
         };
         hayro_syntax::resolved::content(
             program

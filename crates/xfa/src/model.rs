@@ -228,6 +228,36 @@ impl VAlign {
     }
 }
 
+/// Which point of a positioned object's box its `x` and `y` give (`anchorType`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Anchor {
+    /// Fraction of the width left of the point: 0 left, 0.5 centre, 1 right.
+    pub h: f64,
+    /// Fraction of the height above the point: 0 top, 0.5 middle, 1 bottom.
+    pub v: f64,
+}
+
+impl Anchor {
+    pub fn parse(s: Option<&str>) -> Anchor {
+        let s = s.map(str::trim).unwrap_or("");
+        let v = if s.starts_with("middle") {
+            0.5
+        } else if s.starts_with("bottom") {
+            1.0
+        } else {
+            0.0
+        };
+        let h = if s.ends_with("Center") {
+            0.5
+        } else if s.ends_with("Right") {
+            1.0
+        } else {
+            0.0
+        };
+        Anchor { h, v }
+    }
+}
+
 /// Paragraph properties as written on an element; `None` inherits.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ParaSpec {
@@ -276,6 +306,7 @@ pub struct Common {
     pub id: Option<String>,
     pub x: Option<f64>,
     pub y: Option<f64>,
+    pub anchor: Anchor,
     pub w: Option<f64>,
     pub h: Option<f64>,
     pub min_w: Option<f64>,
@@ -298,6 +329,13 @@ pub enum Node {
     Field(Box<Field>),
     Draw(Box<Draw>),
     ExclGroup(Box<ExclGroup>),
+}
+
+impl Common {
+    /// The top-left corner of a positioned box of `w` by `h`, from `x`, `y` and the anchor.
+    pub fn top_left(&self, w: f64, h: f64) -> (f64, f64) {
+        (self.x.unwrap_or(0.0) - w * self.anchor.h, self.y.unwrap_or(0.0) - h * self.anchor.v)
+    }
 }
 
 impl Node {
@@ -378,6 +416,17 @@ pub enum Ui {
     Unknown,
 }
 
+/// How a `<choiceList>` presents its items.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChoiceList {
+    /// `open="always"` or `"multiSelect"`: a list box that shows its items; else a drop-down.
+    pub list_box: bool,
+    /// `open="multiSelect"`: several items may be chosen (newline-separated in the data).
+    pub multi: bool,
+    /// `textEntry="1"`: the user may type a value that is not an item.
+    pub editable: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Script {
     pub activity: String,
@@ -408,8 +457,13 @@ pub struct Field {
     pub multiline: bool,
     pub caption: Option<Caption>,
     pub value: Value,
-    /// Check buttons: the on value then the off value; choice lists: the items.
+    /// Check buttons: the on value then the off value; choice lists: the items as shown.
     pub items: Vec<String>,
+    /// Choice lists: the bound values saved to the data (`<items save="1">`), one per shown
+    /// item; empty when the shown text is the value.
+    pub item_values: Vec<String>,
+    /// Choice lists: how the list opens.
+    pub choice: ChoiceList,
     pub max_chars: Option<usize>,
     pub tooltip: Option<String>,
     pub access: Access,
@@ -425,6 +479,43 @@ pub struct Field {
     pub validate_message: Option<String>,
     /// Numeric fields (numericEdit, or a decimal/integer/float value) give scripts numbers.
     pub numeric: bool,
+}
+
+impl Field {
+    /// A choice list's value as saved to the data: an item's shown text becomes its saved
+    /// value (an editable list keeps typed text); several values stay on separate lines.
+    /// Other fields keep `v`.
+    pub fn saved_value(&self, v: &str) -> String {
+        if self.ui != Ui::ChoiceList {
+            return v.to_string();
+        }
+        // The data holds saved values: one of those is itself, even when another item shows
+        // the same text (Designer's "specify item values" lists often show 0, 1, 2 and save
+        // 1, 2, 3).
+        let saved = |one: &str| {
+            if self.item_values.is_empty() || self.item_values.iter().any(|s| s == one) {
+                return one.to_string();
+            }
+            self.items.iter().position(|shown| shown == one).and_then(|i| self.item_values.get(i)).cloned().unwrap_or_else(|| one.to_string())
+        };
+        if self.choice.multi {
+            // Each value once, and never more than there are items.
+            let mut out: Vec<String> = Vec::new();
+            for l in v.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                let s = saved(l);
+                if !out.contains(&s) {
+                    out.push(s);
+                }
+                if out.len() >= self.items.len().max(1) {
+                    break;
+                }
+            }
+            out.join("\n")
+        } else {
+            // One value: the first line, should the data hold several.
+            saved(v.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or(""))
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

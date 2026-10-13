@@ -741,7 +741,7 @@ mod tests {
         image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality).encode(pixels, 64, 64, image::ExtendedColorType::L8).unwrap();
         let mut dict = pdfcraft_cos::Dict::new();
         dict.set(b"Filter".to_vec(), Object::Name(b"DCTDecode".to_vec()));
-        Stream { dict, raw: std::sync::Arc::new(out) }
+        Stream { dict, raw: out.into() }
     }
 
     /// A 64 × 64 grey JPEG placed on 64 × 64 points at the origin, against itself with pixels

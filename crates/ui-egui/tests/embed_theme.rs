@@ -7,7 +7,7 @@ use egui_kittest::Harness;
 use embed_support::{embedded, embedded_with};
 use pdfcraft_ui_egui::PdfCraftApp;
 use pdfcraft_ui_egui::embed::{HostCommand, Theme};
-use pdfcraft_ui_egui::theme::{ThemeKind, Tokens};
+use pdfcraft_ui_egui::theme::{ThemeKind, ThemePreference, Tokens};
 
 #[test]
 fn set_theme_switches_to_dark_and_uses_the_host_accent() {
@@ -61,14 +61,16 @@ fn a_host_theme_change_sends_no_window_theme_command() {
     assert_eq!(window_theme_commands(&mut h, &bridge, true), 0, "dark");
     assert_eq!(window_theme_commands(&mut h, &bridge, false), 0, "dark to light");
     assert!(!Tokens::get(&h.ctx).dark(), "the theme itself still changes");
-    assert_eq!(h.ctx.options(|o| o.theme_preference), egui::ThemePreference::Light, "the preference stays explicit");
+    assert_eq!(h.state().theme_preference, ThemePreference::Light, "the preference stays explicit");
 }
 
 #[test]
-fn without_the_embed_context_setup_a_theme_change_sends_one() {
-    // What the test above rules out: egui's window-theme sync, which the web backend only logs.
+fn without_the_embed_context_setup_a_theme_change_sends_none_either() {
+    // Since the upstream merge of 2026-10-13 the app keeps its theme preference itself and no
+    // longer sets egui's, so egui's window-theme sync (which the web backend only logs) has
+    // nothing to follow even without `embed::prepare_context`; that setup stays as a guard.
     let (mut h, bridge) = embedded_with(false);
     h.run_steps(2);
-    window_theme_commands(&mut h, &bridge, true);
-    assert!(window_theme_commands(&mut h, &bridge, false) > 0);
+    assert_eq!(window_theme_commands(&mut h, &bridge, true), 0, "dark");
+    assert_eq!(window_theme_commands(&mut h, &bridge, false), 0, "dark to light");
 }

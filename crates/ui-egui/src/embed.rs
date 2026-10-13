@@ -42,7 +42,7 @@ pub(crate) const OPEN_REFUSED: &str = "only the host page opens documents here";
 /// printing, exporting, opening, panels, help and its links) is refused.
 const VIEW_COMMANDS: &[&str] = &[
     "edit.find",
-    "view.layout.continuous",
+    "view.continuous",
     "view.layout.single",
     "view.layout.two_up",
     "view.layout.cover",
@@ -472,7 +472,7 @@ impl PdfCraftApp {
             return self.host_open_refused(embed, OPEN_TOO_LARGE);
         }
         self.close_for_host_open(embed);
-        let event = match self.try_open(name, None, Arc::new(bytes), None) {
+        let event = match self.try_open(name, None, Arc::new(bytes), None, true) {
             Err(e) => {
                 log::warn!("embed: a host file could not be opened: {e}");
                 HostEvent::OpenFailed { message: OPEN_DAMAGED.into() }
@@ -740,7 +740,12 @@ mod tests {
         let mut text = pdfcraft_render::PageText::default();
         for (k, ch) in line.chars().enumerate() {
             let x = k as f32 * 7.0;
-            text.glyphs.push(pdfcraft_render::TextGlyph { text: ch.to_string(), rect: [x, 0.0, x + 6.0, 12.0] });
+            text.glyphs.push(pdfcraft_render::TextGlyph {
+                text: ch.to_string(),
+                rect: [x, 0.0, x + 6.0, 12.0],
+                quad: [[x, 12.0], [x + 6.0, 12.0], [x + 6.0, 0.0], [x, 0.0]],
+                direction: [1.0, 0.0],
+            });
             text.line_of.push(0);
             text.space_before.push(ch != ' ' && k > 0 && line.chars().nth(k - 1) == Some(' '));
         }

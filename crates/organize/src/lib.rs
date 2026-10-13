@@ -22,13 +22,19 @@ mod outline;
 mod pdfx;
 mod prune;
 pub mod view;
+mod xmp;
 
 pub use boxes::{BoxSpec, PageBox, page_boxes, set_page_box};
 pub use dedupe::dedupe_resources;
-pub use import::{SplitBy, combine, combine_selected, extract_pages, import_pages, page_as_form, split, split_ranges};
-pub use labels::{LabelRange, LabelStyle, number_pages, page_label_ranges, page_labels, set_page_label_ranges};
+pub use import::{
+    CombineOutcome, Combiner, FieldConflicts, ImportOutcome, Run, SplitBy, combine, combine_field_conflicts, combine_grouped, combine_grouped_with,
+    combine_selected, combine_selected_with, combine_with, extract_pages, field_name_conflicts, import_pages, import_pages_with, page_as_form, split,
+    split_ranges,
+};
+pub use labels::{LabelRange, LabelStyle, PageLabels, number_pages, page_label_ranges, page_labels, set_page_label_ranges};
 pub use outline::{
-    Bookmark, OutlineError, add_bookmark, bookmarks, delete_bookmark, move_bookmark, rename_bookmark, set_bookmark_open, set_bookmark_page,
+    Bookmark, BookmarkPage, OutlineEntry, OutlineError, add_bookmark, add_bookmark_tree, bookmark_page, bookmarks, delete_bookmark, move_bookmark,
+    rename_bookmark, set_bookmark_open, set_bookmark_page, top_level_bookmarks,
 };
 pub use view::{InitialView, displays_doc_title, initial_view, set_initial_view};
 
@@ -36,7 +42,8 @@ pub use view::{InitialView, displays_doc_title, initial_view, set_initial_view};
 pub enum OrganizeError {
     #[error("the document has no page tree")]
     NoPageTree,
-    #[error("page {0} does not exist")]
+    /// Holds the 0-based index; the message names the 1-based page a user counts (#1550).
+    #[error("page {} does not exist", .0.saturating_add(1))]
     NoSuchPage(usize),
     #[error("a document must keep at least one page")]
     WouldRemoveAllPages,
@@ -101,6 +108,13 @@ pub fn pages(doc: &Document) -> Result<Vec<PageRef>, OrganizeError> {
     Ok(walk(doc)?.into_iter().map(|(obj, _)| PageRef { obj }).collect())
 }
 
+/// Effective inherited page rotation, clockwise in degrees.
+pub fn page_rotation(doc: &Document, index: usize) -> Result<i64, OrganizeError> {
+    let pages = walk(doc)?;
+    let (_, attrs) = pages.get(index).ok_or(OrganizeError::NoSuchPage(index))?;
+    Ok(attrs.int(b"Rotate").unwrap_or(0).rem_euclid(360))
+}
+
 pub fn page_count(doc: &Document) -> Result<usize, OrganizeError> {
     Ok(walk(doc)?.len())
 }
@@ -142,13 +156,16 @@ fn check(indices: &[usize], n: usize) -> Result<(), OrganizeError> {
 
 /// Rotate pages by a multiple of 90° (positive = clockwise), adjusting `/Rotate` (§7.7.3.3).
 pub fn rotate_pages(doc: &mut Document, indices: &[usize], degrees: i64) -> Result<(), OrganizeError> {
+    if degrees % 90 != 0 {
+        return Err(OrganizeError::Invalid("rotation must be a multiple of 90 degrees".into()));
+    }
     let all = walk(doc)?;
     check(indices, all.len())?;
-    let delta = (degrees / 90) * 90;
+    let delta = degrees.rem_euclid(360);
     for &i in indices {
         let (page, inherited) = &all[i];
         let current = doc.get(*page).as_dict().and_then(|d| d.int(b"Rotate")).or_else(|| inherited.int(b"Rotate")).unwrap_or(0);
-        let new = (current + delta).rem_euclid(360);
+        let new = (current.rem_euclid(360) + delta).rem_euclid(360);
         doc.update_dict(*page, |d| d.set(b"Rotate".to_vec(), Object::Int(new)))?;
     }
     Ok(())
@@ -188,8 +205,9 @@ pub fn delete_pages(doc: &mut Document, indices: &[usize]) -> Result<(), Organiz
 }
 
 /// Bookmarks, and links on the `keep` pages, that go to one of the `gone` pages lose that
-/// destination (/Dest, or a GoTo /A), rather than pointing at nothing.
+/// destination (/Dest, or a GoTo /A), rather than pointing at nothing; so does the catalog's /OpenAction.
 fn drop_destinations_to(doc: &mut Document, gone: &[ObjRef], keep: &[(ObjRef, Dict)]) -> Result<(), OrganizeError> {
+    let dead_names = drop_named_destinations(doc, gone)?;
     let mut holders = outline::items(doc);
     for (p, _) in keep {
         let annots = doc.get(*p).as_dict().and_then(|d| d.get(b"Annots").cloned()).map(|a| doc.resolve(&a).as_array().cloned().unwrap_or_default());
@@ -202,7 +220,12 @@ fn drop_destinations_to(doc: &mut Document, gone: &[ObjRef], keep: &[(ObjRef, Di
         );
     }
     let to_gone = |o: Option<&Object>| {
-        o.map(|o| doc.resolve(o)).and_then(|o| o.as_array().and_then(|a| a.first()).and_then(Object::as_ref)).is_some_and(|r| gone.contains(&r))
+        let Some(o) = o.map(|o| doc.resolve(o)) else { return false };
+        match &*o {
+            Object::Name(n) => dead_names.contains(n),
+            Object::String(s) => dead_names.contains(&s.bytes),
+            _ => goes_to(doc, &o, gone),
+        }
     };
     let mut dead: Vec<(ObjRef, &[u8])> = Vec::new();
     for h in holders {
@@ -215,12 +238,54 @@ fn drop_destinations_to(doc: &mut Document, gone: &[ObjRef], keep: &[(ObjRef, Di
             dead.push((h, b"A"));
         }
     }
+    // The catalog's /OpenAction is either a destination array or a GoTo action; one that opens a
+    // deleted page is dropped, as a bookmark's would be.
+    if let Some(root) = doc.root() {
+        let open = doc.get(root).as_dict().and_then(|c| c.get(b"OpenAction").map(|o| doc.resolve(o)));
+        let opens_gone = match open.as_deref() {
+            Some(Object::Dict(a)) => a.name(b"S") == Some(b"GoTo") && to_gone(a.get(b"D")),
+            other => to_gone(other),
+        };
+        if opens_gone {
+            dead.push((root, b"OpenAction"));
+        }
+    }
     for (h, key) in dead {
         doc.update_dict(h, |d| {
             d.remove(key);
         })?;
     }
     Ok(())
+}
+
+/// True when a destination (an array, or a dictionary whose /D is one) opens one of the `gone` pages.
+fn goes_to(doc: &Document, dest: &Object, gone: &[ObjRef]) -> bool {
+    let dest = doc.resolve(dest);
+    let array = match dest.as_dict() {
+        Some(d) => d.get(b"D").map(|d| doc.resolve(d)),
+        None => Some(dest.clone()),
+    };
+    array.and_then(|a| a.as_array().and_then(|a| a.first()).and_then(Object::as_ref)).is_some_and(|r| gone.contains(&r))
+}
+
+/// The named destinations (the catalog's /Names /Dests tree and the legacy /Dests dictionary)
+/// that open one of the `gone` pages, so that the links using them can lose their destination
+/// too (upstream #817). Embed build: the names themselves are removed by `follow::Before::follow`,
+/// which writes the tree again as one leaf so no node's /Limits can be left wrong; this only
+/// reads them.
+fn drop_named_destinations(doc: &Document, gone: &[ObjRef]) -> Result<Vec<Vec<u8>>, OrganizeError> {
+    let mut dead: Vec<Vec<u8>> = Vec::new();
+    let Some(root) = doc.root() else { return Ok(dead) };
+    let Some(catalog) = doc.get(root).as_dict().cloned() else { return Ok(dead) };
+    if let Some(dests) = catalog.get(b"Dests").and_then(|d| doc.resolve(d).as_dict().cloned()) {
+        dead.extend(dests.iter().filter(|(_, v)| goes_to(doc, v, gone)).map(|(k, _)| k.clone()));
+    }
+    if let Some(top) = catalog.get(b"Names").and_then(|n| doc.resolve(n).as_dict().cloned()).and_then(|n| n.get(b"Dests").cloned()) {
+        let mut entries = Vec::new();
+        follow::tree_entries(doc, &top, &mut entries, &mut std::collections::HashSet::new(), 0)?;
+        dead.extend(entries.into_iter().filter(|(_, v)| goes_to(doc, v, gone)).map(|(k, _)| k));
+    }
+    Ok(dead)
 }
 
 /// Take widgets out of the form: out of their field's /Kids, or out of /AcroForm /Fields when
@@ -353,12 +418,14 @@ pub fn info(doc: &Document, key: &str) -> Option<String> {
 
 /// Set (or clear, with an empty value) a document-information entry.
 ///
-/// Note: documents with XMP metadata also carry these values in the XMP packet; synchronising
-/// XMP arrives with the `model` crate (M2) — viewers that prefer XMP may still show old values.
+/// Documents with XMP metadata also carry Title, Author, Subject, Keywords, Creator and Producer
+/// in the XMP packet, and viewers that read XMP first show its value: the packet's property is
+/// changed (or removed) to match (see `xmp`).
 pub fn set_info(doc: &mut Document, key: &str, value: &str) -> Result<(), OrganizeError> {
     let value = value.trim();
     let entry = (!value.is_empty()).then(|| Object::String(PdfString::text(value)));
-    set_info_entry(doc, key.as_bytes(), entry)
+    set_info_entry(doc, key.as_bytes(), entry)?;
+    xmp::sync_info(doc, key, value)
 }
 
 /// Set (or remove, with `None`) a document-information entry of any type.
