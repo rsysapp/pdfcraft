@@ -239,10 +239,16 @@ fn vertical_writing_text_under_a_mark_fails_closed() {
     let mut vdoc = make("Identity-V");
     mark(&mut vdoc, 0, &[[85.0, 55.5, 105.0, 61.0]], "");
     // Embed build: the redactor's own refusal (R6b-54, by its reason) comes first where it applies.
+    let err = apply(&mut vdoc, None).unwrap_err();
     assert!(
-        matches!(apply(&mut vdoc, None), Err(RedactError::VerticalText(1) | RedactError::Refused(Refusal::TextNotPlaceable))),
-        "vertical text under a mark must not silently pass"
+        matches!(err, RedactError::VerticalText(1) | RedactError::Refused(Refusal::TextNotPlaceable)),
+        "vertical text with a pending mark must not silently pass: {err:?}"
     );
+    if err == RedactError::VerticalText(1) {
+        let msg = err.to_string();
+        assert!(msg.contains("cannot tell whether"), "{msg}");
+        assert!(!msg.contains("text under a redaction mark"), "{msg}");
+    }
 
     // Identity-H control: the same glyphs and mark are redacted normally.
     let mut hdoc = make("Identity-H");

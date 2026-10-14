@@ -32,6 +32,25 @@ fn right_click(h: &mut Harness<'static, PdfCraftApp>, label: &str) {
 }
 
 #[test]
+fn automatic_text_tagging_opens_reviewable_tags() {
+    let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(move |_cc| {
+        let mut app = PdfCraftApp::new();
+        app.set_option("language", "en").unwrap();
+        app.open_bytes("notes.pdf", None, FIXTURE.to_vec()).unwrap();
+        app
+    });
+    h.run_steps(3);
+    assert!(h.state_mut().execute("a11y.autotag"));
+    h.run_steps(2);
+    assert_eq!(h.state().right, Some(RightPanel::Tags));
+    let doc = h.state().session.get(h.state().views[h.state().active.unwrap()].id).unwrap();
+    let tags = doc.tags();
+    assert_eq!(tags.len(), 2);
+    assert_eq!(tags[1].kind, "P");
+    assert_eq!(doc.accessibility_check(&Default::default()).unwrap().result(Rule::TaggedPdf).unwrap().status, Status::Passed);
+}
+
+#[test]
 fn checking_fixing_skipping_and_reporting() {
     let dir = std::env::temp_dir().join(format!("pdfcraft-a11y-ui-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -169,6 +188,26 @@ fn checker_summary_does_not_hide_manual_review() {
     h.state_mut().a11y.report.as_mut().unwrap().1.results[0].status = Status::Passed;
     h.run_steps(2);
     h.get_by_label("No issues found");
+}
+
+#[test]
+fn a_saved_page_range_past_the_document_still_checks_its_pages() {
+    // A range picked on a longer document survives into this one-page document when the options
+    // dialog is turned off. Unclamped, it selected no page, and the page rules came out Passed
+    // without having looked at the untagged text (#1300).
+    let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(move |_cc| {
+        let mut app = PdfCraftApp::new();
+        app.set_option("language", "en").unwrap();
+        app.open_bytes("notes.pdf", None, FIXTURE.to_vec()).unwrap();
+        app
+    });
+    h.run_steps(3);
+    let o = &mut h.state_mut().a11y_options;
+    (o.show_dialog, o.all_pages, o.from, o.to) = (false, false, 2, 2);
+    assert!(h.state_mut().execute("a11y.check"));
+    h.run_steps(2);
+    assert_eq!(status(&h, Rule::TaggedContent), Status::Failed);
+    assert_eq!(h.state().a11y.options.as_ref().and_then(|o| o.pages.clone()), Some(vec![0]));
 }
 
 /// Two tagged figures: an image without alternate text and a bar (role-mapped Photo) with.
